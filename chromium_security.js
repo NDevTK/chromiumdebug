@@ -121,8 +121,8 @@ function help() {
     !heap_info            - PartitionAlloc/V8 heap inspection guide
 
   ORIGIN SPOOFING & FUNCTION PATCHING (renderer only):
-    !spoof("url")                            - Spoof origin by patching memory
-    !patch("Fullscreen::FullscreenEnabled","1") - Patch function to return value
+    !spoof(\"url\")                       - Spoof origin by patching memory
+    !patch(\"FullscreenIsSupported\",\"false\") - Patch function (auto-inlining detection)
 
 
   BLINK DOM HOOKS:
@@ -762,37 +762,77 @@ function patch_function(funcName, returnValue) {
     host.diagnostics.debugLog("\n=== Patch Function ===\n\n");
 
     if (!funcName || funcName === "") {
-        host.diagnostics.debugLog("  Usage: !patch(\"ClassName::FunctionName\",\"return_value\")\n\n");
+        host.diagnostics.debugLog("  Usage: !patch(\"ClassName::FunctionName\",\"value\")\n\n");
+        host.diagnostics.debugLog("  Values: true, false, 0, 1, 0x1234, or any number\n\n");
         host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !patch(\"Fullscreen::FullscreenEnabled\",\"1\")\n");
-        host.diagnostics.debugLog("    !patch(\"*CanAccess*\",\"1\")\n\n");
-        host.diagnostics.debugLog("  Auto-searches for matching symbols in chrome/chrome_child.\n\n");
+        host.diagnostics.debugLog("    !patch(\"FullscreenIsSupported\",\"false\")\n");
+        host.diagnostics.debugLog("    !patch(\"IsFeatureEnabled\",\"0\")\n");
+        host.diagnostics.debugLog("    !patch(\"*CanAccess*\",\"true\")\n\n");
+        host.diagnostics.debugLog("  Auto-detects inlining and patches callers if needed.\n\n");
         return "";
     }
 
     var ctl = host.namespace.Debugger.Utility.Control;
-    var retVal = returnValue || "1";
+
+    // Parse return value - support true/false/hex/decimal
+    var retVal = 0;
+    if (returnValue === undefined || returnValue === null || returnValue === "") {
+        retVal = 0;
+    } else if (returnValue === "true" || returnValue === "TRUE" || returnValue === "True") {
+        retVal = 1;
+    } else if (returnValue === "false" || returnValue === "FALSE" || returnValue === "False") {
+        retVal = 0;
+    } else if (returnValue.toString().startsWith("0x") || returnValue.toString().startsWith("0X")) {
+        retVal = parseInt(returnValue, 16);
+    } else {
+        retVal = parseInt(returnValue) || 0;
+    }
+
+    host.diagnostics.debugLog("  Return value: " + retVal + (retVal === 0 ? " (false)" : retVal === 1 ? " (true)" : "") + "\\n\\n");
 
     try {
         var symbols = [];
 
-        // If it contains '!' it's already a full symbol
+        // If it contains '!' it's already a full symbol - resolve its address
         if (funcName.indexOf("!") !== -1) {
-            symbols.push(funcName);
+            try {
+                var xOut = ctl.ExecuteCommand("x " + funcName);
+                for (var xLine of xOut) {
+                    var match = xLine.toString().match(/^([0-9a-fA-F`]+)\s+(.+)/);
+                    if (match) {
+                        symbols.push({ addr: match[1].replace(/`/g, ""), name: match[2].trim() });
+                    }
+                }
+            } catch (e) { }
         } else {
             // Search for matching symbols
             host.diagnostics.debugLog("  Searching for: *" + funcName + "*\n\n");
 
-            var patterns = ["chrome!*" + funcName + "*", "chrome_child!*" + funcName + "*"];
+            var patterns = [
+                "chrome!*" + funcName + "*",
+                "chrome_child!*" + funcName + "*",
+                "blink_core!*" + funcName + "*",
+                "blink_modules!*" + funcName + "*"
+            ];
 
             for (var pattern of patterns) {
                 try {
                     var output = ctl.ExecuteCommand("x " + pattern);
                     for (var line of output) {
                         var lineStr = line.toString();
-                        var match = lineStr.match(/^[0-9a-fA-F`]+\s+(\S+)/);
-                        if (match && symbols.indexOf(match[1]) === -1) {
-                            symbols.push(match[1]);
+                        // Extract BOTH the address and symbol name
+                        var match = lineStr.match(/^([0-9a-fA-F`]+)\s+(.+)/);
+                        if (match) {
+                            var addr = match[1].replace(/`/g, "");
+                            var symName = match[2].trim();
+                            // Store as object with address and name
+                            var exists = false;
+                            for (var s of symbols) {
+                                if (s.addr === addr) { exists = true; break; }
+                            }
+                            if (!exists) {
+                                symbols.push({ addr: addr, name: symName });
+                            }
                         }
                     }
                 } catch (e) { }
@@ -806,6 +846,11 @@ function patch_function(funcName, returnValue) {
 
         host.diagnostics.debugLog("  Found " + symbols.length + " symbol(s):\n\n");
 
+        // Direct code patching: write "mov eax, VALUE; ret" at function start
+        // This is more reliable than breakpoints for getters/inlined code
+        // x64: mov eax, imm32 = B8 xx xx xx xx; ret = C3 (6 bytes total)
+        // For 0: xor eax,eax = 31 C0; ret = C3 (3 bytes)
+
         var count = 0;
         for (var sym of symbols) {
             if (count >= 10) {
@@ -813,14 +858,87 @@ function patch_function(funcName, returnValue) {
                 break;
             }
             try {
-                var bpCmd = 'bp ' + sym + ' "gu; r rax=' + retVal + '; g"';
-                ctl.ExecuteCommand(bpCmd);
-                host.diagnostics.debugLog("  [+] " + sym + "\n");
+                var funcAddr = sym.addr;
+
+                // Write patch bytes directly to function
+                // mov eax, VALUE (B8 + 4 bytes little-endian) then ret (C3)
+                if (retVal === 0) {
+                    // xor eax, eax; ret = 31 C0 C3
+                    ctl.ExecuteCommand("eb 0x" + funcAddr + " 31 C0 C3");
+                } else if (retVal === 1) {
+                    // mov eax, 1; ret = B8 01 00 00 00 C3
+                    ctl.ExecuteCommand("eb 0x" + funcAddr + " B8 01 00 00 00 C3");
+                } else {
+                    // mov eax, VALUE; ret
+                    var b0 = retVal & 0xFF;
+                    var b1 = (retVal >> 8) & 0xFF;
+                    var b2 = (retVal >> 16) & 0xFF;
+                    var b3 = (retVal >> 24) & 0xFF;
+                    ctl.ExecuteCommand("eb 0x" + funcAddr + " B8 " +
+                        b0.toString(16).padStart(2, '0') + " " +
+                        b1.toString(16).padStart(2, '0') + " " +
+                        b2.toString(16).padStart(2, '0') + " " +
+                        b3.toString(16).padStart(2, '0') + " C3");
+                }
+
+                host.diagnostics.debugLog("  [PATCHED] " + sym.name + " @ 0x" + funcAddr + "\n");
                 count++;
-            } catch (e) { }
+            } catch (e) {
+                host.diagnostics.debugLog("  [FAILED] " + sym.name + " @ 0x" + sym.addr + ": " + e.message + "\n");
+            }
         }
 
-        host.diagnostics.debugLog("\n  " + count + " breakpoint(s) set -> return " + retVal + "\n\n");
+        host.diagnostics.debugLog("\n  " + count + " function(s) patched -> return " + retVal + "\n");
+        host.diagnostics.debugLog("  NOTE: Patches are direct code modifications (not breakpoints)\n");
+        host.diagnostics.debugLog("  TIP: V8 caches results - navigate to a new page to see effect in JS\n\n");
+
+        // Auto inlining detection: analyze if function might be inlined
+        // by looking for callers that contain calls to related functions
+        if (count > 0 && funcName.indexOf("!") === -1) {
+            // Extract short name for caller search
+            var shortName = funcName;
+            if (shortName.indexOf("::") !== -1) {
+                var parts = shortName.split("::");
+                shortName = parts[parts.length - 1];
+            }
+
+            // Look for V8 accessor callbacks that might inline this function
+            var callerPatterns = [
+                "chrome!*" + shortName + "*AttributeGetCallback*",
+                "chrome!*" + shortName + "*Callback*"
+            ];
+
+            var callers = [];
+            for (var callerPattern of callerPatterns) {
+                try {
+                    var callerOutput = ctl.ExecuteCommand("x " + callerPattern);
+                    for (var callerLine of callerOutput) {
+                        var callerMatch = callerLine.toString().match(/^([0-9a-fA-F`]+)\\s+(.+)/);
+                        if (callerMatch) {
+                            var callerAddr = callerMatch[1].replace(/`/g, "");
+                            var callerName = callerMatch[2].trim();
+                            // Check if this caller is different from what we patched
+                            var isDifferent = true;
+                            for (var patched of symbols) {
+                                if (patched.addr === callerAddr) { isDifferent = false; break; }
+                            }
+                            if (isDifferent) {
+                                callers.push({ addr: callerAddr, name: callerName });
+                            }
+                        }
+                    }
+                } catch (e) { }
+            }
+
+            if (callers.length > 0) {
+                host.diagnostics.debugLog("\\n  Found " + callers.length + " potential caller(s) that may inline this function.\\n");
+                host.diagnostics.debugLog("  If patch doesn't work, try: !patch(\"<caller_name>\",\"" + retVal + "\")\\n");
+                for (var c = 0; c < Math.min(callers.length, 3); c++) {
+                    host.diagnostics.debugLog("    - " + callers[c].name + "\\n");
+                }
+                host.diagnostics.debugLog("\\n");
+            }
+        }
 
     } catch (e) {
         host.diagnostics.debugLog("  Error: " + e.message + "\n\n");

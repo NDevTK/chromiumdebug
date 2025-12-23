@@ -48,18 +48,18 @@ Then in WinDbg: `!chelp`
 ### Origin Spoofing & Function Patching
 | Command | Description |
 |---------|-------------|
-| `!spoof "url"` | Spoof renderer origin by patching memory (auto-detects current) |
-| `!patch("Fullscreen::FullscreenEnabled","1")` | Patch function to return specific value (auto-searches symbols) |
+| `!spoof("url")` | Spoof renderer origin by patching memory (auto-detects current) |
+| `!patch("FullscreenIsSupported","false")` | Patch function to return value (supports true/false/hex, auto-inlining detection) |
 
 ### Cross-Process Execution
 | Command | Description |
 |---------|-------------|
-| `!run_renderer "cmd"` | Run command in all renderer processes |
-| `!run_browser "cmd"` | Run command in browser process |
-| `!run_gpu "cmd"` | Run command in GPU process |
-| `!script_renderer "path"` | Load script in all renderers |
-| `!on_attach "cmd"` | Auto-run command when renderers attach |
-| `!script_attach "path"` | Auto-load script when renderers attach |
+| `!run_renderer("cmd")` | Run command in all renderer processes |
+| `!run_browser("cmd")` | Run command in browser process |
+| `!run_gpu("cmd")` | Run command in GPU process |
+| `!script_renderer("path")` | Load script in all renderers |
+| `!on_attach("cmd")` | Auto-run command when renderers attach |
+| `!script_attach("path")` | Auto-load script when renderers attach |
 
 ## Files
 
