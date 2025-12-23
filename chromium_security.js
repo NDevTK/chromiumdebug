@@ -61,7 +61,11 @@ function initializeScript() {
         new host.functionAlias(bp_compile, "bp_compile"),
         new host.functionAlias(bp_gc, "bp_gc"),
         new host.functionAlias(bp_wasm, "bp_wasm"),
-        new host.functionAlias(bp_jit, "bp_jit")
+        new host.functionAlias(bp_jit, "bp_jit"),
+        // V8 Pointer Compression
+        new host.functionAlias(v8_cage_info, "v8_cage"),
+        new host.functionAlias(decompress, "decompress"),
+        new host.functionAlias(decompress_gc, "decompress_gc")
     ];
 }
 
@@ -139,6 +143,10 @@ function help() {
     !bp_wasm              - Break on WebAssembly
     !bp_jit               - Break on JIT compilation
 
+  V8 POINTER COMPRESSION:
+    !v8_cage              - Show V8 cage base address
+    !decompress(ptr)      - Decompress a 32-bit V8 compressed pointer
+
   PROCESS-SPECIFIC EXECUTION (works from any process):
     !run_renderer("cmd")      - Run command in all renderer processes
     !run_browser("cmd")       - Run command in browser process
@@ -161,6 +169,247 @@ function help() {
 /// =============================================================================
 /// INTERNAL HELPERS
 /// =============================================================================
+
+/// Cache for V8 cage base address
+var g_v8CageBase = null;
+
+/// Get V8 pointer compression cage base address
+/// V8 uses pointer compression where 64-bit pointers are stored as 32-bit offsets
+/// from a cage base address. This function finds that base.
+function getV8CageBase() {
+    if (g_v8CageBase !== null) {
+        return g_v8CageBase;
+    }
+
+    var ctl = host.namespace.Debugger.Utility.Control;
+
+    try {
+        // Try to find v8::internal::MainCage::base_
+        var xOutput = ctl.ExecuteCommand("x chrome!v8::internal::MainCage::base_");
+        for (var line of xOutput) {
+            var match = line.toString().match(/^([0-9a-fA-F`]+)/);
+            if (match) {
+                var addr = match[1].replace(/`/g, "");
+                // Read the value at this address (it's a uintptr_t)
+                var dqOutput = ctl.ExecuteCommand("dq 0x" + addr + " L1");
+                for (var dline of dqOutput) {
+                    var dMatch = dline.toString().match(/[0-9a-fA-F`]+\s+([0-9a-fA-F`]+)/);
+                    if (dMatch) {
+                        g_v8CageBase = dMatch[1].replace(/`/g, "");
+                        return g_v8CageBase;
+                    }
+                }
+            }
+        }
+    } catch (e) { }
+
+    return null;
+}
+
+/// Decompress a V8 compressed pointer
+/// Input: 32-bit compressed pointer value (as hex string or number)
+/// Returns: Full 64-bit pointer (as hex string)
+function decompressV8Ptr(compressedPtr) {
+    var cageBase = getV8CageBase();
+    if (!cageBase) {
+        return null;
+    }
+
+    // Convert to BigInt for proper 64-bit math
+    var base = BigInt("0x" + cageBase);
+    var compressed;
+
+    if (typeof compressedPtr === "string") {
+        compressed = BigInt(compressedPtr.startsWith("0x") ? compressedPtr : "0x" + compressedPtr);
+    } else {
+        compressed = BigInt(compressedPtr);
+    }
+
+    // Sign-extend the 32-bit value if needed (V8 uses signed offsets)
+    if (compressed > 0x7FFFFFFF) {
+        compressed = compressed - BigInt("0x100000000");
+    }
+
+    var fullPtr = base + compressed;
+    return fullPtr.toString(16);
+}
+
+/// Cache for cppgc/Oilpan cage base address
+var g_cppgcCageBase = null;
+
+/// Get cppgc/Oilpan pointer compression cage base address
+/// Oilpan uses its own compression scheme separate from V8
+function getCppgcCageBase() {
+    if (g_cppgcCageBase !== null) {
+        return g_cppgcCageBase;
+    }
+
+    var ctl = host.namespace.Debugger.Utility.Control;
+
+    try {
+        // Try to find cppgc::internal::CageBaseGlobal::g_base_
+        var xOutput = ctl.ExecuteCommand("x chrome!cppgc::internal::CageBaseGlobal::g_base_");
+        for (var line of xOutput) {
+            var match = line.toString().match(/^([0-9a-fA-F`]+)/);
+            if (match) {
+                var addr = match[1].replace(/`/g, "");
+                // Read the value at this address (it's a uintptr_t in a union)
+                var dqOutput = ctl.ExecuteCommand("dq 0x" + addr + " L1");
+                for (var dline of dqOutput) {
+                    var dMatch = dline.toString().match(/[0-9a-fA-F`]+\s+([0-9a-fA-F`]+)/);
+                    if (dMatch) {
+                        g_cppgcCageBase = dMatch[1].replace(/`/g, "");
+                        return g_cppgcCageBase;
+                    }
+                }
+            }
+        }
+    } catch (e) { }
+
+    return null;
+}
+
+/// Decompress a cppgc/Oilpan compressed pointer
+/// Formula: decompressed = (sign_extend_32(compressed) << 1) & base
+/// contextAddr: Optional address of an object in the same heap (to derive base)
+function decompressCppgcPtr(compressedPtr, contextAddr) {
+    // shift = 3 (Larger Cage)
+    const kPointerCompressionShift = 3n;
+    // 16GB cage -> 34 bits of offset. Mask is 2^34 - 1.
+    const kPointerCompressionMask = 0x3FFFFFFFFn;
+
+    let base;
+
+    // Strategy 1: Use context address if provided (most reliable for specific objects)
+    if (contextAddr) {
+        var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
+
+        // Derive base from context address for 16GB cage (shift=3)
+        // 1. Get the page base by clearing the lower 34 bits (preserves the high bits that identify the 16GB cage)
+        //    Since we can't use ~ BigInt easily in JS bitwise operations safely with mixed signs sometimes, 
+        //    we construct the mask manually.
+        //    ~0x3FFFFFFFF is ...FFFFFC00000000
+        const invMask = BigInt("0xFFFFFFFC00000000");
+        const cageBaseAddr = context & invMask;
+
+        // 2. Create the "mask-like" base by ORing with the compression mask
+        //    (CageBaseGlobal::g_base_ stores it this way: base_addr | mask)
+        base = cageBaseAddr | kPointerCompressionMask;
+    }
+    // Strategy 2: Fallback to global cage base
+    else {
+        var cageBase = getCppgcCageBase();
+        if (!cageBase) {
+            return null; // Cannot decompress without a base
+        }
+        base = BigInt("0x" + cageBase);
+    }
+
+    var compressed;
+    if (typeof compressedPtr === "string") {
+        var ptrStr = compressedPtr.replace(/`/g, "");
+        compressed = BigInt(ptrStr.startsWith("0x") ? ptrStr : "0x" + ptrStr);
+    } else if (typeof compressedPtr === "number") {
+        // WinDbg passes hex values as numbers - convert to hex string first
+        compressed = BigInt("0x" + compressedPtr.toString(16));
+    } else {
+        compressed = BigInt(compressedPtr);
+    }
+
+    // Sign-extend the 32-bit value to 64-bit
+    // The high bit (bit 31) indicates if we need sign extension
+    var signExtended;
+    if (compressed >= BigInt("0x80000000")) {
+        // Negative - sign extend with 1s in upper 32 bits
+        signExtended = BigInt("0xFFFFFFFF00000000") | compressed;
+    } else {
+        signExtended = compressed;
+    }
+
+    // Shift left by kPointerCompressionShift
+    var shifted = signExtended << kPointerCompressionShift;
+
+    // Mask to 64 bits (BigInt can be arbitrary size)
+    shifted = shifted & BigInt("0xFFFFFFFFFFFFFFFF");
+
+    // AND with base
+    var fullPtr = shifted & base;
+
+    return fullPtr.toString(16);
+}
+
+/// Display cage base info for both V8 and cppgc/Oilpan
+function v8_cage_info() {
+    host.diagnostics.debugLog("\n=== Pointer Compression Cages ===\n\n");
+
+    var v8CageBase = getV8CageBase();
+    if (v8CageBase) {
+        host.diagnostics.debugLog("  V8 Cage Base:     0x" + v8CageBase + "\n");
+        host.diagnostics.debugLog("    Formula: Full = CageBase + SignExtend32(Compressed)\n\n");
+    } else {
+        host.diagnostics.debugLog("  V8 Cage Base:     (not found)\n\n");
+    }
+
+    var cppgcCageBase = getCppgcCageBase();
+    if (cppgcCageBase) {
+        host.diagnostics.debugLog("  Oilpan Cage Base: 0x" + cppgcCageBase + "\n");
+        host.diagnostics.debugLog("    Formula: Full = (SignExtend32(Compressed) << 1) & Base\n\n");
+    } else {
+        host.diagnostics.debugLog("  Oilpan Cage Base: (not found)\n\n");
+    }
+
+    host.diagnostics.debugLog("  Commands:\n");
+    host.diagnostics.debugLog("    !decompress <ptr>      - V8 decompression\n");
+    host.diagnostics.debugLog("    !decompress_gc <ptr>   - Oilpan/cppgc decompression\n\n");
+
+    return "";
+}
+
+/// Decompress command - exposed to user
+function decompress(ptr) {
+    if (!ptr) {
+        host.diagnostics.debugLog("\n=== V8 Pointer Decompression ===\n\n");
+        host.diagnostics.debugLog("  Usage: !decompress <compressed_ptr>\n");
+        host.diagnostics.debugLog("  Example: !decompress 0x12345678\n\n");
+        return "";
+    }
+
+    var result = decompressV8Ptr(ptr);
+    if (result) {
+        host.diagnostics.debugLog("\n  Compressed: " + ptr + "\n");
+        host.diagnostics.debugLog("  Full ptr:   0x" + result + "\n\n");
+    } else {
+        host.diagnostics.debugLog("\n  Could not decompress - cage base not found.\n");
+        host.diagnostics.debugLog("  Try !v8_cage to see cage info.\n\n");
+    }
+
+    return "";
+}
+
+/// Decompress Oilpan/cppgc pointer - exposed to user
+function decompress_gc(ptr) {
+    if (!ptr) {
+        host.diagnostics.debugLog("\n=== Oilpan/cppgc Pointer Decompression ===\n\n");
+        host.diagnostics.debugLog("  Usage: !decompress_gc <compressed_ptr>\n");
+        host.diagnostics.debugLog("  Example: !decompress_gc 0x12345678\n\n");
+        host.diagnostics.debugLog("  Used for blink::Member<T>, cppgc::internal::BasicMember<T>\n\n");
+        return "";
+    }
+
+    // Use the decompression function
+    var result = decompressCppgcPtr(ptr);
+
+    if (result === null) {
+        host.diagnostics.debugLog("\n  Could not decompress - cage base not found.\n");
+        host.diagnostics.debugLog("  Try !decompress_gc <ptr> <context_address> to derive base from an object.\n\n");
+    } else {
+        host.diagnostics.debugLog("\n  Compressed: " + ptr + "\n");
+        host.diagnostics.debugLog("  Full ptr:   0x" + result.toString(16) + "\n\n");
+    }
+
+    return "";
+}
+
 
 /// Helper: Set multiple breakpoints with a title and description
 function set_breakpoints(title, targets, description) {
@@ -810,7 +1059,6 @@ function patch_function(funcName, returnValue) {
 
             var patterns = [
                 "chrome!*" + funcName + "*",
-                "chrome_child!*" + funcName + "*",
                 "blink_core!*" + funcName + "*",
                 "blink_modules!*" + funcName + "*"
             ];
@@ -948,6 +1196,16 @@ function patch_function(funcName, returnValue) {
 }
 
 /// Spoof renderer origin by patching the host string in memory
+/// Extract host from a URL or return the string if it looks like a host
+function getHostFromUrl(url) {
+    if (!url) return "";
+    var match = url.match(/^https?:\/\/([^\/]+)/);
+    if (match) {
+        return match[1];
+    }
+    return url;
+}
+
 /// Usage: !spoof_origin "https://target.com"
 function spoof_origin(targetUrl) {
     host.diagnostics.debugLog("\n=== Spoof Origin ===\n\n");
@@ -962,11 +1220,7 @@ function spoof_origin(targetUrl) {
     }
 
     // Parse target URL to get host
-    var targetHost = targetUrl;
-    var urlMatch = targetUrl.match(/^https?:\/\/([^\/]+)/);
-    if (urlMatch) {
-        targetHost = urlMatch[1];
-    }
+    var targetHost = getHostFromUrl(targetUrl);
 
     // Get current origin from !site
     host.diagnostics.debugLog("  Target: " + targetHost + "\n");
@@ -976,11 +1230,11 @@ function spoof_origin(targetUrl) {
     try {
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            var siteMatch = site.match(/^https?:\/\/([^\/]+)/);
-            if (siteMatch) {
-                currentHost = siteMatch[1];
-            } else if (site.indexOf(".") !== -1) {
-                currentHost = site;
+            var extracted = getHostFromUrl(site);
+            // Verify it looks like a domain if it didn't come from a URL match
+            // (getHostFromUrl returns raw input fallback, so we check for dot or if it changed)
+            if (extracted !== site || site.indexOf(".") !== -1) {
+                currentHost = extracted;
             }
         }
     } catch (e) { }
@@ -1625,276 +1879,280 @@ function site_isolation_status() {
 function renderer_frames() {
     host.diagnostics.debugLog("\n=== Renderer Frames ===\n\n");
 
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    // First, verify we're in a renderer process
-    var cmdLine = getCommandLine();
-    var info = cmdLine ? parseProcessInfo(cmdLine) : { type: "renderer", extra: "(sandboxed/locked)" };
-
-    if (info.type !== "renderer") {
-        host.diagnostics.debugLog("  Not a renderer process (current: " + info.type + ")\n");
-        host.diagnostics.debugLog("  Switch to a renderer process first with |<ID>s\n\n");
+    var ctl;
+    try {
+        ctl = host.namespace.Debugger.Utility.Control;
+    } catch (e) {
+        host.diagnostics.debugLog("  Error: Cannot get debugger control interface.\n\n");
         return "";
+    }
+
+    // Try to verify we're in a renderer, but don't fail if we can't check
+    try {
+        var cmdLine = getCommandLine();
+        if (cmdLine) {
+            var info = parseProcessInfo(cmdLine);
+            if (info && info.type !== "renderer") {
+                host.diagnostics.debugLog("  Warning: May not be a renderer (detected: " + info.type + ")\n");
+                host.diagnostics.debugLog("  Continuing anyway...\n\n");
+            }
+        }
+    } catch (e) {
+        host.diagnostics.debugLog("  Could not verify process type (continuing anyway)\n\n");
     }
 
     try {
         // Find g_frame_map symbol address
-        // g_frame_map is a LazyInstance<absl::flat_hash_map<blink::WebFrame*, RenderFrameImpl*>>
-        var xOutput = ctl.ExecuteCommand("x chrome_child!content::`anonymous namespace'::g_frame_map");
-        var mapAddr = null;
+        // g_frame_map is a base::LazyInstance<FrameMap>::DestructorAtExit
+        // where FrameMap = absl::flat_hash_map<blink::WebFrame*, RenderFrameImpl*>
+        host.diagnostics.debugLog("  Step 1: Looking for g_frame_map symbol...\n");
+
+        // First check if chrome module is loaded
+        var hasModule = false;
+        try {
+            var modules = host.currentProcess.Modules;
+            for (var mod of modules) {
+                var modName = mod.Name.toLowerCase();
+                // Look for chrome.dll specifically (not chrome_elf.dll etc.)
+                if (modName === "chrome.dll" || modName.endsWith("\\chrome.dll")) {
+                    hasModule = true;
+                    host.diagnostics.debugLog("    Found module: " + mod.Name + "\n");
+                    break;
+                }
+            }
+        } catch (modErr) {
+            host.diagnostics.debugLog("    Warning: Could not enumerate modules\n");
+        }
+
+        if (!hasModule) {
+            host.diagnostics.debugLog("  chrome.dll not found in this process.\n");
+            host.diagnostics.debugLog("  This command only works in renderer processes.\n");
+            host.diagnostics.debugLog("  Use !procs to list processes and |<id>s to switch.\n\n");
+            return "";
+        }
+
+        var xOutput;
+        try {
+            xOutput = ctl.ExecuteCommand("x chrome!*g_frame_map*");
+        } catch (xErr) {
+            host.diagnostics.debugLog("  Symbol lookup failed: " + (xErr.message || xErr) + "\n");
+            host.diagnostics.debugLog("  Try: .reload /f chrome.dll\n\n");
+            return "";
+        }
+
+        var lazyInstanceAddr = null;
 
         for (var line of xOutput) {
-            var match = line.toString().match(/^([0-9a-fA-F`]+)/);
+            var lineStr = line.toString();
+            host.diagnostics.debugLog("    > " + lineStr + "\n");
+            var match = lineStr.match(/^([0-9a-fA-F`]+)/);
             if (match) {
-                mapAddr = match[1].replace(/`/g, "");
+                lazyInstanceAddr = match[1].replace(/`/g, "");
                 break;
             }
         }
 
-        if (!mapAddr) {
-            // Try alternative symbol pattern
-            xOutput = ctl.ExecuteCommand("x chrome_child!*g_frame_map*");
-            for (var line of xOutput) {
-                var match = line.toString().match(/^([0-9a-fA-F`]+)/);
-                if (match) {
-                    mapAddr = match[1].replace(/`/g, "");
-                    break;
-                }
-            }
-        }
-
-        if (!mapAddr) {
+        if (!lazyInstanceAddr) {
             host.diagnostics.debugLog("  Could not find g_frame_map symbol.\n");
-            host.diagnostics.debugLog("  Make sure symbols are loaded (try: .reload /f chrome_child.dll)\n\n");
+            host.diagnostics.debugLog("  Make sure symbols are loaded (try: .reload /f chrome.dll)\n\n");
             return "";
         }
 
-        host.diagnostics.debugLog("  g_frame_map at: 0x" + mapAddr + "\n\n");
+        host.diagnostics.debugLog("  g_frame_map (LazyInstance) at: 0x" + lazyInstanceAddr + "\n");
 
-        // Use dx to dump the frame map contents
-        // The LazyInstance wraps the actual map, so we need to dereference it
-        var dxCmd = "dx -r3 ((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")";
-        host.diagnostics.debugLog("  Attempting to enumerate frames...\n");
+        // LazyInstance has private_instance_ as first member (std::atomic<uintptr_t>)
+        // This holds the pointer to the actual FrameMap once initialized
+        // Read the pointer value from the LazyInstance
+        host.diagnostics.debugLog("  Step 2: Reading private_instance_ pointer...\n");
+        var mapAddr = null;
+        try {
+            var lazyAddrVal = BigInt("0x" + lazyInstanceAddr);
+            var ptrValue = host.memory.readMemoryValues(host.parseInt64(lazyAddrVal.toString(16), 16), 1, 8)[0];
+            mapAddr = ptrValue.toString(16);
+        } catch (e) { }
+
+        if (!mapAddr || mapAddr === "0000000000000000" || mapAddr === "00000000") {
+            host.diagnostics.debugLog("  LazyInstance not yet initialized (no frames created yet).\n\n");
+            return "";
+        }
+
+        host.diagnostics.debugLog("  FrameMap (actual map) at: 0x" + mapAddr + "\n\n");
+
+        // Now enumerate the flat_hash_map
+        // absl::flat_hash_map uses Swiss tables internally
+        // Try using dx with the FrameMap type
+        host.diagnostics.debugLog("  Enumerating frames...\n");
         host.diagnostics.debugLog("  " + "-".repeat(70) + "\n\n");
 
-        var mapOutput = ctl.ExecuteCommand(dxCmd);
-        var frameCount = 0;
         var frames = [];
+        var currentWebFrame = null;
+
+        // Use dx with moderate recursion to see the map entries
+        var dxCmd = "dx -r5 *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")";
+        var mapOutput = ctl.ExecuteCommand(dxCmd);
 
         for (var line of mapOutput) {
             var lineStr = line.toString();
 
-            // Look for frame entries - pattern: [0x...] : 0x... (pointer pairs)
-            var ptrMatch = lineStr.match(/\[\s*(0x[0-9a-fA-F`]+)\s*\]\s*:\s*(0x[0-9a-fA-F`]+)/i);
-            if (ptrMatch) {
-                var webFrameAddr = ptrMatch[1].replace(/`/g, "");
-                var renderFrameAddr = ptrMatch[2].replace(/`/g, "");
+            // Look for "first" entries (WebFrame pointers)
+            // Pattern: "first : 0x... [Type: blink::WebFrame *]"
+            var firstMatch = lineStr.match(/first\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*blink::WebFrame/i);
+            if (firstMatch) {
+                currentWebFrame = firstMatch[1].replace(/`/g, "");
+            }
+
+            // Look for "second" entries (RenderFrameImpl pointers)
+            // Pattern: "second : 0x... [Type: content::RenderFrameImpl *]"
+            var secondMatch = lineStr.match(/second\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*content::RenderFrameImpl/i);
+            if (secondMatch && currentWebFrame) {
                 frames.push({
-                    webFrame: webFrameAddr,
-                    renderFrame: renderFrameAddr
+                    webFrame: currentWebFrame,
+                    renderFrame: secondMatch[1].replace(/`/g, "")
                 });
-                frameCount++;
+                currentWebFrame = null;
             }
         }
 
-        if (frameCount === 0) {
-            // Try a more detailed dump
-            host.diagnostics.debugLog("  Trying alternative enumeration method...\n\n");
+        // Display the frames
+        if (frames.length > 0) {
+            host.diagnostics.debugLog("  Found " + frames.length + " frame(s):\n\n");
 
-            // Try to get the flat_hash_map size and iterate
-            var dxCmd2 = "dx -r5 *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")";
-            mapOutput = ctl.ExecuteCommand(dxCmd2);
-
-            for (var line of mapOutput) {
-                var lineStr = line.toString();
-                // Output full line for debugging
-                if (lineStr.indexOf("0x") !== -1 && lineStr.indexOf("RenderFrameImpl") !== -1) {
-                    host.diagnostics.debugLog("  " + lineStr + "\n");
-                    frameCount++;
-                }
+            // Get the Oilpan cage base for pointer decompression
+            var oilpanBase = getCppgcCageBase();
+            if (oilpanBase) {
+                host.diagnostics.debugLog("  (Oilpan Cage Base: 0x" + oilpanBase + ")\n\n");
             }
-
-            if (frameCount === 0) {
-                host.diagnostics.debugLog("  No frames found or map is empty.\n");
-                host.diagnostics.debugLog("\n  Manual inspection:\n");
-                host.diagnostics.debugLog("    dx -r3 ((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")\n\n");
-            }
-        } else {
-            // Display found frames with additional info
-            host.diagnostics.debugLog("  ID    WebFrame             RenderFrameImpl      URL (if resolvable)\n");
-            host.diagnostics.debugLog("  " + "-".repeat(70) + "\n");
 
             for (var i = 0; i < frames.length; i++) {
-                var frame = frames[i];
-                var urlStr = "";
+                var f = frames[i];
+                var rfId = "N/A"; // Initialize rfId
 
-                // Try to get URL from RenderFrameImpl
-                try {
-                    var urlCmd = "dx ((content::RenderFrameImpl*)" + frame.renderFrame + ")->unique_name_helper_.value_";
-                    var urlOutput = ctl.ExecuteCommand(urlCmd);
-                    for (var uline of urlOutput) {
-                        var uStr = uline.toString();
-                        if (uStr.indexOf("\"") !== -1) {
-                            var urlMatch = uStr.match(/"([^"]*)"/);
-                            if (urlMatch) {
-                                urlStr = urlMatch[1].substring(0, 30);
+                // Extract process_label_id_ from RenderFrameImpl
+                if (f.renderFrame) {
+                    try {
+                        var rfCmd = "dx -r0 ((content::RenderFrameImpl*)" + f.renderFrame + ")->process_label_id_";
+                        // host.diagnostics.debugLog("Debug RF: " + rfCmd + "\n");
+                        var rfOutput = ctl.ExecuteCommand(rfCmd);
+                        for (var rfLine of rfOutput) {
+                            // host.diagnostics.debugLog("Debug RF line: " + rfLine.toString() + "\n");
+                            if (rfLine.toString().indexOf("process_label_id_") !== -1) {
+                                var idMatch = rfLine.toString().match(/:\s*(\d+)/);
+                                if (idMatch) {
+                                    rfId = idMatch[1];
+                                    break;
+                                }
                             }
                         }
+                    } catch (eRf) {
+                        // host.diagnostics.debugLog("Debug RF Error: " + eRf.message + "\n");
                     }
-                } catch (e) { }
+                }
 
-                host.diagnostics.debugLog("  " + i.toString().padEnd(6) +
-                    frame.webFrame.padEnd(21) +
-                    frame.renderFrame.padEnd(21) +
-                    urlStr + "\n");
+                host.diagnostics.debugLog("  [" + i + "] RenderFrameImpl:  " + f.renderFrame + " (ID: " + rfId + ")\n");
+                host.diagnostics.debugLog("       WebFrame:         " + f.webFrame + "\n");
+
+                // Try to get LocalFrame by decompressing the compressed pointer at WebLocalFrameImpl+0x3c
+                var localFrameAddr = null;
+                var urlStr = "";
+
+                try {
+                    // Read the compressed pointer at offset +0x3c (frame_)
+                    var webFrameVal = BigInt(f.webFrame.startsWith("0x") ? f.webFrame : "0x" + f.webFrame);
+                    var offset = webFrameVal + 0x3cn;
+                    var offsetInt64 = host.parseInt64(offset.toString(16), 16);
+
+                    var compressedPtr = host.memory.readMemoryValues(offsetInt64, 1, 4)[0];
+
+                    // Decompress using Oilpan formula
+                    localFrameAddr = decompressCppgcPtr(compressedPtr, f.webFrame);
+                    if (localFrameAddr) {
+                        host.diagnostics.debugLog("       LocalFrame:       0x" + localFrameAddr + "\n");
+                    }
+                } catch (e1) { }
+
+                // Trace URL: LocalFrame -> loader_ (FrameLoader) -> document_loader_ (DocumentLoader) -> url_
+                if (localFrameAddr) {
+                    try {
+                        // Offset of loader_ in LocalFrame (0x1c8 based on dx output)
+                        // Offset of document_loader_ in FrameLoader (0x10 based on dx output)
+                        // Total offset: 0x1d8
+                        var docLoaderPtrOffsetBig = BigInt("0x" + localFrameAddr) + 0x1d8n;
+                        var docLoaderPtrOffset = host.parseInt64(docLoaderPtrOffsetBig.toString(16), 16);
+
+                        // Read Compressed ptr
+                        var docLoaderCompressed = host.memory.readMemoryValues(docLoaderPtrOffset, 1, 4)[0];
+
+                        // Decompress (using LocalFrame as context, they are in same heap)
+                        var docLoaderAddr = decompressCppgcPtr(docLoaderCompressed, localFrameAddr);
+
+                        // host.diagnostics.debugLog("Debug: DocLoaderAddr: 0x" + docLoaderAddr.toString(16) + "\n");
+
+                        if (docLoaderAddr) {
+                            // Use dx to extract the URL string from DocumentLoader
+                            // We target url_.string_ directly to get the data
+                            var dxCmd = "dx -r2 ((blink::DocumentLoader*)0x" + docLoaderAddr.toString(16) + ")->url_.string_";
+                            var output = ctl.ExecuteCommand(dxCmd);
+                            for (var line of output) {
+                                var sLine = line.toString();
+                                // host.diagnostics.debugLog("Debug dx: " + sLine + "\n");
+
+                                // Match AsciiText line: Debug dx: AsciiText : 0x... : "https://..." [Type: char *]
+                                if (sLine.indexOf("AsciiText") !== -1) {
+                                    var m = sLine.match(/"(.*)"/);
+                                    if (m) {
+                                        urlStr = m[1];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (eUrl) {
+                        host.diagnostics.debugLog("       (URL Error: " + eUrl.message + ")\n");
+                    }
+                }
+
+                if (urlStr) {
+                    host.diagnostics.debugLog("       URL:              " + urlStr + "\n");
+                } else {
+                    host.diagnostics.debugLog("       URL:              (use dx to inspect)\n");
+                }
+                host.diagnostics.debugLog("\n");
             }
-
-            host.diagnostics.debugLog("\n  Total frames: " + frameCount + "\n");
+        } else {
+            host.diagnostics.debugLog("  No frames found. Map may be empty.\n\n");
+            host.diagnostics.debugLog("  Manual inspection commands:\n");
+            host.diagnostics.debugLog("    dq 0x" + mapAddr + " L10\n");
+            host.diagnostics.debugLog("    dx *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")\n\n");
         }
 
         host.diagnostics.debugLog("\n  Useful commands:\n");
-        host.diagnostics.debugLog("    dx ((content::RenderFrameImpl*)<addr>)     - Inspect a frame\n");
-        host.diagnostics.debugLog("    dx ((blink::WebLocalFrame*)<addr>)         - Inspect WebFrame\n\n");
+        host.diagnostics.debugLog("    dx ((content::RenderFrameImpl*)<addr>)         - Inspect RenderFrameImpl\n");
+        host.diagnostics.debugLog("    dx ((content::RenderFrameImpl*)<addr>)->frame_ - Get WebLocalFrame\n");
+        host.diagnostics.debugLog("    dx ((blink::WebLocalFrame*)<addr>)             - Inspect WebFrame\n\n");
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
+        host.diagnostics.debugLog("  Error: " + (e.message || e.toString()) + "\n");
+        if (e.stack) {
+            host.diagnostics.debugLog("  Stack: " + e.stack + "\n");
+        }
         host.diagnostics.debugLog("\n  Manual approach:\n");
-        host.diagnostics.debugLog("    x chrome_child!*g_frame_map*\n");
-        host.diagnostics.debugLog("    dx -r3 ((content::`anonymous namespace'::FrameMap*)<addr>)\n\n");
+        host.diagnostics.debugLog("    x chrome!*g_frame_map*\n");
+        host.diagnostics.debugLog("    dq <addr> L1                ; Read LazyInstance.private_instance_\n");
+        host.diagnostics.debugLog("    dx *((content::`anonymous namespace'::FrameMap*)<ptr>)\n\n");
     }
 
     return "";
 }
 
-/// =============================================================================
-/// PROCESS-SPECIFIC EXECUTION
-/// =============================================================================
 
-/// Global storage for attach commands
-var g_attachCommands = [];
 
-/// Get the process type of the current process
-function getProcessType() {
-    try {
-        // Try to read command line
-        var cmdLine = getCommandLine();
-
-        // If read fails or returns empty, check if we are in a process where we expect this failure
-        // Typically sandboxed renderers might fail this read depending on debugger state
-        if (!cmdLine || cmdLine.length === 0) {
-            // Fallback: If we can't read it, assume renderer or verify via other means if possible.
-            // For now, returning 'renderer' is the safest heuristic for locked processes in this context.
-            return "renderer";
-        }
-
-        var info = parseProcessInfo(cmdLine);
-        return info.type;
-    } catch (e) {
-        // If we throw reading memory, it's likely a locked renderer
-        return "renderer";
-    }
-}
-
-/// Check if current process matches a type
-function isProcessType(targetType) {
-    return getProcessType() === targetType;
-}
-
-/// Check if current process is a renderer
-function is_renderer() {
-    var result = isProcessType("renderer");
-    host.diagnostics.debugLog("\n  Current process is " + (result ? "a RENDERER" : "NOT a renderer") + "\n\n");
-    return result;
-}
-
-/// Generic: Execute command in all processes of a specific type
-function runInProcessType(targetType, command) {
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    // If already in the target process type, run directly
-    if (isProcessType(targetType)) {
-        host.diagnostics.debugLog("  [" + targetType.toUpperCase() + " PID:" + host.currentProcess.Id + "] Executing: " + command + "\n");
-        try {
-            var output = ctl.ExecuteCommand(command);
-            for (var line of output) {
-                host.diagnostics.debugLog("  " + line + "\n");
-            }
-        } catch (e) {
-            host.diagnostics.debugLog("  Error: " + e.message + "\n");
-        }
-        return "executed";
-    }
-
-    // Not in target type - iterate through all processes
-    host.diagnostics.debugLog("\n=== Running in All " + targetType.toUpperCase() + " Processes ===\n\n");
-
-    try {
-        // 1. Get Map
-        var pidToSysId = getPidToSysIdMap();
-        var processes = host.currentSession.Processes;
-
-        var matchCount = 0;
-        var matchingSystemIds = [];
-
-        // Find matching processes
-        for (var proc of processes) {
-            try {
-                var pid = parseInt(proc.Id.toString());
-                var sysId = pidToSysId.has(pid) ? pidToSysId.get(pid) : null;
-
-                if (sysId === null) continue;
-
-                // 2. Get Safe Info
-                var info = getProcessInfoSafe(proc, sysId);
-
-                if (info.type === targetType) {
-                    matchingSystemIds.push({ sysId: sysId, pid: pid });
-                }
-            } catch (e) { }
-        }
-
-        if (matchingSystemIds.length === 0) {
-            host.diagnostics.debugLog("  No " + targetType + " processes found.\n\n");
-            return "no_match";
-        }
-
-        host.diagnostics.debugLog("  Found " + matchingSystemIds.length + " " + targetType + " process(es)\n\n");
-
-        // Execute in each matching process
-        for (var i = 0; i < matchingSystemIds.length; i++) {
-            var info = matchingSystemIds[i];
-            host.diagnostics.debugLog("  [" + targetType.toUpperCase() + " PID:" + info.pid + "] Executing: " + command + "\n");
-
-            try {
-                ctl.ExecuteCommand("|" + info.sysId + "s");
-                var output = ctl.ExecuteCommand(command);
-                for (var line of output) {
-                    host.diagnostics.debugLog("    " + line + "\n");
-                }
-                matchCount++;
-            } catch (e) {
-                host.diagnostics.debugLog("    Error: " + e.message + "\n");
-            }
-        }
-
-        // Restore original context if possible (approximate)
-        try { ctl.ExecuteCommand("|0s"); } catch (e) { }
-
-        host.diagnostics.debugLog("\n  Executed in " + matchCount + " " + targetType + " process(es)\n\n");
-        return "executed_in_" + matchCount;
-
-    } catch (e) {
-        host.diagnostics.debugLog("Error in runInProcessType: " + e.message + "\n");
-        return "error";
-    }
-}
 
 /// Execute a command only in renderer processes (works from any process context)
 function run_in_renderer(command) {
     if (!command) {
         host.diagnostics.debugLog("\n=== Run in Renderer ===\n\n");
         host.diagnostics.debugLog("  Usage: !run_in_renderer \"<windbg command>\"\n");
-        host.diagnostics.debugLog("  Example: !run_in_renderer \"bp chrome_child!v8::internal::Heap::CollectGarbage\"\n\n");
+        host.diagnostics.debugLog("  Example: !run_in_renderer \"bp chrome!v8::internal::Heap::CollectGarbage\"\n\n");
         host.diagnostics.debugLog("  Works from ANY process - automatically finds and runs in all renderers.\n\n");
         return "";
     }
@@ -1918,7 +2176,7 @@ function run_in_gpu(command) {
     if (!command) {
         host.diagnostics.debugLog("\n=== Run in GPU ===\n\n");
         host.diagnostics.debugLog("  Usage: !run_in_gpu \"<windbg command>\"\n");
-        host.diagnostics.debugLog("  Example: !run_in_gpu \"bp chrome_child!gpu::CommandBufferService::Flush\"\n\n");
+        host.diagnostics.debugLog("  Example: !run_in_gpu \"bp chrome!gpu::CommandBufferService::Flush\"\n\n");
         host.diagnostics.debugLog("  Works from ANY process - automatically finds and runs in GPU process.\n\n");
         return "";
     }
@@ -1935,7 +2193,7 @@ function on_renderer_attach(command) {
         host.diagnostics.debugLog("  Usage: !on_renderer_attach \"<windbg command>\"\n\n");
         host.diagnostics.debugLog("  Examples:\n");
         host.diagnostics.debugLog("    !on_renderer_attach \"!sandbox_state\"\n");
-        host.diagnostics.debugLog("    !on_renderer_attach \"bp chrome_child!blink::Document::CreateRawElement\"\n");
+        host.diagnostics.debugLog("    !on_renderer_attach \"bp chrome!blink::Document::CreateRawElement\"\n");
         host.diagnostics.debugLog("    !on_renderer_attach \".echo Renderer attached!\"\n\n");
         host.diagnostics.debugLog("  Registered commands:\n");
         host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
@@ -2163,22 +2421,22 @@ function vuln_hunt() {
                 name: "Use-After-Free Indicators",
                 targets: [
                     { sym: "ntdll!RtlFreeHeap", desc: "Heap free (watch for double-free)" },
-                    { sym: "chrome_child!base::PartitionFree", desc: "PartitionAlloc free" },
+                    { sym: "chrome!base::PartitionFree", desc: "PartitionAlloc free" },
                     { sym: "chrome!content::RenderProcessHostImpl::Cleanup", desc: "Renderer cleanup" }
                 ]
             },
             {
                 name: "Type Confusion Points",
                 targets: [
-                    { sym: "chrome_child!blink::V8ScriptValueDeserializer::Deserialize", desc: "Deserialization" },
-                    { sym: "chrome_child!v8::internal::Object::ToObject", desc: "V8 type coercion" }
+                    { sym: "chrome!blink::V8ScriptValueDeserializer::Deserialize", desc: "Deserialization" },
+                    { sym: "chrome!v8::internal::Object::ToObject", desc: "V8 type coercion" }
                 ]
             },
             {
                 name: "Race Condition Hotspots",
                 targets: [
                     { sym: "chrome!content::ChildProcessHost::OnMessageReceived", desc: "IPC receive (browser)" },
-                    { sym: "chrome_child!content::ChildThreadImpl::OnMessageReceived", desc: "IPC receive (renderer)" }
+                    { sym: "chrome!content::ChildThreadImpl::OnMessageReceived", desc: "IPC receive (renderer)" }
                 ]
             },
             {
@@ -2229,7 +2487,7 @@ function heap_info() {
         host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
         host.diagnostics.debugLog("    dt chrome!base::PartitionRoot\n");
         host.diagnostics.debugLog("    dt chrome!base::internal::SlotSpanMetadata\n");
-        host.diagnostics.debugLog("    dt chrome_child!base::PartitionRoot\n\n");
+        host.diagnostics.debugLog("    dt chrome!base::PartitionRoot\n\n");
 
         host.diagnostics.debugLog("  Useful Commands:\n");
         host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
@@ -2248,14 +2506,14 @@ function heap_info() {
         ];
 
         for (var i = 0; i < paTargets.length; i++) {
-            var sym = (procType === "browser" ? "chrome!" : "chrome_child!") + paTargets[i];
+            var sym = "chrome!" + paTargets[i];
             host.diagnostics.debugLog("    bp " + sym + "\n");
         }
 
         host.diagnostics.debugLog("\n  V8 Heap (renderer only):\n");
         host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
-        host.diagnostics.debugLog("    dt chrome_child!v8::internal::Heap\n");
-        host.diagnostics.debugLog("    bp chrome_child!v8::internal::Heap::CollectGarbage\n\n");
+        host.diagnostics.debugLog("    dt chrome!v8::internal::Heap\n");
+        host.diagnostics.debugLog("    bp chrome!v8::internal::Heap::CollectGarbage\n\n");
 
     } catch (e) {
         host.diagnostics.debugLog("  Error: " + e.message + "\n");
@@ -2277,7 +2535,7 @@ function blink_help() {
   !bp_pm        - Break on postMessage (cross-origin comms)
   !bp_fetch     - Break on fetch/XHR requests
 
-  Target symbols (chrome_child.dll):
+  Target symbols (chrome.dll):
     blink::Document::CreateRawElement
     blink::LocalDOMWindow::postMessage
     blink::FetchManager::Fetch
@@ -2290,9 +2548,9 @@ function bp_element() {
     return set_breakpoints(
         "DOM Element Creation Breakpoints",
         [
-            "chrome_child!blink::Document::CreateRawElement",
-            "chrome_child!blink::Document::createElement",
-            "chrome_child!blink::HTMLElement::insertAdjacentHTML"
+            "chrome!blink::Document::CreateRawElement",
+            "chrome!blink::Document::createElement",
+            "chrome!blink::HTMLElement::insertAdjacentHTML"
         ],
         "DOM clobbering, XSS sink analysis"
     );
@@ -2302,10 +2560,10 @@ function bp_nav() {
     return set_breakpoints(
         "Navigation Breakpoints",
         [
-            "chrome_child!blink::LocalDOMWindow::setLocation",
-            "chrome_child!blink::Location::assign",
-            "chrome_child!blink::Location::replace",
-            "chrome_child!blink::FrameLoader::StartNavigation"
+            "chrome!blink::LocalDOMWindow::setLocation",
+            "chrome!blink::Location::assign",
+            "chrome!blink::Location::replace",
+            "chrome!blink::FrameLoader::StartNavigation"
         ],
         "Navigation hijacking, URL spoofing"
     );
@@ -2315,8 +2573,8 @@ function bp_pm() {
     return set_breakpoints(
         "postMessage Breakpoints",
         [
-            "chrome_child!blink::LocalDOMWindow::postMessage",
-            "chrome_child!blink::MessageEvent::Create"
+            "chrome!blink::LocalDOMWindow::postMessage",
+            "chrome!blink::MessageEvent::Create"
         ],
         "Cross-origin message interception"
     );
@@ -2326,9 +2584,9 @@ function bp_fetch() {
     return set_breakpoints(
         "Fetch/XHR Breakpoints",
         [
-            "chrome_child!blink::FetchManager::Fetch",
-            "chrome_child!blink::XMLHttpRequest::send",
-            "chrome_child!blink::XMLHttpRequest::open"
+            "chrome!blink::FetchManager::Fetch",
+            "chrome!blink::XMLHttpRequest::send",
+            "chrome!blink::XMLHttpRequest::open"
         ],
         "Request interception, CORS bypass"
     );
@@ -2347,11 +2605,11 @@ function v8_help() {
   !bp_wasm      - Break on WebAssembly compilation  
   !bp_jit       - Break on JIT code generation
 
-  Target module: chrome_child.dll (v8 is statically linked)
+  Target module: chrome.dll (v8 is statically linked)
   
   Tips:
   - V8 symbols are large, use: .symopt+0x10 for deferred loading
-  - For heap inspection: dt chrome_child!v8::internal::Heap
+  - For heap inspection: dt chrome!v8::internal::Heap
   
 `);
     return "";
@@ -2361,9 +2619,9 @@ function bp_compile() {
     return set_breakpoints(
         "V8 Script Compilation Breakpoints",
         [
-            "chrome_child!v8::Script::Compile",
-            "chrome_child!v8::ScriptCompiler::Compile",
-            "chrome_child!v8::internal::Compiler::Compile"
+            "chrome!v8::Script::Compile",
+            "chrome!v8::ScriptCompiler::Compile",
+            "chrome!v8::internal::Compiler::Compile"
         ],
         "Analyzing JIT compilation, CSP bypass"
     );
@@ -2373,9 +2631,9 @@ function bp_gc() {
     return set_breakpoints(
         "V8 Garbage Collection Breakpoints",
         [
-            "chrome_child!v8::internal::Heap::CollectGarbage",
-            "chrome_child!v8::internal::Heap::PerformGarbageCollection",
-            "chrome_child!v8::internal::MarkCompactCollector::CollectGarbage"
+            "chrome!v8::internal::Heap::CollectGarbage",
+            "chrome!v8::internal::Heap::PerformGarbageCollection",
+            "chrome!v8::internal::MarkCompactCollector::CollectGarbage"
         ],
         "UAF exploitation, heap grooming"
     );
@@ -2385,9 +2643,9 @@ function bp_wasm() {
     return set_breakpoints(
         "WebAssembly Breakpoints",
         [
-            "chrome_child!v8::internal::wasm::CompileLazy",
-            "chrome_child!v8::internal::wasm::WasmEngine::SyncCompile",
-            "chrome_child!v8::internal::wasm::WasmCodeManager::Commit"
+            "chrome!v8::internal::wasm::CompileLazy",
+            "chrome!v8::internal::wasm::WasmEngine::SyncCompile",
+            "chrome!v8::internal::wasm::WasmCodeManager::Commit"
         ],
         "WASM JIT bugs, RWX page analysis"
     );
@@ -2397,9 +2655,9 @@ function bp_jit() {
     return set_breakpoints(
         "V8 JIT Code Generation Breakpoints",
         [
-            "chrome_child!v8::internal::compiler::PipelineImpl::GenerateCode",
-            "chrome_child!v8::internal::Builtins::Generate_*",
-            "chrome_child!v8::internal::MacroAssembler::Call"
+            "chrome!v8::internal::compiler::PipelineImpl::GenerateCode",
+            "chrome!v8::internal::Builtins::Generate_*",
+            "chrome!v8::internal::MacroAssembler::Call"
         ],
         "JIT spray, code injection analysis"
     );

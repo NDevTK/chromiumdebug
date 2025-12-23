@@ -19,7 +19,7 @@ Then in WinDbg: `!chelp`
 | `!procs` | List all Chrome processes with types & sites |
 | `!proc` | Show current process type (+ site if renderer) |
 | `!cmdline` | Show command line switches |
-| `!frames` | List all frames in current renderer process |
+| `!frames` | List all frames (Local/Remote) with **URLs**, IDs, and addresses |
 
 ### Sandbox & Security
 | Command | Description |
@@ -48,7 +48,7 @@ Then in WinDbg: `!chelp`
 ### Origin Spoofing & Function Patching
 | Command | Description |
 |---------|-------------|
-| `!spoof("url")` | Spoof renderer origin by patching memory (auto-detects current) |
+| `!spoof("url")` | Spoof renderer origin (memory patch). Supports subdomains/paths. |
 | `!patch("FullscreenIsSupported","false")` | Patch function to return value (supports true/false/hex, auto-inlining detection) |
 
 ### Cross-Process Execution
