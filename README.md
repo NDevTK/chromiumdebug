@@ -49,7 +49,7 @@ Then in WinDbg: `!chelp`
 | Command | Description |
 |---------|-------------|
 | `!spoof "url"` | Spoof renderer origin by patching memory (auto-detects current) |
-| `!patch "name" "value"` | Patch function to return specific value (auto-searches symbols) |
+| `!patch("Fullscreen::FullscreenEnabled","1")` | Patch function to return specific value (auto-searches symbols) |
 
 ### Cross-Process Execution
 | Command | Description |
