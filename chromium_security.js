@@ -121,8 +121,8 @@ function help() {
     !heap_info            - PartitionAlloc/V8 heap inspection guide
 
   ORIGIN SPOOFING & FUNCTION PATCHING (renderer only):
-    !spoof \"url\"              - Spoof origin by patching memory
-    !patch \"sym\" \"v\"          - Patch function to return value v
+    !spoof("url")                            - Spoof origin by patching memory
+    !patch("Fullscreen::FullscreenEnabled","1") - Patch function to return value
 
 
   BLINK DOM HOOKS:
@@ -140,12 +140,12 @@ function help() {
     !bp_jit               - Break on JIT compilation
 
   PROCESS-SPECIFIC EXECUTION (works from any process):
-    !run_renderer \"cmd\"       - Run command in all renderer processes
-    !run_browser \"cmd\"        - Run command in browser process
-    !run_gpu \"cmd\"            - Run command in GPU process
-    !script_renderer \"path\"   - Load script in all renderers
-    !on_attach \"cmd\"          - Auto-run command when renderers attach
-    !script_attach \"path\"     - Auto-load script when renderers attach
+    !run_renderer("cmd")      - Run command in all renderer processes
+    !run_browser("cmd")       - Run command in browser process
+    !run_gpu("cmd")           - Run command in GPU process
+    !script_renderer("path")  - Load script in all renderers
+    !on_attach("cmd")         - Auto-run command when renderers attach
+    !script_attach("path")    - Auto-load script when renderers attach
 
   TIPS:
     - Use '|' to switch between processes: |0s, |1s, etc.
@@ -762,10 +762,10 @@ function patch_function(funcName, returnValue) {
     host.diagnostics.debugLog("\n=== Patch Function ===\n\n");
 
     if (!funcName || funcName === "") {
-        host.diagnostics.debugLog("  Usage: !patch_function \"FunctionName\" \"return_value\"\n\n");
+        host.diagnostics.debugLog("  Usage: !patch(\"ClassName::FunctionName\",\"return_value\")\n\n");
         host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !patch_function \"IsFeatureEnabled\" \"1\"\n");
-        host.diagnostics.debugLog("    !patch_function \"*CanAccess*\" \"1\"\n\n");
+        host.diagnostics.debugLog("    !patch(\"Fullscreen::FullscreenEnabled\",\"1\")\n");
+        host.diagnostics.debugLog("    !patch(\"*CanAccess*\",\"1\")\n\n");
         host.diagnostics.debugLog("  Auto-searches for matching symbols in chrome/chrome_child.\n\n");
         return "";
     }
@@ -837,8 +837,8 @@ function spoof_origin(targetUrl) {
     var ctl = host.namespace.Debugger.Utility.Control;
 
     if (!targetUrl || targetUrl === "") {
-        host.diagnostics.debugLog("  Usage: !spoof_origin \"https://target.com\"\n\n");
-        host.diagnostics.debugLog("  Example: !spoof_origin \"https://google.com\"\n\n");
+        host.diagnostics.debugLog("  Usage: !spoof(\"https://target.com\")\n\n");
+        host.diagnostics.debugLog("  Example: !spoof(\"https://google.com\")\n\n");
         host.diagnostics.debugLog("  Auto-detects current origin and patches all occurrences.\n\n");
         return "";
     }
