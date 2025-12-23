@@ -1,6 +1,7 @@
 # Chromium Security Research WinDbg Toolkit
 
-An experimental WinDbg debugging toolkit for Chromium security researchers.
+An experimental WinDbg debugging toolkit for Chromium security researchers.  
+Inspired by <https://github.com/shhnjk/spoof.js>
 
 ## Quick Start
 - Install Chrome Canary <https://www.google.com/chrome/canary/>
