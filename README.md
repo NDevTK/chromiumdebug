@@ -5,7 +5,7 @@ Inspired by <https://github.com/shhnjk/spoof.js>
 
 ## Quick Start
 - Install Chrome Canary <https://www.google.com/chrome/canary/>
-- Install Windbg from MS Store <https://apps.microsoft.com/detail/9pgjgd53tn86>
+- Install WinDbg from MS Store <https://apps.microsoft.com/detail/9pgjgd53tn86>
 - Download repository and run `debug_chrome.bat`
 
 Then in WinDbg: `!chelp`
