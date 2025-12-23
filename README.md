@@ -1,12 +1,11 @@
 # Chromium Security Research WinDbg Toolkit
 
-A WinDbg debugging toolkit for Chromium security researchers.
+An experimental WinDbg debugging toolkit for Chromium security researchers.
 
 ## Quick Start
-
-```batch
-debug_chrome.bat
-```
+- Install Chrome Canary <https://www.google.com/chrome/canary/>
+- Install Windbg from MS Store <https://apps.microsoft.com/detail/9pgjgd53tn86>
+- Download repository and run `debug_chrome.bat`
 
 Then in WinDbg: `!chelp`
 
@@ -68,13 +67,4 @@ ChromeHelper/
 ├── debug_chrome.bat          # Launcher (auto-cleans old sessions)
 ├── chromium_security.js      # Main WinDbg script (includes all hooks)
 └── init.txt                  # WinDbg init commands
-```
-
-## Symbol Configuration
-
-The batch script auto-configures symbols. Manual setup:
-```
-.sympath srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
-.sympath+ srv*C:\Symbols*https://chromium-browser-symsrv.commondatastorage.googleapis.com
-.reload /f
 ```
