@@ -2326,19 +2326,17 @@ function spoof_origin(targetUrl) {
     try {
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            var extracted = CommandLineUtils.getHostFromUrl(site);
-            // Verify it looks like a domain if it didn't come from a URL match
-            // (getHostFromUrl returns raw input fallback, so we check for dot or if it changed)
-            if (extracted !== site || site.indexOf(".") !== -1) {
-                currentHost = extracted;
-            }
+            // User requested support for any URL/Scheme.
+            // Previously we extracted host, but that caused issues with scheme mismatches (e.g. double https://).
+            // We now use the full site string as the search pattern.
+            currentHost = site;
         }
     } catch (e) { }
 
     if (!currentHost) {
         Logger.empty();
-        Logger.warn("Could not detect current origin.");
-        Logger.info("Make sure you're in a renderer with a loaded page.");
+        Logger.warn("Could not detect current origin_lock.");
+        Logger.info("Make sure you're in a renderer with a loaded page and correct symbols.");
         Logger.empty();
         return "";
     }
