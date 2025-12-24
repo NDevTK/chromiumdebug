@@ -2394,8 +2394,8 @@ function spoof_origin(targetUrl) {
                     for (var i = 0; i < replaceStr.length; i++) {
                         byteStr += " " + replaceStr.charCodeAt(i).toString(16).padStart(2, '0');
                     }
-                    // Add null terminator if replacement is shorter
-                    if (replaceStr.length < searchStr.length) {
+                    // Pad remainder with nulls
+                    for (var k = replaceStr.length; k < searchStr.length; k++) {
                         byteStr += " 00";
                     }
                     ctl.ExecuteCommand('eb 0x' + addr + byteStr);
@@ -2435,8 +2435,8 @@ function spoof_origin(targetUrl) {
                         byteStr += " " + (code & 0xFF).toString(16).padStart(2, '0');
                         byteStr += " " + ((code >> 8) & 0xFF).toString(16).padStart(2, '0');
                     }
-                    // Add null terminator if replacement is shorter
-                    if (replaceStr.length < searchStr.length) {
+                    // Pad remainder with nulls
+                    for (var k = replaceStr.length; k < searchStr.length; k++) {
                         byteStr += " 00 00";
                     }
                     ctl.ExecuteCommand('eb 0x' + addr + byteStr);
