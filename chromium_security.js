@@ -1624,9 +1624,9 @@ function bp_renderer_launch() {
     return set_breakpoints(
         "Renderer Launch Breakpoints",
         [
-            "content!RenderProcessHostImpl::Init",
-            "content!RenderProcessHostImpl::OnProcessLaunched",
-            "content!ChildProcessLauncher::Launch"
+            "chrome!content::RenderProcessHostImpl::Init",
+            "chrome!content::RenderProcessHostImpl::OnProcessLaunched",
+            "chrome!content::ChildProcessLauncher::Launch"
         ],
         "Breaking when renderer processes start"
     );
@@ -1637,8 +1637,8 @@ function bp_sandbox_lower() {
     return set_breakpoints(
         "Sandbox Token Breakpoints",
         [
-            "sandbox!TargetServicesBase::LowerToken",
-            "sandbox!ProcessState::SetRevertedToSelf"
+            "chrome!sandbox::TargetServicesBase::LowerToken",
+            "chrome!sandbox::ProcessState::SetRevertedToSelf"
         ],
         "Breaking when sandbox restricts token"
     );
@@ -1649,9 +1649,9 @@ function bp_mojo_interface() {
     return set_breakpoints(
         "Mojo Interface Breakpoints",
         [
-            "content!BrowserInterfaceBrokerImpl::GetInterface",
-            "content!RenderProcessHostImpl::BindReceiver",
-            "mojo!MessagePipeDispatcher::WriteMessage"
+            "chrome!content::BrowserInterfaceBrokerImpl::GetInterface",
+            "chrome!content::RenderProcessHostImpl::BindReceiver",
+            "chrome!mojo::core::MessagePipeDispatcher::WriteMessage"
         ],
         "Tracking Mojo IPC"
     );
@@ -1662,8 +1662,8 @@ function bp_ipc_message() {
     return set_breakpoints(
         "IPC Message Breakpoints",
         [
-            "content!ChildProcessHost::OnMessageReceived",
-            "ipc!ChannelMojo::OnMessageReceived"
+            "chrome!content::ChildProcessHost::OnMessageReceived",
+            "chrome!IPC::ChannelMojo::OnMessageReceived"
         ],
         "IPC message logging"
     );
@@ -1835,8 +1835,8 @@ function site_isolation_status() {
     Logger.info("");
     Logger.info("  Runtime Check Breakpoints:");
     Logger.info("  " + "-".repeat(40));
-    Logger.info("    bp content!SiteIsolationPolicy::UseDedicatedProcessesForAllSites");
-    Logger.info("    bp content!SiteInstanceImpl::GetSiteForURL");
+    Logger.info("    bp chrome!content::SiteIsolationPolicy::UseDedicatedProcessesForAllSites");
+    Logger.info("    bp chrome!content::SiteInstanceImpl::GetSiteForURL");
     Logger.empty();
 
     return "";
@@ -2227,9 +2227,9 @@ function bp_bad_message() {
     return set_breakpoints(
         "Bad Message Breakpoints (Security Violations)",
         [
-            "mojo!mojo::ReportBadMessage",
-            "mojo_base!mojo::ReportBadMessage",
-            "content!mojo::ReportBadMessage"
+            "chrome!mojo::ReportBadMessage",
+            "chrome!mojo::ReportBadMessage",
+            "chrome!mojo::ReportBadMessage"
         ],
         "Breaking on security violations (check message string)"
     );
@@ -2240,12 +2240,12 @@ function bp_security_check() {
     return set_breakpoints(
         "Security Policy Breakpoints",
         [
-            { sym: "content!ChildProcessSecurityPolicyImpl::CanAccessDataForOrigin", desc: "Origin access check" },
-            { sym: "content!ChildProcessSecurityPolicyImpl::CanCommitURL", desc: "URL commit check" },
-            { sym: "content!ChildProcessSecurityPolicyImpl::GetProcessLock", desc: "Process lock query" },
-            { sym: "content!SiteIsolationPolicy::UseDedicatedProcessesForAllSites", desc: "Site isolation check" },
-            { sym: "content!SiteInstanceImpl::GetProcess", desc: "SiteInstance process" },
-            { sym: "sandbox!TargetServicesBase::LowerToken", desc: "Sandbox token lowering" }
+            { sym: "chrome!content::ChildProcessSecurityPolicyImpl::CanAccessDataForOrigin", desc: "Origin access check" },
+            { sym: "chrome!content::ChildProcessSecurityPolicyImpl::CanCommitURL", desc: "URL commit check" },
+            { sym: "chrome!content::ChildProcessSecurityPolicyImpl::GetProcessLock", desc: "Process lock query" },
+            { sym: "chrome!content::SiteIsolationPolicy::UseDedicatedProcessesForAllSites", desc: "Site isolation check" },
+            { sym: "chrome!content::SiteInstanceImpl::GetProcess", desc: "SiteInstance process" },
+            { sym: "chrome!sandbox::TargetServicesBase::LowerToken", desc: "Sandbox token lowering" }
         ],
         "Breaking on security policy checks"
     );
@@ -2256,9 +2256,9 @@ function trace_ipc() {
     return set_breakpoints(
         "IPC Tracing Mode",
         [
-            { sym: "mojo!mojo::MessageDispatcher::Accept", desc: "Mojo message accept", cmd: 'bp mojo!mojo::MessageDispatcher::Accept ".echo [IPC] Mojo message accept; k 3; g"' },
-            { sym: "content!BrowserInterfaceBrokerImpl::GetInterface", desc: "Interface broker", cmd: 'bp content!BrowserInterfaceBrokerImpl::GetInterface ".echo [IPC] Interface broker; k 3; g"' },
-            { sym: "ipc!IPC::ChannelMojo::OnMessageReceived", desc: "Legacy IPC receive", cmd: 'bp ipc!IPC::ChannelMojo::OnMessageReceived ".echo [IPC] Legacy IPC receive; k 3; g"' }
+            { sym: "chrome!mojo::MessageDispatcher::Accept", desc: "Mojo message accept", cmd: 'bp chrome!mojo::MessageDispatcher::Accept ".echo [IPC] Mojo message accept; k 3; g"' },
+            { sym: "chrome!content::BrowserInterfaceBrokerImpl::GetInterface", desc: "Interface broker", cmd: 'bp chrome!content::BrowserInterfaceBrokerImpl::GetInterface ".echo [IPC] Interface broker; k 3; g"' },
+            { sym: "chrome!IPC::ChannelMojo::OnMessageReceived", desc: "Legacy IPC receive", cmd: 'bp chrome!IPC::ChannelMojo::OnMessageReceived ".echo [IPC] Legacy IPC receive; k 3; g"' }
         ],
         "Logging IPC traffic (noisy!)"
     );
@@ -2401,7 +2401,7 @@ function blink_help() {
     Logger.empty();
     Logger.info("  Target symbols (chrome.dll):");
     Logger.info("    blink::Document::CreateRawElement");
-    Logger.info("    blink::LocalDOMWindow::postMessage");
+    Logger.info("    blink::LocalDOMWindow::DispatchPostMessage");
     Logger.info("    blink::FetchManager::Fetch");
     Logger.empty();
     return "";
