@@ -8,8 +8,585 @@
 "use strict";
 
 /// Global state
-var g_initialized = false;
-var g_processTypes = {};
+var g_rendererAttachCommands = [];
+
+/// Constants
+const MAX_PATCHES = 10;
+const MAX_CALLER_DISPLAY = 3;
+const BROWSER_CMDLINE_MIN_LENGTH = 500;
+const USER_MODE_ADDR_LIMIT = "0x7fffffffffff";
+const MIN_PTR_VALUE_LENGTH = 4;
+
+/// Helper: Check if string is empty or null
+function isEmpty(str) {
+    return !str || str === "";
+}
+
+/// Helper: Register sxe cpr handler for renderer attach
+function _registerRendererSxeHandler(commandString, displayLabel) {
+    try {
+        var ctl = SymbolUtils.getControl();
+        // Escape quotes for nesting
+        var escapedCmd = commandString.replace(/"/g, "'");
+        var handlerCmd = "sxe -c \"" + escapedCmd + "; g\" cpr";
+        Logger.info("  Setting up: " + handlerCmd);
+        ctl.ExecuteCommand(handlerCmd);
+        Logger.empty();
+        Logger.info("  Handler registered. " + (displayLabel || "Command") + " will run in new renderer processes.");
+        Logger.empty();
+    } catch (e) {
+        Logger.warn("Note: Auto-setup failed. Manually use sxe command.");
+        Logger.empty();
+    }
+}
+
+/// =============================================================================
+/// UTILITIES & CLASSES
+/// =============================================================================
+
+class Logger {
+    static log(msg) { host.diagnostics.debugLog(msg); }
+    static empty() { host.diagnostics.debugLog("\n"); }
+
+    static section(title) {
+        this.log("\n=== " + title + " ===\n\n");
+    }
+
+    static header(title) {
+        this.log("  " + title + "\n");
+        this.log("  " + "-".repeat(Math.max(40, title.length)) + "\n");
+    }
+
+    static info(msg, indent = 2) {
+        this.log(" ".repeat(indent) + msg + "\n");
+    }
+
+    static warn(msg) {
+        this.log("  [WARNING] " + msg + "\n\n");
+    }
+
+    static error(msg) {
+        this.log("  [ERROR] " + msg + "\n\n");
+    }
+
+    static separator(width = 40) {
+        this.log("  " + "-".repeat(width) + "\n");
+    }
+
+    static showUsage(title, usage, examples) {
+        this.section(title);
+        this.info("Usage: " + usage);
+        this.empty();
+        if (examples && examples.length > 0) {
+            this.info("Examples:");
+            for (var i = 0; i < examples.length; i++) {
+                this.info("  " + examples[i]);
+            }
+            this.empty();
+        }
+    }
+
+    /// Display filtered command line switches
+    static displaySwitches(switches, filterList) {
+        for (var i = 0; i < switches.length; i++) {
+            if (filterList.indexOf(switches[i].name) !== -1) {
+                var val = switches[i].value ? ("=" + switches[i].value) : "";
+                this.info("  --" + switches[i].name + val);
+            }
+        }
+    }
+}
+
+class SymbolUtils {
+    static getControl() { return host.namespace.Debugger.Utility.Control; }
+
+    /// Extract hex address from a line of debugger output (removes backticks)
+    static extractAddress(line) {
+        var match = line.toString().match(/^([0-9a-fA-F`]+)/);
+        return match ? match[1].replace(/`/g, "") : null;
+    }
+
+    static findSymbolAddress(pattern) {
+        try {
+            var output = this.getControl().ExecuteCommand("x " + pattern);
+            for (var line of output) {
+                var addr = this.extractAddress(line);
+                if (addr) return addr;
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    /// Execute command with fallback on error (DRY helper)
+    static tryExecute(cmd, fallback = []) {
+        try { return this.getControl().ExecuteCommand(cmd); } catch (e) { return fallback; }
+    }
+
+    static execute(cmd) {
+        return this.tryExecute(cmd, []);
+    }
+
+    static evaluate(expression) {
+        try {
+            // Use '?' to evaluate expression
+            var output = this.execute("? " + expression);
+            for (var line of output) {
+                var match = line.toString().match(/=\s+([0-9a-fA-F`]+)/);
+                if (match) return match[1].replace(/`/g, "");
+            }
+        } catch (e) { }
+        return null;
+    }
+}
+
+class MemoryUtils {
+    // Cache for cage bases
+    static _v8CageBase = null;
+    static _cppgcCageBase = null;
+
+    /// Invalidate cached cage bases (call when switching processes)
+    static invalidateCaches() {
+        this._v8CageBase = null;
+        this._cppgcCageBase = null;
+    }
+
+    static readGlobalPointer(symbolName) {
+        try {
+            var addr = SymbolUtils.findSymbolAddress(symbolName);
+            if (addr) {
+                var dqOutput = SymbolUtils.execute("dq 0x" + addr + " L1");
+                for (var dline of dqOutput) {
+                    var dMatch = dline.toString().match(/[0-9a-fA-F`]+\s+([0-9a-fA-F`]+)/);
+                    if (dMatch) return dMatch[1].replace(/`/g, "");
+                }
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    static parseBigInt(input) {
+        if (typeof input === "string") {
+            var ptrStr = input.replace(/`/g, "");
+            return BigInt(ptrStr.startsWith("0x") ? ptrStr : "0x" + ptrStr);
+        } else if (typeof input === "number") {
+            return BigInt("0x" + input.toString(16));
+        } else {
+            return BigInt(input);
+        }
+    }
+
+    static getV8CageBase() {
+        if (this._v8CageBase !== null) return this._v8CageBase;
+        this._v8CageBase = this.readGlobalPointer("chrome!v8::internal::MainCage::base_");
+        return this._v8CageBase;
+    }
+
+    static getCppgcCageBase() {
+        if (this._cppgcCageBase !== null) return this._cppgcCageBase;
+        this._cppgcCageBase = this.readGlobalPointer("chrome!cppgc::internal::CageBaseGlobal::g_base_");
+        return this._cppgcCageBase;
+    }
+
+    static decompressV8Ptr(compressedPtr) {
+        var cageBase = this.getV8CageBase();
+        if (!cageBase) return null;
+
+        var base = BigInt("0x" + cageBase);
+        var compressed = this.parseBigInt(compressedPtr);
+
+        // Sign-extend 32-bit (V8 uses signed offsets)
+        if (compressed > 0x7FFFFFFF) {
+            compressed = compressed - BigInt("0x100000000");
+        }
+
+        var fullPtr = base + compressed;
+        return fullPtr.toString(16);
+    }
+
+    static decompressCppgcPtr(compressedPtr, contextAddr) {
+        const kPointerCompressionShift = 3n;
+        const kPointerCompressionMask = 0x3FFFFFFFFn;
+        let base;
+
+        if (contextAddr) {
+            var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
+            const invMask = BigInt("0xFFFFFFFC00000000");
+            const cageBaseAddr = context & invMask;
+            base = cageBaseAddr | kPointerCompressionMask;
+        } else {
+            var cageBase = this.getCppgcCageBase();
+            if (!cageBase) return null;
+            base = BigInt("0x" + cageBase);
+        }
+
+        var compressed = this.parseBigInt(compressedPtr);
+        var signExtended = (compressed >= BigInt("0x80000000")) ?
+            (BigInt("0xFFFFFFFF00000000") | compressed) : compressed;
+
+        var shifted = signExtended << kPointerCompressionShift;
+        shifted = shifted & BigInt("0xFFFFFFFFFFFFFFFF");
+        var fullPtr = shifted & base;
+
+        return fullPtr.toString(16);
+    }
+}
+
+class CommandLineUtils {
+    static get() {
+        try {
+            var peb = host.currentProcess.Environment.EnvironmentBlock;
+            var cmdLine = peb.ProcessParameters.CommandLine.Buffer;
+            return host.memory.readWideString(cmdLine);
+        } catch (e) { return ""; }
+    }
+
+    static parseSwitches(cmdLine) {
+        var switches = [];
+        var regex = /--([\w-]+)(=("[^"]*"|[^\s]*))?/g;
+        var match;
+        while ((match = regex.exec(cmdLine)) !== null) {
+            switches.push({ name: match[1], value: (match[3] || "").replace(/"/g, '') });
+        }
+        return switches;
+    }
+
+    static getSwitch(cmdLine, name) {
+        var match = cmdLine.match(new RegExp("--" + name + "(=([^\\s\"]+|\"[^\"]*\"))?"));
+        return match ? (match[2] || "true").replace(/"/g, "") : null;
+    }
+
+    static getHostFromUrl(url) {
+        if (!url) return "";
+        var match = url.match(/^https?:\/\/([^\/]+)/);
+        return match ? match[1] : url;
+    }
+}
+
+class BreakpointManager {
+    static set(title, targets, description) {
+        Logger.section(title);
+        var ctl = SymbolUtils.getControl();
+
+        for (var t of targets) {
+            var sym = (typeof t === 'string') ? t : t.sym;
+            var desc = (typeof t === 'string') ? "" : (" (" + t.desc + ")");
+            var cmd = (typeof t === 'string') ? ("bp " + t) : (t.cmd ? t.cmd : "bp " + t.sym);
+
+            Logger.info(cmd + desc);
+            try { ctl.ExecuteCommand(cmd); } catch (e) { }
+        }
+
+        if (description) Logger.info("Useful for: " + description + "\n");
+    }
+}
+
+/// Integrity level SID lookup table
+const INTEGRITY_LEVELS = {
+    "S-1-16-0": "Untrusted",
+    "S-1-16-4096": "Low",
+    "S-1-16-8192": "Medium",
+    "S-1-16-12288": "High",
+    "S-1-16-16384": "System",
+    "S-1-15-2": "AppContainer"
+};
+
+/// Centralized breakpoint configurations (DRY)
+const BREAKPOINT_CONFIGS = {
+    element: {
+        title: "DOM Element Creation Breakpoints",
+        targets: [
+            "chrome!blink::Document::CreateRawElement",
+            "chrome!blink::Document::createElement",
+            "chrome!blink::HTMLElement::insertAdjacentHTML"
+        ],
+        desc: "DOM clobbering, XSS sink analysis"
+    },
+    nav: {
+        title: "Navigation Breakpoints",
+        targets: [
+            "chrome!blink::LocalDOMWindow::setLocation",
+            "chrome!blink::Location::assign",
+            "chrome!blink::Location::replace",
+            "chrome!blink::FrameLoader::StartNavigation"
+        ],
+        desc: "Navigation hijacking, URL spoofing"
+    },
+    pm: {
+        title: "postMessage Breakpoints",
+        targets: [
+            "chrome!blink::LocalDOMWindow::postMessage",
+            "chrome!blink::MessageEvent::Create"
+        ],
+        desc: "Cross-origin message interception"
+    },
+    fetch: {
+        title: "Fetch/XHR Breakpoints",
+        targets: [
+            "chrome!blink::FetchManager::Fetch",
+            "chrome!blink::XMLHttpRequest::send",
+            "chrome!blink::XMLHttpRequest::open"
+        ],
+        desc: "Request interception, CORS bypass"
+    },
+    compile: {
+        title: "V8 Script Compilation Breakpoints",
+        targets: [
+            "chrome!v8::Script::Compile",
+            "chrome!v8::ScriptCompiler::Compile",
+            "chrome!v8::internal::Compiler::Compile"
+        ],
+        desc: "Analyzing JIT compilation, CSP bypass"
+    },
+    gc: {
+        title: "V8 Garbage Collection Breakpoints",
+        targets: [
+            "chrome!v8::internal::Heap::CollectGarbage",
+            "chrome!v8::internal::Heap::PerformGarbageCollection",
+            "chrome!v8::internal::MarkCompactCollector::CollectGarbage"
+        ],
+        desc: "UAF exploitation, heap grooming"
+    },
+    wasm: {
+        title: "WebAssembly Breakpoints",
+        targets: [
+            "chrome!v8::internal::wasm::CompileLazy",
+            "chrome!v8::internal::wasm::WasmEngine::SyncCompile",
+            "chrome!v8::internal::wasm::WasmCodeManager::Commit"
+        ],
+        desc: "WASM JIT bugs, RWX page analysis"
+    },
+    jit: {
+        title: "V8 JIT Code Generation Breakpoints",
+        targets: [
+            "chrome!v8::internal::compiler::PipelineImpl::GenerateCode",
+            "chrome!v8::internal::Builtins::Generate_*",
+            "chrome!v8::internal::MacroAssembler::Call"
+        ],
+        desc: "JIT spray, code injection analysis"
+    }
+};
+
+/// Helper: Create breakpoint handler from config key
+function _bpFromConfig(key) {
+    var cfg = BREAKPOINT_CONFIGS[key];
+    return set_breakpoints(cfg.title, cfg.targets, cfg.desc);
+}
+
+/// Helper: Extract URL from dx output line
+function extractUrlFromLine(lineStr) {
+    var urlMatch = lineStr.match(/"(https?:\/\/[^"]+)"/) ||
+        lineStr.match(/"(chrome-extension:\/\/[^"]+)"/) ||
+        lineStr.match(/"(chrome:\/\/[^"]+)"/);
+    return urlMatch ? urlMatch[1] : null;
+}
+
+/// Helper: Get a compressed member pointer value using symbols
+/// @param baseAddr - Base address (with or without 0x prefix)
+/// @param typeCast - Type cast string, e.g. "(blink::WebLocalFrameImpl*)"
+/// @param memberName - Member name to read
+/// @returns Compressed pointer value or null
+function getCompressedMember(baseAddr, typeCast, memberName) {
+    try {
+        var ctl = SymbolUtils.getControl();
+        var cmd = "dx &(" + typeCast + baseAddr + ")->" + memberName;
+        var out = ctl.ExecuteCommand(cmd);
+        for (var line of out) {
+            var l = line.toString();
+            var m = l.match(/: (0x[0-9a-fA-F`]+)/);
+            if (m) {
+                var addr = m[1].replace(/`/g, "");
+                var ptrVal = host.memory.readMemoryValues(host.parseInt64(addr, 16), 1, 4)[0];
+                return ptrVal;
+            }
+        }
+    } catch (e) { }
+    return null;
+}
+
+/// Helper: Read URL string from dx output for a url_.string_ member
+/// @param addr - Address of the object containing url_
+/// @param typeCast - Type cast string, e.g. "(blink::DocumentLoader*)"
+/// @returns URL string or null
+function readUrlStringFromDx(addr, typeCast) {
+    try {
+        var ctl = SymbolUtils.getControl();
+        var dxCmd = "dx -r2 (" + typeCast + "0x" + addr + ")->url_.string_";
+        var output = ctl.ExecuteCommand(dxCmd);
+        for (var line of output) {
+            var sLine = line.toString();
+            if (sLine.indexOf("AsciiText") !== -1 || sLine.indexOf("Text") !== -1) {
+                var m = sLine.match(/\"(.*)\"/);
+                if (m) return m[1];
+            }
+        }
+    } catch (e) { }
+    return null;
+}
+
+class ProcessUtils {
+    static getCurrentSysId() {
+        var pidToSysId = this.getPidToSysIdMap();
+        try {
+            var currentPid = parseInt(host.currentProcess.Id.toString());
+            return pidToSysId.has(currentPid) ? pidToSysId.get(currentPid) : 0;
+        } catch (e) { return 0; }
+    }
+
+    static parseInfoWithFallback(cmdLine) {
+        if (!cmdLine || cmdLine === "") {
+            return { type: "renderer", extra: "(sandboxed/locked)" };
+        }
+        return this.parseInfo(cmdLine);
+    }
+
+    static getPidToSysIdMap() {
+        var map = new Map();
+        try {
+            var lines = SymbolUtils.execute("|");
+            for (var line of lines) {
+                var match = line.toString().match(/(\d+)\s+id:\s*([0-9a-fA-F]+)/);
+                if (match) map.set(parseInt(match[2], 16), parseInt(match[1]));
+            }
+        } catch (e) { }
+        return map;
+    }
+
+    static getList(filterType) {
+        var processes = host.currentSession.Processes;
+        var pidToSysId = this.getPidToSysIdMap();
+        var results = [];
+
+        for (var proc of processes) {
+            try {
+                var pid = parseInt(proc.Id.toString());
+                var sysId = pidToSysId.has(pid) ? pidToSysId.get(pid) : "?";
+                var info = this.getInfoSafe(proc, sysId);
+
+                if (filterType && info.type !== filterType) continue;
+
+                var procObj = {
+                    pid: pid,
+                    sysId: sysId,
+                    type: info.type,
+                    extra: info.extra,
+                    cmdLine: info.cmdLine,
+                    clientId: null
+                };
+
+                if (info.type === "renderer" && info.extra) {
+                    var clientMatch = info.extra.match(/client=(\d+)/);
+                    if (clientMatch) procObj.clientId = clientMatch[1];
+                }
+                results.push(procObj);
+            } catch (e) { }
+        }
+        return results;
+    }
+
+    static getInfoSafe(proc, sysId) {
+        var cmdLine = "";
+        var readSuccess = false;
+        try {
+            if (sysId !== undefined && sysId !== null && sysId !== "?") {
+                try { SymbolUtils.execute("|" + sysId + "s"); } catch (e) { }
+            }
+            cmdLine = CommandLineUtils.get();
+            readSuccess = (cmdLine !== "");
+        } catch (e) { }
+
+        if (readSuccess) {
+            var info = this.parseInfo(cmdLine);
+            return { type: info.type, extra: info.extra, cmdLine: cmdLine, locked: false };
+        } else {
+            return { type: "renderer", extra: "(sandboxed/locked)", cmdLine: "", locked: true };
+        }
+    }
+
+    static parseInfo(cmdLine) {
+        if (isEmpty(cmdLine)) return { type: "unknown", extra: "" };
+        var typeMatch = cmdLine.match(/--type=([^\s"]+)/);
+        var extra = "";
+        if (typeMatch) {
+            var type = typeMatch[1];
+            if (type === "renderer") {
+                var clientMatch = cmdLine.match(/--renderer-client-id=(\d+)/);
+                if (clientMatch) extra = "client=" + clientMatch[1];
+            } else if (type === "utility") {
+                var utilMatch = cmdLine.match(/--utility-sub-type=([^\s"]+)/);
+                if (utilMatch) extra = utilMatch[1].split('.').pop();
+            }
+            return { type: type, extra: extra };
+        }
+        if (cmdLine.toLowerCase().indexOf("chrome.exe") !== -1) {
+            if (cmdLine.indexOf("--monitor-self") !== -1 || cmdLine.indexOf("crashpad") !== -1) return { type: "crashpad-handler", extra: "" };
+            if (cmdLine.indexOf("--enable-features") !== -1 && cmdLine.indexOf("--field-trial-handle") !== -1) return { type: "browser", extra: "" };
+            if (cmdLine.length < BROWSER_CMDLINE_MIN_LENGTH || cmdLine.indexOf("--user-data-dir") !== -1) return { type: "browser", extra: "" };
+        }
+        return { type: "unknown", extra: "" };
+    }
+
+    static forEachProcess(filterType, callback) {
+        var processes = this.getList(filterType);
+        if (processes.length === 0) return 0;
+
+        var count = 0;
+        for (var proc of processes) {
+            if (proc.sysId === "?" || proc.sysId === null) continue;
+            try {
+                SymbolUtils.execute("|" + proc.sysId + "s");
+                var result = callback(proc);
+                count++;
+                if (result === false) break;
+            } catch (e) { Logger.error("Error in process " + proc.pid + ": " + e.message); }
+        }
+        try { SymbolUtils.execute("|0s"); } catch (e) { }
+        return count;
+    }
+
+    /// Execute callback in a specific process context, then restore original context
+    static withContext(sysId, callback) {
+        var originalId = this.getCurrentSysId();
+        try {
+            SymbolUtils.execute("|" + sysId + "s");
+            MemoryUtils.invalidateCaches(); // Clear cached cage bases for new process
+            return callback();
+        } finally {
+            try { SymbolUtils.execute("|" + originalId + "s"); } catch (e) { }
+            MemoryUtils.invalidateCaches(); // Clear again when returning to original
+        }
+    }
+
+    static runInType(targetType, command) {
+        // Check current process first
+        var currentType = this.parseInfo(CommandLineUtils.get()).type || "renderer"; // heuristic
+        if (currentType === targetType) {
+            Logger.info("  [" + targetType.toUpperCase() + " PID:" + host.currentProcess.Id + "] Executing: " + command);
+            try {
+                var output = SymbolUtils.execute(command);
+                for (var l of output) Logger.log("  " + l + "\n");
+            } catch (e) { Logger.error(e.message); }
+            return "executed";
+        }
+
+        Logger.section("Running in All " + targetType.toUpperCase() + " Processes");
+
+        var matchCount = this.forEachProcess(targetType, function (info) {
+            Logger.info("  [" + targetType.toUpperCase() + " PID:" + info.pid + "] Executing: " + command);
+            var output = SymbolUtils.execute(command);
+            for (var l of output) Logger.log("    " + l + "\n");
+        });
+
+        if (matchCount === 0) {
+            Logger.info("  No " + targetType + " processes found.");
+            Logger.empty();
+            return "no_match";
+        }
+
+        Logger.info("  Executed in " + matchCount + " processes");
+        Logger.empty();
+        return "executed_in_" + matchCount;
+    }
+}
 
 /// =============================================================================
 /// INITIALIZATION
@@ -65,23 +642,21 @@ function initializeScript() {
         // V8 Pointer Compression
         new host.functionAlias(v8_cage_info, "v8_cage"),
         new host.functionAlias(decompress, "decompress"),
-        new host.functionAlias(decompress_gc, "decompress_gc")
+        new host.functionAlias(decompress_gc, "decompress_gc"),
+        // Site Isolation
+        new host.functionAlias(site_isolation_status, "site_iso")
     ];
 }
 
 /// Initialize the Chrome debugging environment
 function chrome_init() {
-    host.diagnostics.debugLog("=============================================================================\n");
-    host.diagnostics.debugLog("  Chromium Security Research Debugger - Initialized\n");
-    host.diagnostics.debugLog("=============================================================================\n");
-    host.diagnostics.debugLog("  Type !chelp for available commands\n");
-    host.diagnostics.debugLog("=============================================================================\n\n");
-
-    g_initialized = true;
+    Logger.header("Chromium Security Research Debugger - Initialized");
+    Logger.info("Type !chelp for available commands");
+    Logger.empty();
 
     // Set up useful aliases
     try {
-        var ctl = host.namespace.Debugger.Utility.Control;
+        var ctl = SymbolUtils.getControl();
         ctl.ExecuteCommand(".prefer_dml 1");
     } catch (e) {
         // Ignore if fails
@@ -95,74 +670,76 @@ function chrome_init() {
 /// =============================================================================
 
 function help() {
-    var helpText = `
-=============================================================================
-  Chromium Security Research Debugger - Commands
-=============================================================================
+    Logger.section("Chromium Security Research Debugger - Commands");
 
-  PROCESS IDENTIFICATION:
-    !proc                 - Show process type (+ site if renderer)
-    !cmdline              - Show the command line for the current process
-    !procs                - List all Chrome processes with types
-    !frames               - List all frames in current renderer process
+    Logger.info("PROCESS IDENTIFICATION:");
+    Logger.info("  !proc                 - Show process type (+ site if renderer)");
+    Logger.info("  !cmdline              - Show the command line for the current process");
+    Logger.info("  !procs                - List all Chrome processes with types");
+    Logger.info("  !frames               - List all frames in current renderer process");
+    Logger.empty();
 
-  SANDBOX & SECURITY:
-    !sandbox_all          - Dashboard of sandbox status for ALL processes
-    !sandbox_state        - Check sandbox status of CURRENT process
-    !sandbox_token        - Dump process token info and integrity level
+    Logger.info("SANDBOX & SECURITY:");
+    Logger.info("  !sandbox_all          - Dashboard of sandbox status for ALL processes");
+    Logger.info("  !sandbox_state        - Check sandbox status of CURRENT process");
+    Logger.info("  !sandbox_token        - Dump process token info and integrity level");
+    Logger.empty();
 
-  SECURITY BREAKPOINTS:
-    !bp_renderer          - Break when renderer processes are launched
-    !bp_sandbox           - Break when sandbox lowers token
-    !bp_mojo              - Break on Mojo interface binding
-    !bp_ipc               - Break on IPC message dispatch
-    !bp_bad               - Break on mojo::ReportBadMessage (security violations!)
-    !bp_security          - Break on ChildProcessSecurityPolicy checks
-    !trace_ipc            - Enable IPC message logging (noisy)
+    Logger.info("SECURITY BREAKPOINTS:");
+    Logger.info("  !bp_renderer          - Break when renderer processes are launched");
+    Logger.info("  !bp_sandbox           - Break when sandbox lowers token");
+    Logger.info("  !bp_mojo              - Break on Mojo interface binding");
+    Logger.info("  !bp_ipc               - Break on IPC message dispatch");
+    Logger.info("  !bp_bad               - Break on mojo::ReportBadMessage (security violations!)");
+    Logger.info("  !bp_security          - Break on ChildProcessSecurityPolicy checks");
+    Logger.info("  !trace_ipc            - Enable IPC message logging (noisy)");
+    Logger.empty();
 
-  VULNERABILITY HUNTING:
-    !vuln_hunt            - UAF, type confusion, race condition breakpoints
-    !heap_info            - PartitionAlloc/V8 heap inspection guide
+    Logger.info("VULNERABILITY HUNTING:");
+    Logger.info("  !vuln_hunt            - UAF, type confusion, race condition breakpoints");
+    Logger.info("  !heap_info            - PartitionAlloc/V8 heap inspection guide");
+    Logger.empty();
 
-  ORIGIN SPOOFING & FUNCTION PATCHING (renderer only):
-    !spoof(\"url\")                       - Spoof origin by patching memory
-    !patch(\"FullscreenIsSupported\",\"false\") - Patch function (auto-inlining detection)
+    Logger.info("ORIGIN SPOOFING & FUNCTION PATCHING (renderer only):");
+    Logger.info("  !spoof(\"url\")                       - Spoof origin by patching memory");
+    Logger.info("  !patch(\"FullscreenIsSupported\",\"false\") - Patch function (auto-inlining detection)");
+    Logger.empty();
 
+    Logger.info("BLINK DOM HOOKS:");
+    Logger.info("  !blink_help           - Show full Blink DOM help");
+    Logger.info("  !bp_element           - Break on DOM element creation");
+    Logger.info("  !bp_nav               - Break on navigation");
+    Logger.info("  !bp_pm                - Break on postMessage");
+    Logger.info("  !bp_fetch             - Break on Fetch/XHR");
+    Logger.empty();
 
-  BLINK DOM HOOKS:
-    !blink_help           - Show full Blink DOM help
-    !bp_element           - Break on DOM element creation
-    !bp_nav               - Break on navigation
-    !bp_pm                - Break on postMessage
-    !bp_fetch             - Break on Fetch/XHR
+    Logger.info("V8 EXPLOITATION HOOKS:");
+    Logger.info("  !v8_help              - Show full V8 help");
+    Logger.info("  !bp_compile           - Break on script compilation");
+    Logger.info("  !bp_gc                - Break on Garbage Collection");
+    Logger.info("  !bp_wasm              - Break on WebAssembly");
+    Logger.info("  !bp_jit               - Break on JIT compilation");
+    Logger.empty();
 
-  V8 EXPLOITATION HOOKS:
-    !v8_help              - Show full V8 help
-    !bp_compile           - Break on script compilation
-    !bp_gc                - Break on Garbage Collection
-    !bp_wasm              - Break on WebAssembly
-    !bp_jit               - Break on JIT compilation
+    Logger.info("V8 POINTER COMPRESSION:");
+    Logger.info("  !v8_cage              - Show V8 cage base address");
+    Logger.info("  !decompress(ptr)      - Decompress a 32-bit V8 compressed pointer");
+    Logger.empty();
 
-  V8 POINTER COMPRESSION:
-    !v8_cage              - Show V8 cage base address
-    !decompress(ptr)      - Decompress a 32-bit V8 compressed pointer
+    Logger.info("PROCESS-SPECIFIC EXECUTION (works from any process):");
+    Logger.info("  !run_renderer(\"cmd\")      - Run command in all renderer processes");
+    Logger.info("  !run_browser(\"cmd\")       - Run command in browser process");
+    Logger.info("  !run_gpu(\"cmd\")           - Run command in GPU process");
+    Logger.info("  !script_renderer(\"path\")  - Load script in all renderers");
+    Logger.info("  !on_attach(\"cmd\")         - Auto-run command when renderers attach");
+    Logger.info("  !script_attach(\"path\")    - Auto-load script when renderers attach");
+    Logger.empty();
 
-  PROCESS-SPECIFIC EXECUTION (works from any process):
-    !run_renderer("cmd")      - Run command in all renderer processes
-    !run_browser("cmd")       - Run command in browser process
-    !run_gpu("cmd")           - Run command in GPU process
-    !script_renderer("path")  - Load script in all renderers
-    !on_attach("cmd")         - Auto-run command when renderers attach
-    !script_attach("path")    - Auto-load script when renderers attach
-
-  TIPS:
-    - Use '|' to switch between processes: |0s, |1s, etc.
-    - Use '||' to list all debugged processes
-    - Use '~*k' to get stacks from all threads
-    
-=============================================================================
-`;
-    host.diagnostics.debugLog(helpText);
+    Logger.info("TIPS:");
+    Logger.info("  - Use '|' to switch between processes: |0s, |1s, etc.");
+    Logger.info("  - Use '||' to list all debugged processes");
+    Logger.info("  - Use '~*k' to get stacks from all threads");
+    Logger.empty();
     return "";
 }
 
@@ -170,335 +747,107 @@ function help() {
 /// INTERNAL HELPERS
 /// =============================================================================
 
-/// Cache for V8 cage base address
-var g_v8CageBase = null;
-
-/// Get V8 pointer compression cage base address
-/// V8 uses pointer compression where 64-bit pointers are stored as 32-bit offsets
-/// from a cage base address. This function finds that base.
-function getV8CageBase() {
-    if (g_v8CageBase !== null) {
-        return g_v8CageBase;
-    }
-
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    try {
-        // Try to find v8::internal::MainCage::base_
-        var xOutput = ctl.ExecuteCommand("x chrome!v8::internal::MainCage::base_");
-        for (var line of xOutput) {
-            var match = line.toString().match(/^([0-9a-fA-F`]+)/);
-            if (match) {
-                var addr = match[1].replace(/`/g, "");
-                // Read the value at this address (it's a uintptr_t)
-                var dqOutput = ctl.ExecuteCommand("dq 0x" + addr + " L1");
-                for (var dline of dqOutput) {
-                    var dMatch = dline.toString().match(/[0-9a-fA-F`]+\s+([0-9a-fA-F`]+)/);
-                    if (dMatch) {
-                        g_v8CageBase = dMatch[1].replace(/`/g, "");
-                        return g_v8CageBase;
-                    }
-                }
-            }
-        }
-    } catch (e) { }
-
-    return null;
-}
-
-/// Decompress a V8 compressed pointer
-/// Input: 32-bit compressed pointer value (as hex string or number)
-/// Returns: Full 64-bit pointer (as hex string)
-function decompressV8Ptr(compressedPtr) {
-    var cageBase = getV8CageBase();
-    if (!cageBase) {
-        return null;
-    }
-
-    // Convert to BigInt for proper 64-bit math
-    var base = BigInt("0x" + cageBase);
-    var compressed;
-
-    if (typeof compressedPtr === "string") {
-        compressed = BigInt(compressedPtr.startsWith("0x") ? compressedPtr : "0x" + compressedPtr);
-    } else {
-        compressed = BigInt(compressedPtr);
-    }
-
-    // Sign-extend the 32-bit value if needed (V8 uses signed offsets)
-    if (compressed > 0x7FFFFFFF) {
-        compressed = compressed - BigInt("0x100000000");
-    }
-
-    var fullPtr = base + compressed;
-    return fullPtr.toString(16);
-}
-
-/// Cache for cppgc/Oilpan cage base address
-var g_cppgcCageBase = null;
-
-/// Get cppgc/Oilpan pointer compression cage base address
-/// Oilpan uses its own compression scheme separate from V8
-function getCppgcCageBase() {
-    if (g_cppgcCageBase !== null) {
-        return g_cppgcCageBase;
-    }
-
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    try {
-        // Try to find cppgc::internal::CageBaseGlobal::g_base_
-        var xOutput = ctl.ExecuteCommand("x chrome!cppgc::internal::CageBaseGlobal::g_base_");
-        for (var line of xOutput) {
-            var match = line.toString().match(/^([0-9a-fA-F`]+)/);
-            if (match) {
-                var addr = match[1].replace(/`/g, "");
-                // Read the value at this address (it's a uintptr_t in a union)
-                var dqOutput = ctl.ExecuteCommand("dq 0x" + addr + " L1");
-                for (var dline of dqOutput) {
-                    var dMatch = dline.toString().match(/[0-9a-fA-F`]+\s+([0-9a-fA-F`]+)/);
-                    if (dMatch) {
-                        g_cppgcCageBase = dMatch[1].replace(/`/g, "");
-                        return g_cppgcCageBase;
-                    }
-                }
-            }
-        }
-    } catch (e) { }
-
-    return null;
-}
-
-/// Decompress a cppgc/Oilpan compressed pointer
-/// Formula: decompressed = (sign_extend_32(compressed) << 1) & base
-/// contextAddr: Optional address of an object in the same heap (to derive base)
-function decompressCppgcPtr(compressedPtr, contextAddr) {
-    // shift = 3 (Larger Cage)
-    const kPointerCompressionShift = 3n;
-    // 16GB cage -> 34 bits of offset. Mask is 2^34 - 1.
-    const kPointerCompressionMask = 0x3FFFFFFFFn;
-
-    let base;
-
-    // Strategy 1: Use context address if provided (most reliable for specific objects)
-    if (contextAddr) {
-        var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
-
-        // Derive base from context address for 16GB cage (shift=3)
-        // 1. Get the page base by clearing the lower 34 bits (preserves the high bits that identify the 16GB cage)
-        //    Since we can't use ~ BigInt easily in JS bitwise operations safely with mixed signs sometimes, 
-        //    we construct the mask manually.
-        //    ~0x3FFFFFFFF is ...FFFFFC00000000
-        const invMask = BigInt("0xFFFFFFFC00000000");
-        const cageBaseAddr = context & invMask;
-
-        // 2. Create the "mask-like" base by ORing with the compression mask
-        //    (CageBaseGlobal::g_base_ stores it this way: base_addr | mask)
-        base = cageBaseAddr | kPointerCompressionMask;
-    }
-    // Strategy 2: Fallback to global cage base
-    else {
-        var cageBase = getCppgcCageBase();
-        if (!cageBase) {
-            return null; // Cannot decompress without a base
-        }
-        base = BigInt("0x" + cageBase);
-    }
-
-    var compressed;
-    if (typeof compressedPtr === "string") {
-        var ptrStr = compressedPtr.replace(/`/g, "");
-        compressed = BigInt(ptrStr.startsWith("0x") ? ptrStr : "0x" + ptrStr);
-    } else if (typeof compressedPtr === "number") {
-        // WinDbg passes hex values as numbers - convert to hex string first
-        compressed = BigInt("0x" + compressedPtr.toString(16));
-    } else {
-        compressed = BigInt(compressedPtr);
-    }
-
-    // Sign-extend the 32-bit value to 64-bit
-    // The high bit (bit 31) indicates if we need sign extension
-    var signExtended;
-    if (compressed >= BigInt("0x80000000")) {
-        // Negative - sign extend with 1s in upper 32 bits
-        signExtended = BigInt("0xFFFFFFFF00000000") | compressed;
-    } else {
-        signExtended = compressed;
-    }
-
-    // Shift left by kPointerCompressionShift
-    var shifted = signExtended << kPointerCompressionShift;
-
-    // Mask to 64 bits (BigInt can be arbitrary size)
-    shifted = shifted & BigInt("0xFFFFFFFFFFFFFFFF");
-
-    // AND with base
-    var fullPtr = shifted & base;
-
-    return fullPtr.toString(16);
-}
-
 /// Display cage base info for both V8 and cppgc/Oilpan
 function v8_cage_info() {
-    host.diagnostics.debugLog("\n=== Pointer Compression Cages ===\n\n");
+    Logger.section("Pointer Compression Cages");
 
-    var v8CageBase = getV8CageBase();
+    var v8CageBase = MemoryUtils.getV8CageBase();
     if (v8CageBase) {
-        host.diagnostics.debugLog("  V8 Cage Base:     0x" + v8CageBase + "\n");
-        host.diagnostics.debugLog("    Formula: Full = CageBase + SignExtend32(Compressed)\n\n");
+        Logger.info("V8 Cage Base:     0x" + v8CageBase);
+        Logger.info("  Formula: Full = CageBase + SignExtend32(Compressed)");
     } else {
-        host.diagnostics.debugLog("  V8 Cage Base:     (not found)\n\n");
+        Logger.info("V8 Cage Base:     (not found)");
     }
+    Logger.empty();
 
-    var cppgcCageBase = getCppgcCageBase();
+    var cppgcCageBase = MemoryUtils.getCppgcCageBase();
     if (cppgcCageBase) {
-        host.diagnostics.debugLog("  Oilpan Cage Base: 0x" + cppgcCageBase + "\n");
-        host.diagnostics.debugLog("    Formula: Full = (SignExtend32(Compressed) << 1) & Base\n\n");
+        Logger.info("Oilpan Cage Base: 0x" + cppgcCageBase);
+        Logger.info("  Formula: Full = (SignExtend32(Compressed) << 1) & Base");
     } else {
-        host.diagnostics.debugLog("  Oilpan Cage Base: (not found)\n\n");
+        Logger.info("Oilpan Cage Base: (not found)");
     }
+    Logger.empty();
 
-    host.diagnostics.debugLog("  Commands:\n");
-    host.diagnostics.debugLog("    !decompress <ptr>      - V8 decompression\n");
-    host.diagnostics.debugLog("    !decompress_gc <ptr>   - Oilpan/cppgc decompression\n\n");
+    Logger.info("Commands:");
+    Logger.info("  !decompress <ptr>      - V8 decompression");
+    Logger.info("  !decompress_gc <ptr>   - Oilpan/cppgc decompression");
+    Logger.empty();
 
     return "";
 }
 
 /// Decompress command - exposed to user
 function decompress(ptr) {
-    if (!ptr) {
-        host.diagnostics.debugLog("\n=== V8 Pointer Decompression ===\n\n");
-        host.diagnostics.debugLog("  Usage: !decompress <compressed_ptr>\n");
-        host.diagnostics.debugLog("  Example: !decompress 0x12345678\n\n");
+    if (isEmpty(ptr)) {
+        Logger.showUsage(
+            "V8 Pointer Decompression",
+            "!decompress <compressed_ptr>",
+            ["!decompress 0x12345678"]
+        );
         return "";
     }
 
-    var result = decompressV8Ptr(ptr);
+    var result = MemoryUtils.decompressV8Ptr(ptr);
     if (result) {
-        host.diagnostics.debugLog("\n  Compressed: " + ptr + "\n");
-        host.diagnostics.debugLog("  Full ptr:   0x" + result + "\n\n");
+        Logger.empty();
+        Logger.info("Compressed: " + ptr);
+        Logger.info("Full ptr:   0x" + result);
+        Logger.empty();
     } else {
-        host.diagnostics.debugLog("\n  Could not decompress - cage base not found.\n");
-        host.diagnostics.debugLog("  Try !v8_cage to see cage info.\n\n");
+        Logger.empty();
+        Logger.warn("Could not decompress - cage base not found.");
+        Logger.info("Try !v8_cage to see cage info.");
+        Logger.empty();
     }
-
     return "";
 }
 
 /// Decompress Oilpan/cppgc pointer - exposed to user
 function decompress_gc(ptr) {
-    if (!ptr) {
-        host.diagnostics.debugLog("\n=== Oilpan/cppgc Pointer Decompression ===\n\n");
-        host.diagnostics.debugLog("  Usage: !decompress_gc <compressed_ptr>\n");
-        host.diagnostics.debugLog("  Example: !decompress_gc 0x12345678\n\n");
-        host.diagnostics.debugLog("  Used for blink::Member<T>, cppgc::internal::BasicMember<T>\n\n");
+    if (isEmpty(ptr)) {
+        Logger.showUsage(
+            "Oilpan/cppgc Pointer Decompression",
+            "!decompress_gc <compressed_ptr>",
+            ["!decompress_gc 0x12345678", "Used for blink::Member<T>, cppgc::internal::BasicMember<T>"]
+        );
         return "";
     }
 
-    // Use the decompression function
-    var result = decompressCppgcPtr(ptr);
+    var result = MemoryUtils.decompressCppgcPtr(ptr);
 
     if (result === null) {
-        host.diagnostics.debugLog("\n  Could not decompress - cage base not found.\n");
-        host.diagnostics.debugLog("  Try !decompress_gc <ptr> <context_address> to derive base from an object.\n\n");
+        Logger.empty();
+        Logger.warn("Could not decompress - cage base not found.");
+        Logger.info("Try !decompress_gc <ptr> <context_address> to derive base from an object.");
+        Logger.empty();
     } else {
-        host.diagnostics.debugLog("\n  Compressed: " + ptr + "\n");
-        host.diagnostics.debugLog("  Full ptr:   0x" + result.toString(16) + "\n\n");
+        Logger.empty();
+        Logger.info("Compressed: " + ptr);
+        Logger.info("Full ptr:   0x" + result);
+        Logger.empty();
     }
-
     return "";
 }
 
 
 /// Helper: Set multiple breakpoints with a title and description
 function set_breakpoints(title, targets, description) {
-    host.diagnostics.debugLog("\n=== " + title + " ===\n\n");
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    for (var i = 0; i < targets.length; i++) {
-        host.diagnostics.debugLog("  bp " + targets[i] + "\n");
-        try { ctl.ExecuteCommand("bp " + targets[i]); } catch (e) { }
-    }
-
-    if (description) {
-        host.diagnostics.debugLog("\n  Useful for: " + description + "\n\n");
-    }
+    BreakpointManager.set(title, targets, description);
     return "";
 }
 
-/// Helper: Parse WinDbg '|' command to map PIDs to System IDs
-function getPidToSysIdMap() {
-    var ctl = host.namespace.Debugger.Utility.Control;
-    var map = new Map();
-    try {
-        var lines = ctl.ExecuteCommand("|");
-        for (var line of lines) {
-            // Match: <sysId> id: <hexPid> (ignore leading . or whitespace)
-            // Simply looking for the pattern "digits id: hex" is robust enough
-            var match = line.match(/(\d+)\s+id:\s*([0-9a-fA-F]+)/);
-            if (match) {
-                map.set(parseInt(match[2], 16), parseInt(match[1]));
-            }
-        }
-    } catch (e) {
-        host.diagnostics.debugLog("Debug: Failed to parse process map: " + e.message + "\n");
-    }
-    return map;
-}
-
-/// Helper: Safely get process info (type, extra, cmdline) given a process object and system ID.
-/// Handles context switching and the "locked process = renderer" heuristic.
-function getProcessInfoSafe(proc, sysId) {
-    var ctl = host.namespace.Debugger.Utility.Control;
-    var cmdLine = "";
-    var readSuccess = false;
-
-    // 1. Try to read command line
-    try {
-        if (sysId !== undefined && sysId !== null && sysId !== "?") {
-            try { ctl.ExecuteCommand("|" + sysId + "s"); } catch (e) { }
-        }
-
-        var peb = proc.Environment.EnvironmentBlock;
-        var cmdLinePtr = peb.ProcessParameters.CommandLine.Buffer;
-        cmdLine = host.memory.readWideString(cmdLinePtr);
-        readSuccess = true;
-    } catch (e) {
-        readSuccess = false;
-    }
-
-    // 2. Parse or Apply Heuristic
-    if (readSuccess) {
-        var info = parseProcessInfo(cmdLine);
-        return {
-            type: info.type,
-            extra: info.extra,
-            cmdLine: cmdLine,
-            locked: false
-        };
-    } else {
-        // Heuristic: If we can't read the command line in a debugged process,
-        // it is almost certainly a sandboxed Renderer process.
-        return {
-            type: "renderer",
-            extra: "(sandboxed/locked)",
-            cmdLine: "",
-            locked: true
-        };
-    }
-}
 
 /// Helper: Find the browser process System ID
 function get_browser_sysid() {
     var processes = host.currentSession.Processes;
-    var pidToSysId = getPidToSysIdMap();
+    var pidToSysId = ProcessUtils.getPidToSysIdMap();
 
     for (var proc of processes) {
         var pid = parseInt(proc.Id.toString());
         if (pidToSysId.has(pid)) {
             var sysId = pidToSysId.get(pid);
-            var info = getProcessInfoSafe(proc, sysId);
+            var info = ProcessUtils.getInfoSafe(proc, sysId);
             if (info.type === "browser") {
                 return sysId;
             }
@@ -513,7 +862,7 @@ function get_browser_sysid() {
 /// @param childIds - Array of child IDs to query (from command line parsing)
 function get_site_locks(browserSysId, childIds) {
     var locks = new Map();
-    var ctl = host.namespace.Debugger.Utility.Control;
+    var ctl = SymbolUtils.getControl();
 
     if (browserSysId === null || !childIds || childIds.length === 0) {
         return locks;
@@ -525,10 +874,9 @@ function get_site_locks(browserSysId, childIds) {
         try {
             var xOutput = ctl.ExecuteCommand("x chrome!content::ChildProcessSecurityPolicyImpl::GetInstance");
             for (var xLine of xOutput) {
-                var lineStr = xLine.toString();
-                var match = lineStr.match(/^([0-9a-fA-F`]+)/);
-                if (match) {
-                    funcAddr = match[1];
+                var addr = SymbolUtils.extractAddress(xLine);
+                if (addr) {
+                    funcAddr = addr;
                     break;
                 }
             }
@@ -538,33 +886,14 @@ function get_site_locks(browserSysId, childIds) {
         // Step 2: Find a browser with chrome.dll and accessible singleton
 
         // Get all browser process IDs
-        var browserIds = [];
-        var processes = host.currentSession.Processes;
-        var pidToSysId = getPidToSysIdMap();
-
-        for (var proc of processes) {
-            var pid = parseInt(proc.Id.toString());
-            if (pidToSysId.has(pid)) {
-                var sysId = pidToSysId.get(pid);
-                var info = getProcessInfoSafe(proc, sysId);
-                if (info.type === "browser") {
-                    browserIds.push(sysId);
-                }
-            }
-        }
-
-
+        // Step 2: Find a browser with chrome.dll and accessible singleton
         var instanceAddr = null;
         var workingBrowserId = null;
 
-        for (var bi = 0; bi < browserIds.length; bi++) {
-            var tryBrowserId = browserIds[bi];
-
+        ProcessUtils.forEachProcess("browser", function (proc) {
             try {
-                ctl.ExecuteCommand("|" + tryBrowserId + "s");
-
                 // Check if chrome is loaded in this browser
-                var lmOut = ctl.ExecuteCommand("lm m chrome");
+                var lmOut = SymbolUtils.execute("lm m chrome");
                 var hasChrome = false;
                 for (var lmLine of lmOut) {
                     var lmStr = lmLine.toString();
@@ -574,28 +903,28 @@ function get_site_locks(browserSysId, childIds) {
                     }
                 }
 
-                if (!hasChrome) continue;
+                if (!hasChrome) return;
 
                 // Use poi() to read the singleton pointer from the correct process context
-                var disasm = ctl.ExecuteCommand("u " + funcAddr + " L15");
+                var disasm = SymbolUtils.execute("u " + funcAddr + " L15");
                 for (var dLine of disasm) {
                     var dLineStr = dLine.toString();
                     var addrMatch = dLineStr.match(/\(([0-9a-fA-F`]+)\)\]/);
                     if (addrMatch) {
                         var addrStr = addrMatch[1].replace(/`/g, "");
                         try {
-                            var poiOut = ctl.ExecuteCommand("? poi(0x" + addrStr + ")");
+                            var poiOut = SymbolUtils.execute("? poi(0x" + addrStr + ")");
                             for (var poiLine of poiOut) {
                                 var poiMatch = poiLine.toString().match(/= ([0-9a-fA-F`]+)/);
                                 if (poiMatch) {
                                     var ptrVal = poiMatch[1].replace(/`/g, "");
-                                    if (ptrVal !== "0" && ptrVal !== "00000000" && ptrVal.length > 4) {
+                                    if (ptrVal !== "0" && ptrVal !== "00000000" && ptrVal.length > MIN_PTR_VALUE_LENGTH) {
                                         var candidateAddr = "0x" + ptrVal;
 
                                         // Verify memory is accessible
                                         var memoryOk = false;
                                         try {
-                                            var dqsCheck = ctl.ExecuteCommand("dqs " + candidateAddr + " L1");
+                                            var dqsCheck = SymbolUtils.execute("dqs " + candidateAddr + " L1");
                                             for (var dqsLine of dqsCheck) {
                                                 var dqsStr = dqsLine.toString();
                                                 if (dqsStr.indexOf("????????") === -1 && dqsStr.indexOf(ptrVal.substring(0, 8)) !== -1) {
@@ -606,21 +935,18 @@ function get_site_locks(browserSysId, childIds) {
 
                                         if (memoryOk) {
                                             instanceAddr = candidateAddr;
-                                            workingBrowserId = tryBrowserId;
-                                            break;
+                                            workingBrowserId = proc.sysId;
+                                            return false; // Break loop
                                         }
                                     }
                                 }
                             }
                         } catch (e) { }
-                        if (instanceAddr) break;
+                        if (instanceAddr) return false;
                     }
                 }
-
-                if (instanceAddr) break;
-
             } catch (e) { }
-        }
+        });
 
         if (!instanceAddr) return locks;
 
@@ -631,7 +957,6 @@ function get_site_locks(browserSysId, childIds) {
             var enumOutput = ctl.ExecuteCommand(enumCmd);
             var currentChildId = null;
             var currentLockUrl = null;
-            var lineCount = 0;
 
             for (var line of enumOutput) {
                 var lineStr = line.toString();
@@ -651,11 +976,9 @@ function get_site_locks(browserSysId, childIds) {
 
                 // Look for site_url_ with URL - only capture the first one per child ID
                 if ((lineStr.indexOf("site_url_") !== -1 || lineStr.indexOf("lock_url_") !== -1) && currentLockUrl === null) {
-                    var urlMatch = lineStr.match(/"(https?:\/\/[^"]+)"/) ||
-                        lineStr.match(/"(chrome-extension:\/\/[^"]+)"/) ||
-                        lineStr.match(/"(chrome:\/\/[^"]+)"/);
-                    if (urlMatch && currentChildId !== null) {
-                        currentLockUrl = urlMatch[1];
+                    var extractedUrl = extractUrlFromLine(lineStr);
+                    if (extractedUrl && currentChildId !== null) {
+                        currentLockUrl = extractedUrl;
                     }
                 }
 
@@ -676,38 +999,24 @@ function get_site_locks(browserSysId, childIds) {
 /// PROCESS IDENTIFICATION
 /// =============================================================================
 
-/// Get the command line for the current process
-function getCommandLine() {
-    try {
-        var peb = host.currentProcess.Environment.EnvironmentBlock;
-        var cmdLine = peb.ProcessParameters.CommandLine.Buffer;
-        return host.memory.readWideString(cmdLine);
-    } catch (e) {
-        return "";
-    }
-}
+/// Get the command line for the current process (alias for CommandLineUtils.get)
+var getCommandLine = CommandLineUtils.get.bind(CommandLineUtils);
 
 /// Identify the current Chrome process type (and site if renderer)
 function chrome_process_type() {
     var cmdLine = getCommandLine();
-    var info;
-
-    if (!cmdLine || cmdLine === "") {
-        info = { type: "renderer", extra: "(sandboxed/locked)" };
-    } else {
-        info = parseProcessInfo(cmdLine);
-    }
+    var info = ProcessUtils.parseInfoWithFallback(cmdLine);
 
     var pid = host.currentProcess.Id;
     var pidVal = parseInt(pid.toString());
 
-    host.diagnostics.debugLog("\n");
-    host.diagnostics.debugLog("  PID:  " + pidVal + "\n");
-    host.diagnostics.debugLog("  Type: " + info.type);
+    Logger.empty();
+    Logger.info("PID:  " + pidVal);
+    Logger.info("Type: " + info.type);
     if (info.extra) {
-        host.diagnostics.debugLog(" (" + info.extra + ")");
+        Logger.info(" (" + info.extra + ")");
     }
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
 
     // If renderer, also show the locked site
     if (info.type === "renderer") {
@@ -724,154 +1033,59 @@ function chrome_process_type() {
 function chrome_cmdline() {
     var cmdLine = getCommandLine();
 
-    if (cmdLine === "") {
+    if (isEmpty(cmdLine)) {
         return "Unable to read command line (process may be sandboxed/locked)";
     }
 
-    host.diagnostics.debugLog("\n=== Chrome Command Line ===\n\n");
+    Logger.section("Chrome Command Line");
 
-    // Parse and display switches
-    var switches = [];
-    var regex = /--([\w-]+)(=("[^"]*"|[^\s]*))?/g;
-    var match;
-
-    while ((match = regex.exec(cmdLine)) !== null) {
-        var switchName = match[1];
-        var switchValue = match[3] || "";
-        switches.push({ name: switchName, value: switchValue.replace(/"/g, '') });
-    }
+    // Parse switches
+    var switches = CommandLineUtils.parseSwitches(cmdLine);
 
     // Categorize and display
     var securitySwitches = ["no-sandbox", "disable-web-security", "disable-site-isolation-trials",
         "site-per-process", "disable-features", "enable-features"];
     var processSwitches = ["type", "renderer-client-id", "utility-sub-type", "field-trial-handle"];
 
-    host.diagnostics.debugLog("  Security-Relevant Switches:\n");
-    host.diagnostics.debugLog("  " + "-".repeat(60) + "\n");
-    for (var i = 0; i < switches.length; i++) {
-        if (securitySwitches.indexOf(switches[i].name) !== -1) {
-            host.diagnostics.debugLog("    --" + switches[i].name);
-            if (switches[i].value) {
-                host.diagnostics.debugLog("=" + switches[i].value);
-            }
-            host.diagnostics.debugLog("\n");
-        }
-    }
+    Logger.info("Security-Relevant Switches:");
+    Logger.info("-".repeat(60));
+    Logger.displaySwitches(switches, securitySwitches);
 
-    host.diagnostics.debugLog("\n  Process Switches:\n");
-    host.diagnostics.debugLog("  " + "-".repeat(60) + "\n");
-    for (var i = 0; i < switches.length; i++) {
-        if (processSwitches.indexOf(switches[i].name) !== -1) {
-            host.diagnostics.debugLog("    --" + switches[i].name);
-            if (switches[i].value) {
-                host.diagnostics.debugLog("=" + switches[i].value);
-            }
-            host.diagnostics.debugLog("\n");
-        }
-    }
+    Logger.info("Process Switches:");
+    Logger.info("-".repeat(60));
+    Logger.displaySwitches(switches, processSwitches);
 
-    host.diagnostics.debugLog("\n  Full command line:\n");
-    host.diagnostics.debugLog("  " + cmdLine.substring(0, 200) + "...\n\n");
+    Logger.info("Full command line:");
+    Logger.info(cmdLine.substring(0, 200) + "...");
+    Logger.empty();
 
     return "";
 }
 
-/// Helper to parse process info from command line
-function parseProcessInfo(cmdLine) {
-    if (!cmdLine || cmdLine === "") return { type: "unknown", extra: "" };
 
-    var typeMatch = cmdLine.match(/--type=([^\s"]+)/);
-    var extra = "";
-
-    if (typeMatch) {
-        var type = typeMatch[1];
-
-        if (type === "renderer") {
-            var clientMatch = cmdLine.match(/--renderer-client-id=(\d+)/);
-            if (clientMatch) extra = "client=" + clientMatch[1];
-        } else if (type === "utility") {
-            var utilMatch = cmdLine.match(/--utility-sub-type=([^\s"]+)/);
-            if (utilMatch) {
-                extra = utilMatch[1].split('.').pop();
-            }
-        }
-        return { type: type, extra: extra };
-    }
-
-    // No --type= flag. Check if this looks like the main browser process.
-    // Browser process has chrome.exe in path but NO --type, NO --monitor-self flags
-    if (cmdLine.toLowerCase().indexOf("chrome.exe") !== -1) {
-        // Check for crashpad-handler (monitor-self flag or crash handler path)
-        if (cmdLine.indexOf("--monitor-self") !== -1 || cmdLine.indexOf("crashpad") !== -1) {
-            return { type: "crashpad-handler", extra: "" };
-        }
-        // Check for child process indicator flags that main browser wouldn't have
-        if (cmdLine.indexOf("--enable-features") !== -1 &&
-            cmdLine.indexOf("--field-trial-handle") !== -1) {
-            // This is the main browser process 
-            return { type: "browser", extra: "" };
-        }
-        // If it has very minimal command line, it might be browser
-        if (cmdLine.length < 500 || cmdLine.indexOf("--user-data-dir") !== -1) {
-            return { type: "browser", extra: "" };
-        }
-    }
-
-    // Default to unknown for unrecognized processes
-    return { type: "unknown", extra: "" };
-}
-
-/// List all Chrome processes in the debug session with site isolation info
+// / List all Chrome processes in the debug session with site isolation info
 function chrome_processes() {
-    host.diagnostics.debugLog("\n=== Chrome Processes in Debug Session ===\n\n");
+    Logger.section("Chrome Processes in Debug Session");
 
-    var ctl = host.namespace.Debugger.Utility.Control;
-    var processes = host.currentSession.Processes;
+    var ctl = SymbolUtils.getControl();
 
-    // 1. Get Map
-    var pidToSysId = getPidToSysIdMap();
-    var originalId = 0;
+    // 1. Get List using helper
+    var processInfoList = ProcessUtils.getList();
+    var pidToSysId = ProcessUtils.getPidToSysIdMap();
 
     // Remember which process we're currently in
-    try {
-        var currentPid = parseInt(host.currentProcess.Id.toString());
-        if (pidToSysId.has(currentPid)) {
-            originalId = pidToSysId.get(currentPid);
-        }
-    } catch (e) { }
+    var originalId = ProcessUtils.getCurrentSysId();
 
-    // 2. First gather process info and find browser
+    // 2. Find browser process
     var browserSysId = null;
     var browserCmdLine = "";
-    var processInfoList = [];
 
-    for (var proc of processes) {
-        try {
-            var pid = parseInt(proc.Id.toString());
-            var sysId = pidToSysId.has(pid) ? pidToSysId.get(pid) : "?";
-            var info = getProcessInfoSafe(proc, sysId);
-
-            processInfoList.push({
-                pid: pid,
-                sysId: sysId,
-                type: info.type,
-                extra: info.extra,
-                clientId: null
-            });
-
-            // Extract renderer client ID for later matching
-            if (info.type === "renderer" && info.extra) {
-                var clientMatch = info.extra.match(/client=(\d+)/);
-                if (clientMatch) {
-                    processInfoList[processInfoList.length - 1].clientId = clientMatch[1];
-                }
-            }
-
-            if (info.type === "browser") {
-                browserSysId = sysId;
-                browserCmdLine = info.cmdLine;
-            }
-        } catch (e) { }
+    for (var pInfo of processInfoList) {
+        if (pInfo.type === "browser") {
+            browserSysId = pInfo.sysId;
+            browserCmdLine = pInfo.cmdLine;
+            break;
+        }
     }
 
     // 3. Collect all child IDs for site lock lookup
@@ -890,21 +1104,21 @@ function chrome_processes() {
     var disableSI = browserCmdLine.indexOf("--disable-site-isolation") !== -1;
     var isolateOrigins = browserCmdLine.indexOf("--isolate-origins") !== -1;
 
-    host.diagnostics.debugLog("  [Site Isolation] ");
+    Logger.info("[Site Isolation] ");
     if (disableSI) {
-        host.diagnostics.debugLog("DISABLED (--disable-site-isolation)\n");
+        Logger.info("DISABLED (--disable-site-isolation)");
     } else if (sitePerProcess) {
-        host.diagnostics.debugLog("ENABLED (--site-per-process)\n");
+        Logger.info("ENABLED (--site-per-process)");
     } else if (isolateOrigins) {
-        host.diagnostics.debugLog("PARTIAL (--isolate-origins)\n");
+        Logger.info("PARTIAL (--isolate-origins)");
     } else {
-        host.diagnostics.debugLog("Default\n");
+        Logger.info("Default");
     }
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
 
     // 6. Display process list with site info inline
-    host.diagnostics.debugLog("  ID    PID       Type            Site / Extra Info\n");
-    host.diagnostics.debugLog("  " + "-".repeat(70) + "\n");
+    Logger.info("  ID    PID       Type            Site / Extra Info");
+    Logger.info("  " + "-".repeat(70));
 
     for (var pInfo of processInfoList) {
         var displayExtra = pInfo.extra;
@@ -919,31 +1133,34 @@ function chrome_processes() {
             }
         }
 
-        host.diagnostics.debugLog("  " + pInfo.sysId.toString().padEnd(6) +
+        var sysIdStr = pInfo.sysId !== null ? pInfo.sysId.toString() : "?";
+        Logger.info("  " + sysIdStr.padEnd(6) +
             pInfo.pid.toString().padEnd(10) +
             pInfo.type.padEnd(16) +
-            displayExtra + "\n");
+            displayExtra);
     }
 
     // Switch back to original process
     try {
-        ctl.ExecuteCommand("|" + originalId + "s");
+        if (originalId !== null && originalId !== 0) ctl.ExecuteCommand("|" + originalId + "s");
     } catch (e) { }
 
-    host.diagnostics.debugLog("\n  Use |<ID>s to switch to a process (e.g., |1s)\n\n");
+    Logger.empty();
+    Logger.info("Use |<ID>s to switch to a process (e.g., |1s)");
+    Logger.empty();
     return "";
 }
 
 /// Show the locked site for the current renderer process
 function renderer_site() {
-    var ctl = host.namespace.Debugger.Utility.Control;
+    var ctl = SymbolUtils.getControl();
 
     // Get current process info
     var cmdLine = getCommandLine();
-    var info = cmdLine ? parseProcessInfo(cmdLine) : { type: "renderer", extra: "(sandboxed/locked)" };
+    var info = ProcessUtils.parseInfoWithFallback(cmdLine);
 
     if (info.type !== "renderer") {
-        host.diagnostics.debugLog("\n  Not a renderer process (current: " + info.type + ")\n\n");
+        Logger.info("  Not a renderer process (current: " + info.type + ")");
         return "";
     }
 
@@ -960,20 +1177,18 @@ function renderer_site() {
     }
 
     if (!clientId) {
-        host.diagnostics.debugLog("\n  Unable to determine renderer client ID\n\n");
+        Logger.info("  Unable to determine renderer client ID");
         return "";
     }
 
     // Remember current process
-    var pidToSysId = getPidToSysIdMap();
-    var currentPid = parseInt(host.currentProcess.Id.toString());
-    var originalId = pidToSysId.has(currentPid) ? pidToSysId.get(currentPid) : 0;
+    var originalId = ProcessUtils.getCurrentSysId();
 
     // Find browser process
     var browserSysId = get_browser_sysid();
 
     if (browserSysId === null) {
-        host.diagnostics.debugLog("\n  Unable to find browser process\n\n");
+        Logger.info("  Unable to find browser process");
         return "";
     }
 
@@ -993,10 +1208,10 @@ function renderer_site() {
         ctl.ExecuteCommand("|" + originalId + "s");
     } catch (e) { }
 
-    host.diagnostics.debugLog("\n");
-    host.diagnostics.debugLog("  Renderer Client ID: " + clientId + "\n");
-    host.diagnostics.debugLog("  Locked Site:        " + site + "\n");
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
+    Logger.info("  Renderer Client ID: " + clientId);
+    Logger.info("  Locked Site:        " + site);
+    Logger.empty();
 
     return site;
 }
@@ -1008,24 +1223,51 @@ function renderer_site() {
 /// Patch a function to return a specific value
 /// Usage: !patch_function "FunctionName" "return_value"
 function patch_function(funcName, returnValue) {
-    host.diagnostics.debugLog("\n=== Patch Function ===\n\n");
+    Logger.section("Patch Function");
 
-    if (!funcName || funcName === "") {
-        host.diagnostics.debugLog("  Usage: !patch(\"ClassName::FunctionName\",\"value\")\n\n");
-        host.diagnostics.debugLog("  Values: true, false, 0, 1, 0x1234, or any number\n\n");
-        host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !patch(\"FullscreenIsSupported\",\"false\")\n");
-        host.diagnostics.debugLog("    !patch(\"IsFeatureEnabled\",\"0\")\n");
-        host.diagnostics.debugLog("    !patch(\"*CanAccess*\",\"true\")\n\n");
-        host.diagnostics.debugLog("  Auto-detects inlining and patches callers if needed.\n\n");
+    if (isEmpty(funcName)) {
+        Logger.info("  Usage: !patch(\"ClassName::FunctionName\",\"value\")");
+        Logger.info("  Values: true, false, 0, 1, 0x1234, or any number");
+        Logger.info("  Examples:");
+        Logger.info("    !patch(\"FullscreenIsSupported\",\"false\")");
+        Logger.info("    !patch(\"IsFeatureEnabled\",\"0\")");
+        Logger.info("    !patch(\"*CanAccess*\",\"true\")");
+        Logger.empty();
+        Logger.info("  Auto-detects inlining and patches callers if needed.");
+        Logger.empty();
         return "";
     }
 
-    var ctl = host.namespace.Debugger.Utility.Control;
+    // Architecture Check
+    try {
+        var ctl = SymbolUtils.getControl();
+        var session = host.currentSession;
+        // Check effective machine. 0x8664 is AMD64/x64.
+        // We can also check attributes on current process or target.
+        // Simple heuristic: check pointer size or .effmach
+        var isX64 = false;
+        var out = ctl.ExecuteCommand(".effmach");
+        for (var line of out) {
+            if (line.toString().toLowerCase().indexOf("x64") !== -1 || line.toString().indexOf("AMD64") !== -1) {
+                isX64 = true;
+                break;
+            }
+        }
+
+        if (!isX64) {
+            Logger.error("Patching is currently only supported on x64 architectures.");
+            Logger.error("Your current effective machine does not appear to be x64.");
+            return "";
+        }
+    } catch (e) {
+        // Fallback: proceed with caution if check fails
+    }
+
+    // ctl already declared above in architecture check, reuse it
 
     // Parse return value - support true/false/hex/decimal
     var retVal = 0;
-    if (returnValue === undefined || returnValue === null || returnValue === "") {
+    if (isEmpty(returnValue)) {
         retVal = 0;
     } else if (returnValue === "true" || returnValue === "TRUE" || returnValue === "True") {
         retVal = 1;
@@ -1037,7 +1279,8 @@ function patch_function(funcName, returnValue) {
         retVal = parseInt(returnValue) || 0;
     }
 
-    host.diagnostics.debugLog("  Return value: " + retVal + (retVal === 0 ? " (false)" : retVal === 1 ? " (true)" : "") + "\\n\\n");
+    Logger.info("  Return value: " + retVal + (retVal === 0 ? " (false)" : retVal === 1 ? " (true)" : ""));
+    Logger.empty();
 
     try {
         var symbols = [];
@@ -1055,7 +1298,8 @@ function patch_function(funcName, returnValue) {
             } catch (e) { }
         } else {
             // Search for matching symbols
-            host.diagnostics.debugLog("  Searching for: *" + funcName + "*\n\n");
+            Logger.info("  Searching for: *" + funcName + "*");
+            Logger.empty();
 
             var patterns = [
                 "chrome!*" + funcName + "*",
@@ -1088,11 +1332,13 @@ function patch_function(funcName, returnValue) {
         }
 
         if (symbols.length === 0) {
-            host.diagnostics.debugLog("  No matching symbols found.\n\n");
+            Logger.info("  No matching symbols found.");
+            Logger.empty();
             return "";
         }
 
-        host.diagnostics.debugLog("  Found " + symbols.length + " symbol(s):\n\n");
+        Logger.info("  Found " + symbols.length + " symbol(s):");
+        Logger.empty();
 
         // Direct code patching: write "mov eax, VALUE; ret" at function start
         // This is more reliable than breakpoints for getters/inlined code
@@ -1101,8 +1347,8 @@ function patch_function(funcName, returnValue) {
 
         var count = 0;
         for (var sym of symbols) {
-            if (count >= 10) {
-                host.diagnostics.debugLog("  ... (limited to 10)\n");
+            if (count >= MAX_PATCHES) {
+                Logger.info("  ... (limited to " + MAX_PATCHES + ")");
                 break;
             }
             try {
@@ -1129,16 +1375,18 @@ function patch_function(funcName, returnValue) {
                         b3.toString(16).padStart(2, '0') + " C3");
                 }
 
-                host.diagnostics.debugLog("  [PATCHED] " + sym.name + " @ 0x" + funcAddr + "\n");
+                Logger.info("  [PATCHED] " + sym.name + " @ 0x" + funcAddr);
                 count++;
             } catch (e) {
-                host.diagnostics.debugLog("  [FAILED] " + sym.name + " @ 0x" + sym.addr + ": " + e.message + "\n");
+                Logger.error("  [FAILED] " + sym.name + " @ 0x" + sym.addr + ": " + e.message);
             }
         }
 
-        host.diagnostics.debugLog("\n  " + count + " function(s) patched -> return " + retVal + "\n");
-        host.diagnostics.debugLog("  NOTE: Patches are direct code modifications (not breakpoints)\n");
-        host.diagnostics.debugLog("  TIP: V8 caches results - navigate to a new page to see effect in JS\n\n");
+        Logger.empty();
+        Logger.info("  " + count + " function(s) patched -> return " + retVal);
+        Logger.info("  NOTE: Patches are direct code modifications (not breakpoints)");
+        Logger.info("  TIP: V8 caches results - navigate to a new page to see effect in JS");
+        Logger.empty();
 
         // Auto inlining detection: analyze if function might be inlined
         // by looking for callers that contain calls to related functions
@@ -1161,7 +1409,7 @@ function patch_function(funcName, returnValue) {
                 try {
                     var callerOutput = ctl.ExecuteCommand("x " + callerPattern);
                     for (var callerLine of callerOutput) {
-                        var callerMatch = callerLine.toString().match(/^([0-9a-fA-F`]+)\\s+(.+)/);
+                        var callerMatch = callerLine.toString().match(/^([0-9a-fA-F`]+)\s+(.+)/);
                         if (callerMatch) {
                             var callerAddr = callerMatch[1].replace(/`/g, "");
                             var callerName = callerMatch[2].trim();
@@ -1179,58 +1427,50 @@ function patch_function(funcName, returnValue) {
             }
 
             if (callers.length > 0) {
-                host.diagnostics.debugLog("\\n  Found " + callers.length + " potential caller(s) that may inline this function.\\n");
-                host.diagnostics.debugLog("  If patch doesn't work, try: !patch(\"<caller_name>\",\"" + retVal + "\")\\n");
-                for (var c = 0; c < Math.min(callers.length, 3); c++) {
-                    host.diagnostics.debugLog("    - " + callers[c].name + "\\n");
+                Logger.info("  Found " + callers.length + " potential caller(s) that may inline this function.");
+                Logger.info("  If patch doesn't work, try: !patch(\"<caller_name>\",\"" + retVal + "\")");
+                for (var c = 0; c < Math.min(callers.length, MAX_CALLER_DISPLAY); c++) {
+                    Logger.info("    - " + callers[c].name);
                 }
-                host.diagnostics.debugLog("\\n");
+                Logger.empty();
             }
         }
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n\n");
+        Logger.error("Error: " + e.message);
     }
 
     return "";
 }
 
-/// Spoof renderer origin by patching the host string in memory
-/// Extract host from a URL or return the string if it looks like a host
-function getHostFromUrl(url) {
-    if (!url) return "";
-    var match = url.match(/^https?:\/\/([^\/]+)/);
-    if (match) {
-        return match[1];
-    }
-    return url;
-}
-
 /// Usage: !spoof_origin "https://target.com"
 function spoof_origin(targetUrl) {
-    host.diagnostics.debugLog("\n=== Spoof Origin ===\n\n");
+    Logger.section("Spoof Origin");
 
-    var ctl = host.namespace.Debugger.Utility.Control;
+    var ctl = SymbolUtils.getControl();
 
-    if (!targetUrl || targetUrl === "") {
-        host.diagnostics.debugLog("  Usage: !spoof(\"https://target.com\")\n\n");
-        host.diagnostics.debugLog("  Example: !spoof(\"https://google.com\")\n\n");
-        host.diagnostics.debugLog("  Auto-detects current origin and patches all occurrences.\n\n");
+    if (isEmpty(targetUrl)) {
+        Logger.info("  Usage: !spoof(\"https://target.com\")");
+        Logger.empty();
+        Logger.info("  Example: !spoof(\"https://google.com\")");
+        Logger.empty();
+        Logger.info("  Auto-detects current origin and patches all occurrences.");
+        Logger.empty();
         return "";
     }
 
     // Parse target URL to get host
-    var targetHost = getHostFromUrl(targetUrl);
+    var targetHost = CommandLineUtils.getHostFromUrl(targetUrl);
 
     // Get current origin from !site
-    host.diagnostics.debugLog("  Target: " + targetHost + "\n");
-    host.diagnostics.debugLog("  Detecting current origin...\n");
+    Logger.info("  Target: " + targetHost);
+    Logger.info("  Detecting current origin...");
 
     var currentHost = "";
     try {
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            var extracted = getHostFromUrl(site);
+            var extracted = CommandLineUtils.getHostFromUrl(site);
             // Verify it looks like a domain if it didn't come from a URL match
             // (getHostFromUrl returns raw input fallback, so we check for dot or if it changed)
             if (extracted !== site || site.indexOf(".") !== -1) {
@@ -1240,39 +1480,44 @@ function spoof_origin(targetUrl) {
     } catch (e) { }
 
     if (!currentHost) {
-        host.diagnostics.debugLog("\n  Could not detect current origin.\n");
-        host.diagnostics.debugLog("  Make sure you're in a renderer with a loaded page.\n\n");
+        Logger.empty();
+        Logger.warn("Could not detect current origin.");
+        Logger.info("Make sure you're in a renderer with a loaded page.");
+        Logger.empty();
         return "";
     }
 
-    host.diagnostics.debugLog("  Current: " + currentHost + "\n\n");
+    Logger.info("  Current: " + currentHost);
+    Logger.empty();
 
     if (targetHost.length > currentHost.length) {
-        host.diagnostics.debugLog("  WARNING: Target longer than current, may corrupt memory.\n\n");
+        Logger.warn("Target longer than current, may corrupt memory.");
+        Logger.empty();
     }
 
     try {
-        host.diagnostics.debugLog("  Searching for \"" + currentHost + "\"...\n");
+        Logger.info("  Searching for \"" + currentHost + "\"...");
 
         // Search entire user-mode address space
-        var searchCmd = 's -a 0 L?0x7fffffffffff "' + currentHost + '"';
+        var searchCmd = 's -a 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + currentHost + '"';
         var output = ctl.ExecuteCommand(searchCmd);
 
         var addresses = [];
         for (var line of output) {
-            var lineStr = line.toString();
-            var match = lineStr.match(/^([0-9a-fA-F`]+)/);
-            if (match) {
-                addresses.push(match[1].replace(/`/g, ""));
+            var addr = SymbolUtils.extractAddress(line);
+            if (addr) {
+                addresses.push(addr);
             }
         }
 
         if (addresses.length === 0) {
-            host.diagnostics.debugLog("  No matches found.\n\n");
+            Logger.info("  No matches found.");
+            Logger.empty();
             return "";
         }
 
-        host.diagnostics.debugLog("  Found " + addresses.length + " occurrence(s), patching...\n\n");
+        Logger.info("  Found " + addresses.length + " occurrence(s), patching...");
+        Logger.empty();
 
         var patched = 0;
         for (var addr of addresses) {
@@ -1282,10 +1527,11 @@ function spoof_origin(targetUrl) {
             } catch (e) { }
         }
 
-        host.diagnostics.debugLog("  Patched " + patched + " location(s)\n\n");
+        Logger.info("  Patched " + patched + " location(s)");
+        Logger.empty();
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n\n");
+        Logger.error("Error: " + e.message);
     }
 
     return "";
@@ -1299,24 +1545,26 @@ function spoof_origin(targetUrl) {
 
 /// Check sandbox state
 function sandbox_state() {
-    host.diagnostics.debugLog("\n=== Sandbox State ===\n\n");
+    Logger.section("Sandbox State");
 
     var processType = chrome_process_type();
 
     if (processType === "browser") {
-        host.diagnostics.debugLog("  Browser process - not sandboxed\n\n");
+        Logger.info("  Browser process - not sandboxed");
+        Logger.empty();
         return "browser (not sandboxed)";
     }
 
     // Try to find sandbox state symbols
-    host.diagnostics.debugLog("  Checking sandbox state...\n\n");
+    Logger.info("  Checking sandbox state...");
+    Logger.empty();
 
     try {
-        var ctl = host.namespace.Debugger.Utility.Control;
+        var ctl = SymbolUtils.getControl();
 
         // Try to examine process token
-        host.diagnostics.debugLog("  Token Information:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
+        Logger.info("  Token Information:");
+        Logger.info("  " + "-".repeat(40));
 
         // Get token integrity level using !token
         var tokenOutput = ctl.ExecuteCommand("!token -n");
@@ -1324,44 +1572,45 @@ function sandbox_state() {
             if (line.indexOf("Impersonation") !== -1 ||
                 line.indexOf("Integrity") !== -1 ||
                 line.indexOf("Restricted") !== -1) {
-                host.diagnostics.debugLog("    " + line + "\n");
+                Logger.info("    " + line);
             }
         }
     } catch (e) {
-        host.diagnostics.debugLog("  Unable to query token (symbols may be needed)\n");
+        Logger.warn("Unable to query token (symbols may be needed)");
     }
 
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
 
     // Check for sandbox::TargetServicesBase if symbols are available
-    host.diagnostics.debugLog("  Sandbox Breakpoints (for detailed analysis):\n");
-    host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
-    host.diagnostics.debugLog("    bp sandbox!TargetServicesBase::Init\n");
-    host.diagnostics.debugLog("    bp sandbox!TargetServicesBase::LowerToken\n");
-    host.diagnostics.debugLog("\n");
+    Logger.info("  Sandbox Breakpoints (for detailed analysis):");
+    Logger.info("  " + "-".repeat(40));
+    Logger.info("    bp sandbox!TargetServicesBase::Init");
+    Logger.info("    bp sandbox!TargetServicesBase::LowerToken");
+    Logger.empty();
 
     return "";
 }
 
 /// Analyze process token
 function sandbox_token() {
-    host.diagnostics.debugLog("\n=== Process Token Analysis ===\n\n");
+    Logger.section("Process Token Analysis");
 
     try {
-        var ctl = host.namespace.Debugger.Utility.Control;
+        var ctl = SymbolUtils.getControl();
 
         // Get detailed token info
-        host.diagnostics.debugLog("  Running !token...\n\n");
+        Logger.info("  Running !token...");
+        Logger.empty();
         var tokenOutput = ctl.ExecuteCommand("!token");
         for (var line of tokenOutput) {
-            host.diagnostics.debugLog("  " + line + "\n");
+            Logger.info("  " + line);
         }
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-        host.diagnostics.debugLog("  Try: .reload /f ntdll.dll\n");
+        Logger.error("Error: " + e.message);
+        Logger.info("Try: .reload /f ntdll.dll");
     }
 
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
     return "";
 }
 
@@ -1425,19 +1674,16 @@ function bp_ipc_message() {
 /// PROCESS-SPECIFIC EXECUTION
 /// =============================================================================
 
-/// Global storage for attach commands
-var g_attachCommands = [];
-
 /// Get the process type of the current process
 function getProcessType() {
     // Reuse safe helper logic without context switch (we are in current context)
     try {
         // Reuse logic of chrome_process_type
         var cmdLine = getCommandLine();
-        if (!cmdLine || cmdLine === "") {
+        if (isEmpty(cmdLine)) {
             return "renderer"; // Heuristic
         }
-        var info = parseProcessInfo(cmdLine);
+        var info = ProcessUtils.parseInfo(cmdLine);
         return info.type;
     } catch (e) {
         return "renderer";
@@ -1452,196 +1698,60 @@ function isProcessType(targetType) {
 /// Check if current process is a renderer
 function is_renderer() {
     var result = isProcessType("renderer");
-    host.diagnostics.debugLog("\n  Current process is " + (result ? "a RENDERER" : "NOT a renderer") + "\n\n");
+    Logger.info("  Current process is " + (result ? "a RENDERER" : "NOT a renderer"));
+    Logger.empty();
     return result;
 }
 
-/// Generic: Execute command in all processes of a specific type
-function runInProcessType(targetType, command) {
-    var ctl = host.namespace.Debugger.Utility.Control;
-
-    // If already in the target process type, run directly
-    if (isProcessType(targetType)) {
-        host.diagnostics.debugLog("  [" + targetType.toUpperCase() + " PID:" + host.currentProcess.Id + "] Executing: " + command + "\n");
-        try {
-            var output = ctl.ExecuteCommand(command);
-            for (var line of output) {
-                host.diagnostics.debugLog("  " + line + "\n");
-            }
-        } catch (e) {
-            host.diagnostics.debugLog("  Error: " + e.message + "\n");
-        }
-        return "executed";
-    }
-
-    host.diagnostics.debugLog("\n=== Running in All " + targetType.toUpperCase() + " Processes ===\n\n");
-
-    try {
-        // 1. Get Map
-        var pidToSysId = getPidToSysIdMap();
-        var processes = host.currentSession.Processes;
-
-        var matchCount = 0;
-        var matchingSystemIds = [];
-
-        // Find matching processes
-        for (var proc of processes) {
-            try {
-                var pid = parseInt(proc.Id.toString());
-                var sysId = pidToSysId.has(pid) ? pidToSysId.get(pid) : null;
-
-                if (sysId === null) continue;
-
-                // 2. Get Safe Info
-                var info = getProcessInfoSafe(proc, sysId);
-
-                if (info.type === targetType) {
-                    matchingSystemIds.push({ sysId: sysId, pid: pid });
-                }
-            } catch (e) { }
-        }
-
-        if (matchingSystemIds.length === 0) {
-            host.diagnostics.debugLog("  No " + targetType + " processes found.\n\n");
-            return "no_match";
-        }
-
-        host.diagnostics.debugLog("  Found " + matchingSystemIds.length + " " + targetType + " process(es)\n\n");
-
-        // Execute in each matching process
-        for (var i = 0; i < matchingSystemIds.length; i++) {
-            var info = matchingSystemIds[i];
-            host.diagnostics.debugLog("  [" + targetType.toUpperCase() + " PID:" + info.pid + "] Executing: " + command + "\n");
-
-            try {
-                ctl.ExecuteCommand("|" + info.sysId + "s");
-                var output = ctl.ExecuteCommand(command);
-                for (var line of output) {
-                    host.diagnostics.debugLog("    " + line + "\n");
-                }
-                matchCount++;
-            } catch (e) {
-                host.diagnostics.debugLog("    Error: " + e.message + "\n");
-            }
-        }
-
-        // Restore original context if possible (approximate)
-        try { ctl.ExecuteCommand("|0s"); } catch (e) { }
-
-        host.diagnostics.debugLog("\n  Executed in " + matchCount + " " + targetType + " process(es)\n\n");
-        return "executed_in_" + matchCount;
-
-    } catch (e) {
-        host.diagnostics.debugLog("Error in runInProcessType: " + e.message + "\n");
-        return "error";
-    }
-}
-
-/// =============================================================================
-/// SANDBOX INSPECTION
-/// =============================================================================
-
-/// Check sandbox state
-function sandbox_state() {
-    host.diagnostics.debugLog("\n=== Sandbox State ===\n\n");
-
-    var processType = chrome_process_type();
-
-    if (processType === "browser") {
-        host.diagnostics.debugLog("  Browser process - not sandboxed\n\n");
-        return "browser (not sandboxed)";
-    }
-
-    // Try to find sandbox state symbols
-    host.diagnostics.debugLog("  Checking sandbox state...\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Try to examine process token
-        host.diagnostics.debugLog("  Token Information:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
-
-        // Get token integrity level using !token
-        var tokenOutput = ctl.ExecuteCommand("!token -n");
-        for (var line of tokenOutput) {
-            if (line.indexOf("Impersonation") !== -1 ||
-                line.indexOf("Integrity") !== -1 ||
-                line.indexOf("Restricted") !== -1) {
-                host.diagnostics.debugLog("    " + line + "\n");
-            }
-        }
-    } catch (e) {
-        host.diagnostics.debugLog("  Unable to query token (symbols may be needed)\n");
-    }
-
-    host.diagnostics.debugLog("\n");
-
-    // Check for sandbox::TargetServicesBase if symbols are available
-    host.diagnostics.debugLog("  Sandbox Breakpoints (for detailed analysis):\n");
-    host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
-    host.diagnostics.debugLog("    bp sandbox!TargetServicesBase::Init\n");
-    host.diagnostics.debugLog("    bp sandbox!TargetServicesBase::LowerToken\n");
-    host.diagnostics.debugLog("\n");
-
-    return "";
-}
 
 /// Check sandbox status for ALL processes
 function sandbox_status_all() {
-    host.diagnostics.debugLog("\n=== Sandbox Status Dashboard ===\n\n");
-    host.diagnostics.debugLog("  ID    PID       Type              Integrity Level           Status\n");
-    host.diagnostics.debugLog("  " + "-".repeat(90) + "\n");
+    Logger.section("Sandbox Status Dashboard");
+    Logger.info("  ID    PID       Type              Integrity Level           Status");
+    Logger.info("  " + "-".repeat(90));
 
-    var ctl = host.namespace.Debugger.Utility.Control;
+    var ctl = SymbolUtils.getControl();
 
     // Use our trusted helpers
-    var pidToSysId = getPidToSysIdMap();
-    var processes = host.currentSession.Processes;
+    var processList = ProcessUtils.getList();
 
     // Remember original context
-    var originalId = 0;
-    try {
-        var curPid = parseInt(host.currentProcess.Id.toString());
-        if (pidToSysId.has(curPid)) originalId = pidToSysId.get(curPid);
-    } catch (e) { }
+    var originalId = ProcessUtils.getCurrentSysId();
 
-    for (var proc of processes) {
+    for (var proc of processList) {
         try {
-            var pid = parseInt(proc.Id.toString());
-            var sysId = pidToSysId.has(pid) ? pidToSysId.get(pid) : null;
-            if (sysId === null) continue;
+            var sysId = proc.sysId;
+            if (sysId === "?" || sysId === null) continue;
 
-            var info = getProcessInfoSafe(proc, sysId);
-            var type = info.type;
+            var type = proc.type;
+            var pid = proc.pid;
 
-            // Switch and query token
-            ctl.ExecuteCommand("|" + sysId + "s");
-
-            var integrity = "Unknown";
             var status = "Unknown";
 
-            // Run !token to get integrity
-            // Output format varies: "Integrity Level: Low" or "IntegrityLevel: Low" or raw SID
-            try {
-                var output = ctl.ExecuteCommand("!token");
-                for (var line of output) {
-                    // Match "Integrity Level" or "IntegrityLevel" followed by colon
-                    if (/Integrity.*Level.*:/i.test(line)) {
-                        var parts = line.split(":");
-                        if (parts.length > 1) integrity = parts[1].trim();
-                        break;
+            // Switch and query token safely
+            var integrity = ProcessUtils.withContext(sysId, function () {
+                var result = "Unknown";
+                try {
+                    var output = SymbolUtils.execute("!token");
+                    for (var line of output) {
+                        // Match "Integrity Level" or "IntegrityLevel" followed by colon
+                        if (/Integrity.*Level.*:/i.test(line)) {
+                            var parts = line.split(":");
+                            if (parts.length > 1) result = parts[1].trim();
+                            break;
+                        }
                     }
-                }
-            } catch (e) { integrity = "Error reading token"; }
+                } catch (e) { result = "Error reading token"; }
+                return result;
+            });
 
-            // Map SIDs to Names if regex didn't catch text
-            if (integrity.indexOf("S-1-16-0") !== -1) integrity = "Untrusted (S-1-16-0)";
-            else if (integrity.indexOf("S-1-16-4096") !== -1) integrity = "Low (S-1-16-4096)";
-            else if (integrity.indexOf("S-1-16-8192") !== -1) integrity = "Medium (S-1-16-8192)";
-            else if (integrity.indexOf("S-1-16-12288") !== -1) integrity = "High (S-1-16-12288)";
-            else if (integrity.indexOf("S-1-16-16384") !== -1) integrity = "System (S-1-16-16384)";
-            else if (integrity.indexOf("S-1-15-2") !== -1) integrity = "AppContainer";
+            // Map SIDs to Names using lookup table
+            for (var sid in INTEGRITY_LEVELS) {
+                if (integrity.indexOf(sid) !== -1) {
+                    integrity = INTEGRITY_LEVELS[sid] + " (" + sid + ")";
+                    break;
+                }
+            }
 
             // Determine status based on type and integrity
             if (type === "browser") {
@@ -1670,170 +1780,24 @@ function sandbox_status_all() {
             // Shorten integrity string for display
             if (integrity.length > 25) integrity = integrity.substring(0, 22) + "...";
 
-            host.diagnostics.debugLog(
+            Logger.info(
                 "  " + sysId.toString().padEnd(6) +
                 pid.toString().padEnd(10) +
                 type.padEnd(18) +
                 integrity.padEnd(26) +
-                status + "\n"
+                status
             );
 
         } catch (e) {
-            host.diagnostics.debugLog("  Error processing PID " + pid + "\n");
+            Logger.error("Error processing PID " + pid);
         }
     }
 
-    // Restore context
-    try { ctl.ExecuteCommand("|" + originalId + "s"); } catch (e) { }
-
-    host.diagnostics.debugLog("\n");
+    Logger.empty();
     return "";
 }
 
-/// Analyze process token
-function sandbox_token() {
-    host.diagnostics.debugLog("\n=== Process Token Analysis ===\n\n");
 
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Get detailed token info
-        host.diagnostics.debugLog("  Running !token...\n\n");
-        var tokenOutput = ctl.ExecuteCommand("!token");
-        for (var line of tokenOutput) {
-            host.diagnostics.debugLog("  " + line + "\n");
-        }
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-        host.diagnostics.debugLog("  Try: .reload /f ntdll.dll\n");
-    }
-
-    host.diagnostics.debugLog("\n");
-    return "";
-}
-
-/// =============================================================================
-/// SECURITY BREAKPOINTS
-/// =============================================================================
-
-/// Set breakpoint on renderer process launch
-function bp_renderer_launch() {
-    host.diagnostics.debugLog("\n=== Setting Renderer Launch Breakpoints ===\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Breakpoint patterns for renderer launch
-        var bpTargets = [
-            "content!RenderProcessHostImpl::Init",
-            "content!RenderProcessHostImpl::OnProcessLaunched",
-            "content!ChildProcessLauncher::Launch"
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            host.diagnostics.debugLog("  Setting: bp " + bpTargets[i] + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + bpTargets[i]);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found - may need symbols)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n  Breakpoints set. Use 'bl' to list.\n\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
-}
-
-/// Set breakpoint on sandbox token lowering
-function bp_sandbox_lower() {
-    host.diagnostics.debugLog("\n=== Setting Sandbox Token Breakpoints ===\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        var bpTargets = [
-            "sandbox!TargetServicesBase::LowerToken",
-            "sandbox!ProcessState::SetRevertedToSelf"
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            host.diagnostics.debugLog("  Setting: bp " + bpTargets[i] + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + bpTargets[i]);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n  These breakpoints will hit when sandbox restricts token.\n\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
-}
-
-/// Set breakpoint on Mojo interface binding
-function bp_mojo_interface() {
-    host.diagnostics.debugLog("\n=== Setting Mojo Interface Breakpoints ===\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        var bpTargets = [
-            "content!BrowserInterfaceBrokerImpl::GetInterface",
-            "content!RenderProcessHostImpl::BindReceiver",
-            "mojo!MessagePipeDispatcher::WriteMessage"
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            host.diagnostics.debugLog("  Setting: bp " + bpTargets[i] + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + bpTargets[i]);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n  These breakpoints track Mojo IPC.\n\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
-}
-
-/// Set breakpoint on IPC message dispatch
-function bp_ipc_message() {
-    host.diagnostics.debugLog("\n=== Setting IPC Message Breakpoints ===\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        var bpTargets = [
-            "content!ChildProcessHost::OnMessageReceived",
-            "ipc!ChannelMojo::OnMessageReceived"
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            host.diagnostics.debugLog("  Setting: bp " + bpTargets[i] + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + bpTargets[i]);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
-}
 
 /// =============================================================================
 /// SITE ISOLATION
@@ -1841,7 +1805,7 @@ function bp_ipc_message() {
 
 /// Check Site Isolation status
 function site_isolation_status() {
-    host.diagnostics.debugLog("\n=== Site Isolation Status ===\n\n");
+    Logger.section("Site Isolation Status");
 
     var cmdLine = getCommandLine();
 
@@ -1852,293 +1816,282 @@ function site_isolation_status() {
         "isolate-origins": cmdLine.indexOf("--isolate-origins") !== -1
     };
 
-    host.diagnostics.debugLog("  Command Line Flags:\n");
-    host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
-    host.diagnostics.debugLog("    --site-per-process:          " + (flags["site-per-process"] ? "ENABLED" : "not set") + "\n");
-    host.diagnostics.debugLog("    --disable-site-isolation:    " + (flags["disable-site-isolation"] ? "WARNING: DISABLED" : "not set") + "\n");
-    host.diagnostics.debugLog("    --isolate-origins:           " + (flags["isolate-origins"] ? "ENABLED" : "not set") + "\n");
+    Logger.info("  Command Line Flags:");
+    Logger.info("  " + "-".repeat(40));
+    Logger.info("    --site-per-process:          " + (flags["site-per-process"] ? "ENABLED" : "not set"));
+    Logger.info("    --disable-site-isolation:    " + (flags["disable-site-isolation"] ? "WARNING: DISABLED" : "not set"));
+    Logger.info("    --isolate-origins:           " + (flags["isolate-origins"] ? "ENABLED" : "not set"));
 
     // Extract isolated origins if present
     if (flags["isolate-origins"]) {
         var match = cmdLine.match(/--isolate-origins=([^\s"]+)/);
         if (match) {
-            host.diagnostics.debugLog("\n  Isolated Origins: " + match[1] + "\n");
+            Logger.info("");
+            Logger.info("  Isolated Origins: " + match[1]);
         }
     }
 
-    host.diagnostics.debugLog("\n  Runtime Check Breakpoints:\n");
-    host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
-    host.diagnostics.debugLog("    bp content!SiteIsolationPolicy::UseDedicatedProcessesForAllSites\n");
-    host.diagnostics.debugLog("    bp content!SiteInstanceImpl::GetSiteForURL\n");
-    host.diagnostics.debugLog("\n");
+    Logger.info("");
+    Logger.info("  Runtime Check Breakpoints:");
+    Logger.info("  " + "-".repeat(40));
+    Logger.info("    bp content!SiteIsolationPolicy::UseDedicatedProcessesForAllSites");
+    Logger.info("    bp content!SiteInstanceImpl::GetSiteForURL");
+    Logger.empty();
 
     return "";
+}
+
+/// Helper: Check if chrome.dll module is loaded in current process
+function _hasChromeModule() {
+    try {
+        var modules = host.currentProcess.Modules;
+        for (var mod of modules) {
+            var modName = mod.Name.toLowerCase();
+            if (modName === "chrome.dll" || modName.endsWith("\\chrome.dll")) {
+                Logger.info("    Found module: " + mod.Name);
+                return true;
+            }
+        }
+    } catch (modErr) {
+        Logger.warn("    Warning: Could not enumerate modules");
+    }
+    return false;
+}
+
+/// Helper: Find g_frame_map LazyInstance address
+function _findFrameMapAddress(ctl) {
+    try {
+        var xOutput = ctl.ExecuteCommand("x chrome!*g_frame_map*");
+        for (var line of xOutput) {
+            var lineStr = line.toString();
+            Logger.info("    > " + lineStr);
+            var addr = SymbolUtils.extractAddress(line);
+            if (addr) return addr;
+        }
+    } catch (xErr) {
+        Logger.error("Symbol lookup failed: " + (xErr.message || xErr));
+        Logger.info("Try: .reload /f chrome.dll");
+    }
+    return null;
+}
+
+/// Helper: Read FrameMap pointer from LazyInstance
+function _readFrameMapPointer(lazyInstanceAddr) {
+    try {
+        var lazyAddrVal = BigInt("0x" + lazyInstanceAddr);
+        var ptrValue = host.memory.readMemoryValues(host.parseInt64(lazyAddrVal.toString(16), 16), 1, 8)[0];
+        var mapAddr = ptrValue.toString(16);
+        if (mapAddr && mapAddr !== "0000000000000000" && mapAddr !== "00000000") {
+            return mapAddr;
+        }
+    } catch (e) { }
+    return null;
+}
+
+/// Helper: Parse frame entries from dx output
+function _parseFrameMapEntries(ctl, mapAddr) {
+    var frames = [];
+    var currentWebFrame = null;
+    var dxCmd = "dx -r5 *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")";
+    var mapOutput = ctl.ExecuteCommand(dxCmd);
+
+    for (var line of mapOutput) {
+        var lineStr = line.toString();
+        var firstMatch = lineStr.match(/first\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*blink::WebFrame/i);
+        if (firstMatch) {
+            currentWebFrame = firstMatch[1].replace(/`/g, "");
+        }
+        var secondMatch = lineStr.match(/second\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*content::RenderFrameImpl/i);
+        if (secondMatch && currentWebFrame) {
+            frames.push({
+                webFrame: currentWebFrame,
+                renderFrame: secondMatch[1].replace(/`/g, "")
+            });
+            currentWebFrame = null;
+        }
+    }
+    return frames;
+}
+
+/// Helper: Extract URL from a frame using various methods
+function _extractFrameUrl(ctl, f) {
+    var webFrameHex = f.webFrame.startsWith("0x") ? f.webFrame : "0x" + f.webFrame;
+    var localFrameAddr = null;
+    var frameCompressed = getCompressedMember(webFrameHex, "(blink::WebLocalFrameImpl*)", "frame_");
+    if (frameCompressed !== null) {
+        localFrameAddr = MemoryUtils.decompressCppgcPtr(frameCompressed, f.webFrame);
+    }
+
+    if (!localFrameAddr) return "";
+
+    // Try via FrameLoader -> DocumentLoader
+    var loaderCompressed = getCompressedMember("0x" + localFrameAddr, "(blink::LocalFrame*)", "loader_");
+    if (loaderCompressed !== null) {
+        var loaderAddr = MemoryUtils.decompressCppgcPtr(loaderCompressed, localFrameAddr);
+        if (loaderAddr && loaderAddr !== "0" && loaderAddr !== "00000000") {
+            var docLoaderCompressed = getCompressedMember("0x" + loaderAddr, "(blink::FrameLoader*)", "document_loader_");
+            if (docLoaderCompressed !== null) {
+                var docLoaderAddr = MemoryUtils.decompressCppgcPtr(docLoaderCompressed, loaderAddr);
+                if (docLoaderAddr && docLoaderAddr !== "0" && docLoaderAddr !== "00000000") {
+                    var url = readUrlStringFromDx(docLoaderAddr.toString(16), "(blink::DocumentLoader*)");
+                    if (url) return url;
+                }
+            }
+        }
+    }
+
+    // Fallback: Try via dom_window_ -> document_ -> url_
+    var windowCompressed = getCompressedMember("0x" + localFrameAddr, "(blink::LocalFrame*)", "dom_window_");
+    if (windowCompressed !== null) {
+        var windowAddr = MemoryUtils.decompressCppgcPtr(windowCompressed, localFrameAddr);
+        if (windowAddr && windowAddr !== "0" && windowAddr !== "00000000") {
+            var docCompressed = getCompressedMember("0x" + windowAddr, "(blink::LocalDOMWindow*)", "document_");
+            if (docCompressed !== null) {
+                var docAddr = MemoryUtils.decompressCppgcPtr(docCompressed, windowAddr);
+                if (docAddr && docAddr !== "0" && docAddr !== "00000000") {
+                    return readUrlStringFromDx(docAddr, "(blink::Document*)") || "";
+                }
+            }
+        }
+    }
+    return "";
+}
+
+/// Helper: Get process_label_id_ from RenderFrameImpl
+function _getFrameLabelId(ctl, renderFrame) {
+    try {
+        var rfCmd = "dx -r0 ((content::RenderFrameImpl*)" + renderFrame + ")->process_label_id_";
+        var rfOutput = ctl.ExecuteCommand(rfCmd);
+        for (var rfLine of rfOutput) {
+            if (rfLine.toString().indexOf("process_label_id_") !== -1) {
+                var idMatch = rfLine.toString().match(/:\s*(\d+)/);
+                if (idMatch) return idMatch[1];
+            }
+        }
+    } catch (e) { }
+    return "N/A";
+}
+
+/// Helper: Display single frame info
+function _displayFrameInfo(ctl, f, index) {
+    var rfId = _getFrameLabelId(ctl, f.renderFrame);
+    Logger.info("  [" + index + "] RenderFrameImpl:  " + f.renderFrame + " (ID: " + rfId + ")");
+    Logger.info("       WebFrame:         " + f.webFrame);
+
+    var urlStr = _extractFrameUrl(ctl, f);
+    if (urlStr) {
+        Logger.info("       URL:              " + urlStr);
+    } else {
+        Logger.info("       URL:              (use dx to inspect)");
+    }
+    Logger.empty();
 }
 
 /// List all frames in the current renderer process
 function renderer_frames() {
-    host.diagnostics.debugLog("\n=== Renderer Frames ===\n\n");
+    Logger.section("Renderer Frames");
 
     var ctl;
     try {
-        ctl = host.namespace.Debugger.Utility.Control;
+        ctl = SymbolUtils.getControl();
     } catch (e) {
-        host.diagnostics.debugLog("  Error: Cannot get debugger control interface.\n\n");
+        Logger.error("Cannot get debugger control interface.");
         return "";
     }
 
-    // Try to verify we're in a renderer, but don't fail if we can't check
+    // Verify we're in a renderer
     try {
         var cmdLine = getCommandLine();
         if (cmdLine) {
-            var info = parseProcessInfo(cmdLine);
+            var info = ProcessUtils.parseInfo(cmdLine);
             if (info && info.type !== "renderer") {
-                host.diagnostics.debugLog("  Warning: May not be a renderer (detected: " + info.type + ")\n");
-                host.diagnostics.debugLog("  Continuing anyway...\n\n");
+                Logger.warn("May not be a renderer (detected: " + info.type + ")");
+                Logger.info("  Continuing anyway...");
+                Logger.empty();
             }
         }
     } catch (e) {
-        host.diagnostics.debugLog("  Could not verify process type (continuing anyway)\n\n");
+        Logger.warn("Could not verify process type (continuing anyway)");
+        Logger.empty();
     }
 
     try {
-        // Find g_frame_map symbol address
-        // g_frame_map is a base::LazyInstance<FrameMap>::DestructorAtExit
-        // where FrameMap = absl::flat_hash_map<blink::WebFrame*, RenderFrameImpl*>
-        host.diagnostics.debugLog("  Step 1: Looking for g_frame_map symbol...\n");
+        Logger.info("  Step 1: Looking for g_frame_map symbol...");
 
-        // First check if chrome module is loaded
-        var hasModule = false;
-        try {
-            var modules = host.currentProcess.Modules;
-            for (var mod of modules) {
-                var modName = mod.Name.toLowerCase();
-                // Look for chrome.dll specifically (not chrome_elf.dll etc.)
-                if (modName === "chrome.dll" || modName.endsWith("\\chrome.dll")) {
-                    hasModule = true;
-                    host.diagnostics.debugLog("    Found module: " + mod.Name + "\n");
-                    break;
-                }
-            }
-        } catch (modErr) {
-            host.diagnostics.debugLog("    Warning: Could not enumerate modules\n");
-        }
-
-        if (!hasModule) {
-            host.diagnostics.debugLog("  chrome.dll not found in this process.\n");
-            host.diagnostics.debugLog("  This command only works in renderer processes.\n");
-            host.diagnostics.debugLog("  Use !procs to list processes and |<id>s to switch.\n\n");
+        if (!_hasChromeModule()) {
+            Logger.info("  chrome.dll not found in this process.");
+            Logger.info("  This command only works in renderer processes.");
+            Logger.info("  Use !procs to list processes and |<id>s to switch.");
+            Logger.empty();
             return "";
         }
 
-        var xOutput;
-        try {
-            xOutput = ctl.ExecuteCommand("x chrome!*g_frame_map*");
-        } catch (xErr) {
-            host.diagnostics.debugLog("  Symbol lookup failed: " + (xErr.message || xErr) + "\n");
-            host.diagnostics.debugLog("  Try: .reload /f chrome.dll\n\n");
-            return "";
-        }
-
-        var lazyInstanceAddr = null;
-
-        for (var line of xOutput) {
-            var lineStr = line.toString();
-            host.diagnostics.debugLog("    > " + lineStr + "\n");
-            var match = lineStr.match(/^([0-9a-fA-F`]+)/);
-            if (match) {
-                lazyInstanceAddr = match[1].replace(/`/g, "");
-                break;
-            }
-        }
-
+        var lazyInstanceAddr = _findFrameMapAddress(ctl);
         if (!lazyInstanceAddr) {
-            host.diagnostics.debugLog("  Could not find g_frame_map symbol.\n");
-            host.diagnostics.debugLog("  Make sure symbols are loaded (try: .reload /f chrome.dll)\n\n");
+            Logger.warn("Could not find g_frame_map symbol.");
+            Logger.info("Make sure symbols are loaded (try: .reload /f chrome.dll)");
+            Logger.empty();
             return "";
         }
 
-        host.diagnostics.debugLog("  g_frame_map (LazyInstance) at: 0x" + lazyInstanceAddr + "\n");
+        Logger.info("  g_frame_map (LazyInstance) at: 0x" + lazyInstanceAddr);
+        Logger.info("  Step 2: Reading private_instance_ pointer...");
 
-        // LazyInstance has private_instance_ as first member (std::atomic<uintptr_t>)
-        // This holds the pointer to the actual FrameMap once initialized
-        // Read the pointer value from the LazyInstance
-        host.diagnostics.debugLog("  Step 2: Reading private_instance_ pointer...\n");
-        var mapAddr = null;
-        try {
-            var lazyAddrVal = BigInt("0x" + lazyInstanceAddr);
-            var ptrValue = host.memory.readMemoryValues(host.parseInt64(lazyAddrVal.toString(16), 16), 1, 8)[0];
-            mapAddr = ptrValue.toString(16);
-        } catch (e) { }
-
-        if (!mapAddr || mapAddr === "0000000000000000" || mapAddr === "00000000") {
-            host.diagnostics.debugLog("  LazyInstance not yet initialized (no frames created yet).\n\n");
+        var mapAddr = _readFrameMapPointer(lazyInstanceAddr);
+        if (!mapAddr) {
+            Logger.info("  LazyInstance not yet initialized (no frames created yet).");
+            Logger.empty();
             return "";
         }
 
-        host.diagnostics.debugLog("  FrameMap (actual map) at: 0x" + mapAddr + "\n\n");
+        Logger.info("  FrameMap (actual map) at: 0x" + mapAddr);
+        Logger.empty();
+        Logger.info("  Enumerating frames...");
+        Logger.info("  " + "-".repeat(70));
+        Logger.empty();
 
-        // Now enumerate the flat_hash_map
-        // absl::flat_hash_map uses Swiss tables internally
-        // Try using dx with the FrameMap type
-        host.diagnostics.debugLog("  Enumerating frames...\n");
-        host.diagnostics.debugLog("  " + "-".repeat(70) + "\n\n");
+        var frames = _parseFrameMapEntries(ctl, mapAddr);
 
-        var frames = [];
-        var currentWebFrame = null;
-
-        // Use dx with moderate recursion to see the map entries
-        var dxCmd = "dx -r5 *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")";
-        var mapOutput = ctl.ExecuteCommand(dxCmd);
-
-        for (var line of mapOutput) {
-            var lineStr = line.toString();
-
-            // Look for "first" entries (WebFrame pointers)
-            // Pattern: "first : 0x... [Type: blink::WebFrame *]"
-            var firstMatch = lineStr.match(/first\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*blink::WebFrame/i);
-            if (firstMatch) {
-                currentWebFrame = firstMatch[1].replace(/`/g, "");
-            }
-
-            // Look for "second" entries (RenderFrameImpl pointers)
-            // Pattern: "second : 0x... [Type: content::RenderFrameImpl *]"
-            var secondMatch = lineStr.match(/second\s*:\s*(0x[0-9a-fA-F`]+)\s*\[Type:\s*content::RenderFrameImpl/i);
-            if (secondMatch && currentWebFrame) {
-                frames.push({
-                    webFrame: currentWebFrame,
-                    renderFrame: secondMatch[1].replace(/`/g, "")
-                });
-                currentWebFrame = null;
-            }
-        }
-
-        // Display the frames
         if (frames.length > 0) {
-            host.diagnostics.debugLog("  Found " + frames.length + " frame(s):\n\n");
+            Logger.info("  Found " + frames.length + " frame(s):");
+            Logger.empty();
 
-            // Get the Oilpan cage base for pointer decompression
-            var oilpanBase = getCppgcCageBase();
+            var oilpanBase = MemoryUtils.getCppgcCageBase();
             if (oilpanBase) {
-                host.diagnostics.debugLog("  (Oilpan Cage Base: 0x" + oilpanBase + ")\n\n");
+                Logger.info("  (Oilpan Cage Base: 0x" + oilpanBase + ")");
+                Logger.empty();
             }
 
             for (var i = 0; i < frames.length; i++) {
-                var f = frames[i];
-                var rfId = "N/A"; // Initialize rfId
-
-                // Extract process_label_id_ from RenderFrameImpl
-                if (f.renderFrame) {
-                    try {
-                        var rfCmd = "dx -r0 ((content::RenderFrameImpl*)" + f.renderFrame + ")->process_label_id_";
-                        // host.diagnostics.debugLog("Debug RF: " + rfCmd + "\n");
-                        var rfOutput = ctl.ExecuteCommand(rfCmd);
-                        for (var rfLine of rfOutput) {
-                            // host.diagnostics.debugLog("Debug RF line: " + rfLine.toString() + "\n");
-                            if (rfLine.toString().indexOf("process_label_id_") !== -1) {
-                                var idMatch = rfLine.toString().match(/:\s*(\d+)/);
-                                if (idMatch) {
-                                    rfId = idMatch[1];
-                                    break;
-                                }
-                            }
-                        }
-                    } catch (eRf) {
-                        // host.diagnostics.debugLog("Debug RF Error: " + eRf.message + "\n");
-                    }
-                }
-
-                host.diagnostics.debugLog("  [" + i + "] RenderFrameImpl:  " + f.renderFrame + " (ID: " + rfId + ")\n");
-                host.diagnostics.debugLog("       WebFrame:         " + f.webFrame + "\n");
-
-                // Try to get LocalFrame by decompressing the compressed pointer at WebLocalFrameImpl+0x3c
-                var localFrameAddr = null;
-                var urlStr = "";
-
-                try {
-                    // Read the compressed pointer at offset +0x3c (frame_)
-                    var webFrameVal = BigInt(f.webFrame.startsWith("0x") ? f.webFrame : "0x" + f.webFrame);
-                    var offset = webFrameVal + 0x3cn;
-                    var offsetInt64 = host.parseInt64(offset.toString(16), 16);
-
-                    var compressedPtr = host.memory.readMemoryValues(offsetInt64, 1, 4)[0];
-
-                    // Decompress using Oilpan formula
-                    localFrameAddr = decompressCppgcPtr(compressedPtr, f.webFrame);
-                    if (localFrameAddr) {
-                        host.diagnostics.debugLog("       LocalFrame:       0x" + localFrameAddr + "\n");
-                    }
-                } catch (e1) { }
-
-                // Trace URL: LocalFrame -> loader_ (FrameLoader) -> document_loader_ (DocumentLoader) -> url_
-                if (localFrameAddr) {
-                    try {
-                        // Offset of loader_ in LocalFrame (0x1c8 based on dx output)
-                        // Offset of document_loader_ in FrameLoader (0x10 based on dx output)
-                        // Total offset: 0x1d8
-                        var docLoaderPtrOffsetBig = BigInt("0x" + localFrameAddr) + 0x1d8n;
-                        var docLoaderPtrOffset = host.parseInt64(docLoaderPtrOffsetBig.toString(16), 16);
-
-                        // Read Compressed ptr
-                        var docLoaderCompressed = host.memory.readMemoryValues(docLoaderPtrOffset, 1, 4)[0];
-
-                        // Decompress (using LocalFrame as context, they are in same heap)
-                        var docLoaderAddr = decompressCppgcPtr(docLoaderCompressed, localFrameAddr);
-
-                        // host.diagnostics.debugLog("Debug: DocLoaderAddr: 0x" + docLoaderAddr.toString(16) + "\n");
-
-                        if (docLoaderAddr) {
-                            // Use dx to extract the URL string from DocumentLoader
-                            // We target url_.string_ directly to get the data
-                            var dxCmd = "dx -r2 ((blink::DocumentLoader*)0x" + docLoaderAddr.toString(16) + ")->url_.string_";
-                            var output = ctl.ExecuteCommand(dxCmd);
-                            for (var line of output) {
-                                var sLine = line.toString();
-                                // host.diagnostics.debugLog("Debug dx: " + sLine + "\n");
-
-                                // Match AsciiText line: Debug dx: AsciiText : 0x... : "https://..." [Type: char *]
-                                if (sLine.indexOf("AsciiText") !== -1) {
-                                    var m = sLine.match(/"(.*)"/);
-                                    if (m) {
-                                        urlStr = m[1];
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    } catch (eUrl) {
-                        host.diagnostics.debugLog("       (URL Error: " + eUrl.message + ")\n");
-                    }
-                }
-
-                if (urlStr) {
-                    host.diagnostics.debugLog("       URL:              " + urlStr + "\n");
-                } else {
-                    host.diagnostics.debugLog("       URL:              (use dx to inspect)\n");
-                }
-                host.diagnostics.debugLog("\n");
+                _displayFrameInfo(ctl, frames[i], i);
             }
         } else {
-            host.diagnostics.debugLog("  No frames found. Map may be empty.\n\n");
-            host.diagnostics.debugLog("  Manual inspection commands:\n");
-            host.diagnostics.debugLog("    dq 0x" + mapAddr + " L10\n");
-            host.diagnostics.debugLog("    dx *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")\n\n");
+            Logger.info("  No frames found. Map may be empty.");
+            Logger.empty();
+            Logger.info("  Manual inspection commands:");
+            Logger.info("    dq 0x" + mapAddr + " L10");
+            Logger.info("    dx *((content::`anonymous namespace'::FrameMap*)0x" + mapAddr + ")");
+            Logger.empty();
         }
 
-        host.diagnostics.debugLog("\n  Useful commands:\n");
-        host.diagnostics.debugLog("    dx ((content::RenderFrameImpl*)<addr>)         - Inspect RenderFrameImpl\n");
-        host.diagnostics.debugLog("    dx ((content::RenderFrameImpl*)<addr>)->frame_ - Get WebLocalFrame\n");
-        host.diagnostics.debugLog("    dx ((blink::WebLocalFrame*)<addr>)             - Inspect WebFrame\n\n");
+        Logger.empty();
+        Logger.info("  Useful commands:");
+        Logger.info("    dx ((content::RenderFrameImpl*)<addr>)         - Inspect RenderFrameImpl");
+        Logger.info("    dx ((content::RenderFrameImpl*)<addr>)->frame_ - Get WebLocalFrame");
+        Logger.info("    dx ((blink::WebLocalFrame*)<addr>)             - Inspect WebFrame");
+        Logger.empty();
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + (e.message || e.toString()) + "\n");
+        Logger.error("Error: " + (e.message || e.toString()));
         if (e.stack) {
-            host.diagnostics.debugLog("  Stack: " + e.stack + "\n");
+            Logger.info("  Stack: " + e.stack);
         }
-        host.diagnostics.debugLog("\n  Manual approach:\n");
-        host.diagnostics.debugLog("    x chrome!*g_frame_map*\n");
-        host.diagnostics.debugLog("    dq <addr> L1                ; Read LazyInstance.private_instance_\n");
-        host.diagnostics.debugLog("    dx *((content::`anonymous namespace'::FrameMap*)<ptr>)\n\n");
+        Logger.empty();
+        Logger.info("  Manual approach:");
+        Logger.info("    x chrome!*g_frame_map*");
+        Logger.info("    dq <addr> L1                ; Read LazyInstance.private_instance_");
+        Logger.info("    dx *((content::`anonymous namespace'::FrameMap*)<ptr>)");
+        Logger.empty();
     }
 
     return "";
@@ -2146,99 +2099,90 @@ function renderer_frames() {
 
 
 
+/// Helper: Show usage for run_in_* commands and execute if command provided
+function _runInProcessType(command, processType, exampleCmd) {
+    if (isEmpty(command)) {
+        var displayName = processType.charAt(0).toUpperCase() + processType.slice(1);
+        Logger.section("Run in " + displayName);
+        Logger.info("  Usage: !run_in_" + processType + " \"<windbg command>\"");
+        Logger.info("  Example: !run_in_" + processType + " \"" + exampleCmd + "\"");
+        Logger.empty();
+        Logger.info("  Works from ANY process - automatically finds and runs in " + processType + ".");
+        Logger.empty();
+        return "";
+    }
+    return ProcessUtils.runInType(processType, command);
+}
+
 
 /// Execute a command only in renderer processes (works from any process context)
 function run_in_renderer(command) {
-    if (!command) {
-        host.diagnostics.debugLog("\n=== Run in Renderer ===\n\n");
-        host.diagnostics.debugLog("  Usage: !run_in_renderer \"<windbg command>\"\n");
-        host.diagnostics.debugLog("  Example: !run_in_renderer \"bp chrome!v8::internal::Heap::CollectGarbage\"\n\n");
-        host.diagnostics.debugLog("  Works from ANY process - automatically finds and runs in all renderers.\n\n");
-        return "";
-    }
-    return runInProcessType("renderer", command);
+    return _runInProcessType(command, "renderer", "bp chrome!v8::internal::Heap::CollectGarbage");
 }
 
 /// Execute a command only in browser process (works from any process context)
 function run_in_browser(command) {
-    if (!command) {
-        host.diagnostics.debugLog("\n=== Run in Browser ===\n\n");
-        host.diagnostics.debugLog("  Usage: !run_in_browser \"<windbg command>\"\n");
-        host.diagnostics.debugLog("  Example: !run_in_browser \"bp chrome!Browser::Create\"\n\n");
-        host.diagnostics.debugLog("  Works from ANY process - automatically finds and runs in browser.\n\n");
-        return "";
-    }
-    return runInProcessType("browser", command);
+    return _runInProcessType(command, "browser", "bp chrome!Browser::Create");
 }
 
 /// Execute a command only in GPU process (works from any process context)
 function run_in_gpu(command) {
-    if (!command) {
-        host.diagnostics.debugLog("\n=== Run in GPU ===\n\n");
-        host.diagnostics.debugLog("  Usage: !run_in_gpu \"<windbg command>\"\n");
-        host.diagnostics.debugLog("  Example: !run_in_gpu \"bp chrome!gpu::CommandBufferService::Flush\"\n\n");
-        host.diagnostics.debugLog("  Works from ANY process - automatically finds and runs in GPU process.\n\n");
-        return "";
-    }
-    return runInProcessType("gpu", command);
+    return _runInProcessType(command, "gpu-process", "bp chrome!gpu::CommandBufferService::Flush");
 }
+
 
 
 /// Set up commands to run automatically when a renderer process attaches
 function on_renderer_attach(command) {
-    host.diagnostics.debugLog("\n=== Renderer Auto-Attach Setup ===\n\n");
+    Logger.section("Renderer Auto-Attach Setup");
 
-    if (!command) {
-        host.diagnostics.debugLog("  This sets up commands to run when new renderer processes attach.\n\n");
-        host.diagnostics.debugLog("  Usage: !on_renderer_attach \"<windbg command>\"\n\n");
-        host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !on_renderer_attach \"!sandbox_state\"\n");
-        host.diagnostics.debugLog("    !on_renderer_attach \"bp chrome!blink::Document::CreateRawElement\"\n");
-        host.diagnostics.debugLog("    !on_renderer_attach \".echo Renderer attached!\"\n\n");
-        host.diagnostics.debugLog("  Registered commands:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(40) + "\n");
+    if (isEmpty(command)) {
+        Logger.info("  This sets up commands to run when new renderer processes attach.");
+        Logger.empty();
+        Logger.info("  Usage: !on_renderer_attach \"<windbg command>\"");
+        Logger.empty();
+        Logger.info("  Examples:");
+        Logger.info("    !on_renderer_attach \"!sandbox_state\"");
+        Logger.info("    !on_renderer_attach \"bp chrome!blink::Document::CreateRawElement\"");
+        Logger.info("    !on_renderer_attach \".echo Renderer attached!\"");
+        Logger.empty();
+        Logger.header("Registered commands:");
         for (var i = 0; i < g_rendererAttachCommands.length; i++) {
-            host.diagnostics.debugLog("    " + (i + 1) + ": " + g_rendererAttachCommands[i] + "\n");
+            Logger.info("    " + (i + 1) + ": " + g_rendererAttachCommands[i]);
         }
         if (g_rendererAttachCommands.length === 0) {
-            host.diagnostics.debugLog("    (none)\n");
+            Logger.info("    (none)");
         }
-        host.diagnostics.debugLog("\n  TIP: To trigger on child process creation, use WinDbg:\n");
-        host.diagnostics.debugLog("    sxe -c \"!run_in_renderer \\\"<cmd>\\\"\" cpr\n\n");
+        Logger.empty();
+        Logger.info("  TIP: To trigger on child process creation, use WinDbg:");
+        Logger.info("    sxe -c \"!run_in_renderer \\\"<cmd>\\\"\" cpr");
+        Logger.empty();
         return "";
     }
 
     g_rendererAttachCommands.push(command);
-    host.diagnostics.debugLog("  Added: " + command + "\n");
-    host.diagnostics.debugLog("  Total registered commands: " + g_rendererAttachCommands.length + "\n\n");
+    Logger.info("  Added: " + command);
+    Logger.info("  Total registered commands: " + g_rendererAttachCommands.length);
+    Logger.empty();
 
-    // Set up child process creation event to run our commands
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Use sxe cpr (create process) to catch child process creation
-        var handlerCmd = "sxe -c \"!run_in_renderer \\\"" + command.replace(/"/g, "'") + "\\\"; g\" cpr";
-        host.diagnostics.debugLog("  Setting up: " + handlerCmd + "\n");
-        ctl.ExecuteCommand(handlerCmd);
-
-        host.diagnostics.debugLog("\n  Handler registered. Command will run in new renderer processes.\n\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Note: Auto-setup failed. Manually use:\n");
-        host.diagnostics.debugLog("    sxe -c \"!run_in_renderer \\\"" + command + "\\\"; g\" cpr\n\n");
-    }
+    // Use helper to register sxe handler
+    _registerRendererSxeHandler("!run_in_renderer \"" + command + "\"", "Command");
 
     return "";
 }
 
 /// Execute a script file only in renderer processes (works from any process context)
 function run_script_in_renderer(scriptPath) {
-    if (!scriptPath) {
-        host.diagnostics.debugLog("\n=== Run Script in Renderer ===\n\n");
-        host.diagnostics.debugLog("  Usage: !run_script_in_renderer \"<path to .js script>\"\n\n");
-        host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !run_script_in_renderer \"C:\\scripts\\renderer_hooks.js\"\n");
-        host.diagnostics.debugLog("    !run_script_in_renderer \"renderer_security.js\"\n\n");
-        host.diagnostics.debugLog("  Works from ANY process - automatically loads in all renderers.\n\n");
+    if (isEmpty(scriptPath)) {
+        Logger.section("Run Script in Renderer");
+        Logger.info("  Usage: !run_script_in_renderer \"<path to .js script>\"");
+        Logger.empty();
+        Logger.info("  Examples:");
+        Logger.info("    !run_script_in_renderer \"C:\\scripts\\renderer_hooks.js\"");
+        Logger.info("    !run_script_in_renderer \"renderer_security.js\"");
+        Logger.empty();
+        Logger.info("  Works from ANY process - automatically loads in all renderers.");
+        Logger.empty();
         return "";
     }
 
@@ -2249,34 +2193,26 @@ function run_script_in_renderer(scriptPath) {
 
 /// Set up a script to load automatically when renderer processes attach
 function script_in_renderer_attach(scriptPath) {
-    host.diagnostics.debugLog("\n=== Script Auto-Load on Renderer Attach ===\n\n");
+    Logger.section("Script Auto-Load on Renderer Attach");
 
-    if (!scriptPath) {
-        host.diagnostics.debugLog("  Usage: !script_in_renderer_attach \"<path to .js script>\"\n\n");
-        host.diagnostics.debugLog("  This will auto-load the script when new renderer processes spawn.\n\n");
-        host.diagnostics.debugLog("  Examples:\n");
-        host.diagnostics.debugLog("    !script_in_renderer_attach \"renderer_hooks.js\"\n");
-        host.diagnostics.debugLog("    !script_in_renderer_attach \"C:\\research\\exploit_test.js\"\n\n");
+    if (isEmpty(scriptPath)) {
+        Logger.info("  Usage: !script_in_renderer_attach \"<path to .js script>\"");
+        Logger.empty();
+        Logger.info("  This will auto-load the script when new renderer processes spawn.");
+        Logger.empty();
+        Logger.info("  Examples:");
+        Logger.info("    !script_in_renderer_attach \"renderer_hooks.js\"");
+        Logger.info("    !script_in_renderer_attach \"C:\\research\\exploit_test.js\"");
+        Logger.empty();
         return "";
     }
 
-    host.diagnostics.debugLog("  Registering: " + scriptPath + "\n\n");
+    Logger.info("  Registering: " + scriptPath);
+    Logger.empty();
 
-    // Set up child process creation event to load the script
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // The handler checks if it's a renderer and loads the script
-        var handlerCmd = "sxe -c \"!run_script_in_renderer \\\"" + scriptPath.replace(/\\/g, "\\\\").replace(/"/g, "'") + "\\\"; g\" cpr";
-        host.diagnostics.debugLog("  Setting up: " + handlerCmd + "\n");
-        ctl.ExecuteCommand(handlerCmd);
-
-        host.diagnostics.debugLog("\n  Handler registered!\n");
-        host.diagnostics.debugLog("  Script will load automatically in new renderer processes.\n\n");
-    } catch (e) {
-        host.diagnostics.debugLog("  Note: Auto-setup failed. Manually use:\n");
-        host.diagnostics.debugLog("    sxe -c \"!run_script_in_renderer \\\"" + scriptPath + "\\\"; g\" cpr\n\n");
-    }
+    // Use helper to register sxe handler
+    var escapedPath = scriptPath.replace(/\\/g, "\\\\");
+    _registerRendererSxeHandler("!run_script_in_renderer \"" + escapedPath + "\"", "Script");
 
     return "";
 }
@@ -2287,121 +2223,44 @@ function script_in_renderer_attach(scriptPath) {
 
 /// Break on mojo::ReportBadMessage - catches security boundary violations
 function bp_bad_message() {
-    host.diagnostics.debugLog("\n=== Bad Message Breakpoints (Security Violations) ===\n\n");
-    host.diagnostics.debugLog("  These breakpoints catch Mojo security violations.\n");
-    host.diagnostics.debugLog("  When hit, check the message string for the violation reason.\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Core mojo bad message reporting
-        var bpTargets = [
+    return set_breakpoints(
+        "Bad Message Breakpoints (Security Violations)",
+        [
             "mojo!mojo::ReportBadMessage",
             "mojo_base!mojo::ReportBadMessage",
             "content!mojo::ReportBadMessage"
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            host.diagnostics.debugLog("  Setting: bp " + bpTargets[i] + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + bpTargets[i]);
-            } catch (e) {
-                // Symbol may not exist
-            }
-        }
-
-        host.diagnostics.debugLog("\n  Common violations to look for:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
-        host.diagnostics.debugLog("    - 'File System Access access from Unsecure Origin'\n");
-        host.diagnostics.debugLog("    - 'navigate from non-browser-process'\n");
-        host.diagnostics.debugLog("    - 'Received bad user message'\n");
-        host.diagnostics.debugLog("    - 'Invalid origin'\n");
-        host.diagnostics.debugLog("\n  When breakpoint hits, use: da @rcx (or first param) to see message\n\n");
-
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
+        ],
+        "Breaking on security violations (check message string)"
+    );
 }
 
 /// Break on security policy checks
 function bp_security_check() {
-    host.diagnostics.debugLog("\n=== Security Policy Breakpoints ===\n\n");
-    host.diagnostics.debugLog("  These breakpoints catch security policy decisions.\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        var bpTargets = [
-            // Process lock and origin checks
+    return set_breakpoints(
+        "Security Policy Breakpoints",
+        [
             { sym: "content!ChildProcessSecurityPolicyImpl::CanAccessDataForOrigin", desc: "Origin access check" },
             { sym: "content!ChildProcessSecurityPolicyImpl::CanCommitURL", desc: "URL commit check" },
             { sym: "content!ChildProcessSecurityPolicyImpl::GetProcessLock", desc: "Process lock query" },
-            // Site isolation
             { sym: "content!SiteIsolationPolicy::UseDedicatedProcessesForAllSites", desc: "Site isolation check" },
             { sym: "content!SiteInstanceImpl::GetProcess", desc: "SiteInstance process" },
-            // Sandbox
             { sym: "sandbox!TargetServicesBase::LowerToken", desc: "Sandbox token lowering" }
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            var target = bpTargets[i];
-            host.diagnostics.debugLog("  [" + target.desc + "]\n");
-            host.diagnostics.debugLog("    bp " + target.sym + "\n");
-            try {
-                ctl.ExecuteCommand("bp " + target.sym);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n  Breakpoints set. Use 'bl' to list, 'bc *' to clear.\n\n");
-
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
+        ],
+        "Breaking on security policy checks"
+    );
 }
 
 /// Enable IPC/Mojo message tracing
 function trace_ipc() {
-    host.diagnostics.debugLog("\n=== IPC Tracing Mode ===\n\n");
-    host.diagnostics.debugLog("  Setting breakpoints to log IPC traffic.\n");
-    host.diagnostics.debugLog("  WARNING: This can be very noisy!\n\n");
-
-    try {
-        var ctl = host.namespace.Debugger.Utility.Control;
-
-        // Mojo message dispatch points
-        var bpTargets = [
-            { sym: "mojo!mojo::MessageDispatcher::Accept", desc: "Mojo message accept" },
-            { sym: "content!BrowserInterfaceBrokerImpl::GetInterface", desc: "Interface broker" },
-            { sym: "ipc!IPC::ChannelMojo::OnMessageReceived", desc: "Legacy IPC receive" }
-        ];
-
-        for (var i = 0; i < bpTargets.length; i++) {
-            var target = bpTargets[i];
-            // Set logging breakpoint that continues
-            var cmd = 'bp ' + target.sym + ' ".echo [IPC] ' + target.desc + '; k 3; g"';
-            host.diagnostics.debugLog("  " + target.desc + ":\n");
-            host.diagnostics.debugLog("    " + cmd + "\n");
-            try {
-                ctl.ExecuteCommand(cmd);
-            } catch (e) {
-                host.diagnostics.debugLog("    (symbol not found)\n");
-            }
-        }
-
-        host.diagnostics.debugLog("\n  Tracing enabled. IPC calls will be logged with short stacks.\n");
-        host.diagnostics.debugLog("  Use 'bc *' to clear all breakpoints when done.\n\n");
-
-    } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
-    }
-
-    return "";
+    return set_breakpoints(
+        "IPC Tracing Mode",
+        [
+            { sym: "mojo!mojo::MessageDispatcher::Accept", desc: "Mojo message accept", cmd: 'bp mojo!mojo::MessageDispatcher::Accept ".echo [IPC] Mojo message accept; k 3; g"' },
+            { sym: "content!BrowserInterfaceBrokerImpl::GetInterface", desc: "Interface broker", cmd: 'bp content!BrowserInterfaceBrokerImpl::GetInterface ".echo [IPC] Interface broker; k 3; g"' },
+            { sym: "ipc!IPC::ChannelMojo::OnMessageReceived", desc: "Legacy IPC receive", cmd: 'bp ipc!IPC::ChannelMojo::OnMessageReceived ".echo [IPC] Legacy IPC receive; k 3; g"' }
+        ],
+        "Logging IPC traffic (noisy!)"
+    );
 }
 
 /// =============================================================================
@@ -2410,11 +2269,12 @@ function trace_ipc() {
 
 /// Set breakpoints for common vulnerability patterns
 function vuln_hunt() {
-    host.diagnostics.debugLog("\n=== Vulnerability Hunting Mode ===\n\n");
-    host.diagnostics.debugLog("  Setting breakpoints for common vulnerability patterns.\n\n");
+    Logger.section("Vulnerability Hunting Mode");
+    Logger.info("  Setting breakpoints for common vulnerability patterns.");
+    Logger.empty();
 
     try {
-        var ctl = host.namespace.Debugger.Utility.Control;
+        var ctl = SymbolUtils.getControl();
 
         var categories = [
             {
@@ -2450,24 +2310,25 @@ function vuln_hunt() {
 
         for (var c = 0; c < categories.length; c++) {
             var cat = categories[c];
-            host.diagnostics.debugLog("  " + cat.name + ":\n");
-            host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
+            Logger.info("  " + cat.name + ":");
+            Logger.info("  " + "-".repeat(50));
 
             for (var i = 0; i < cat.targets.length; i++) {
                 var target = cat.targets[i];
-                host.diagnostics.debugLog("    [" + target.desc + "]\n");
-                host.diagnostics.debugLog("      bp " + target.sym + "\n");
+                Logger.info("    [" + target.desc + "]");
+                Logger.info("      bp " + target.sym);
                 try {
                     ctl.ExecuteCommand("bp " + target.sym);
                 } catch (e) { }
             }
-            host.diagnostics.debugLog("\n");
+            Logger.empty();
         }
 
-        host.diagnostics.debugLog("  Breakpoints set. Use 'bl' to list, 'bc *' to clear.\n\n");
+        Logger.info("  Breakpoints set. Use 'bl' to list, 'bc *' to clear.");
+        Logger.empty();
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
+        Logger.error("Error: " + e.message);
     }
 
     return "";
@@ -2475,29 +2336,31 @@ function vuln_hunt() {
 
 /// Display heap/allocator information
 function heap_info() {
-    host.diagnostics.debugLog("\n=== Heap / PartitionAlloc Info ===\n\n");
+    Logger.section("Heap / PartitionAlloc Info");
 
     try {
-        var ctl = host.namespace.Debugger.Utility.Control;
+        var ctl = SymbolUtils.getControl();
         var procType = getProcessType();
 
-        host.diagnostics.debugLog("  Process Type: " + procType + "\n\n");
+        Logger.info("  Process Type: " + procType);
+        Logger.empty();
 
-        host.diagnostics.debugLog("  PartitionAlloc Structures:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
-        host.diagnostics.debugLog("    dt chrome!base::PartitionRoot\n");
-        host.diagnostics.debugLog("    dt chrome!base::internal::SlotSpanMetadata\n");
-        host.diagnostics.debugLog("    dt chrome!base::PartitionRoot\n\n");
+        Logger.info("  PartitionAlloc Structures:");
+        Logger.info("  " + "-".repeat(50));
+        Logger.info("    dt chrome!base::PartitionRoot");
+        Logger.info("    dt chrome!base::internal::SlotSpanMetadata");
+        Logger.empty();
 
-        host.diagnostics.debugLog("  Useful Commands:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
-        host.diagnostics.debugLog("    !heap -s                           - NT heap summary\n");
-        host.diagnostics.debugLog("    !heap -a <addr>                    - Analyze heap address\n");
-        host.diagnostics.debugLog("    dps <addr> L10                     - Dump pointers at address\n");
-        host.diagnostics.debugLog("    !address <addr>                    - Memory region info\n\n");
+        Logger.info("  Useful Commands:");
+        Logger.info("  " + "-".repeat(50));
+        Logger.info("    !heap -s                           - NT heap summary");
+        Logger.info("    !heap -a <addr>                    - Analyze heap address");
+        Logger.info("    dps <addr> L10                     - Dump pointers at address");
+        Logger.info("    !address <addr>                    - Memory region info");
+        Logger.empty();
 
-        host.diagnostics.debugLog("  PartitionAlloc Breakpoints:\n");
-        host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
+        Logger.info("  PartitionAlloc Breakpoints:");
+        Logger.info("  " + "-".repeat(50));
 
         var paTargets = [
             "base::PartitionRoot::Alloc",
@@ -2507,16 +2370,18 @@ function heap_info() {
 
         for (var i = 0; i < paTargets.length; i++) {
             var sym = "chrome!" + paTargets[i];
-            host.diagnostics.debugLog("    bp " + sym + "\n");
+            Logger.info("    bp " + sym);
         }
 
-        host.diagnostics.debugLog("\n  V8 Heap (renderer only):\n");
-        host.diagnostics.debugLog("  " + "-".repeat(50) + "\n");
-        host.diagnostics.debugLog("    dt chrome!v8::internal::Heap\n");
-        host.diagnostics.debugLog("    bp chrome!v8::internal::Heap::CollectGarbage\n\n");
+        Logger.empty();
+        Logger.info("  V8 Heap (renderer only):");
+        Logger.info("  " + "-".repeat(50));
+        Logger.info("    dt chrome!v8::internal::Heap");
+        Logger.info("    bp chrome!v8::internal::Heap::CollectGarbage");
+        Logger.empty();
 
     } catch (e) {
-        host.diagnostics.debugLog("  Error: " + e.message + "\n");
+        Logger.error("Error: " + e.message);
     }
 
     return "";
@@ -2527,69 +2392,34 @@ function heap_info() {
 /// =============================================================================
 
 function blink_help() {
-    host.diagnostics.debugLog(`
-=== Blink DOM Security Hooks ===
-
-  !bp_element   - Break on DOM element creation
-  !bp_nav       - Break on navigation/location changes  
-  !bp_pm        - Break on postMessage (cross-origin comms)
-  !bp_fetch     - Break on fetch/XHR requests
-
-  Target symbols (chrome.dll):
-    blink::Document::CreateRawElement
-    blink::LocalDOMWindow::postMessage
-    blink::FetchManager::Fetch
-    
-`);
+    Logger.section("Blink DOM Security Hooks");
+    Logger.info("  !bp_element   - Break on DOM element creation");
+    Logger.info("  !bp_nav       - Break on navigation/location changes");
+    Logger.info("  !bp_pm        - Break on postMessage (cross-origin comms)");
+    Logger.info("  !bp_fetch     - Break on fetch/XHR requests");
+    Logger.empty();
+    Logger.info("  Target symbols (chrome.dll):");
+    Logger.info("    blink::Document::CreateRawElement");
+    Logger.info("    blink::LocalDOMWindow::postMessage");
+    Logger.info("    blink::FetchManager::Fetch");
+    Logger.empty();
     return "";
 }
 
 function bp_element() {
-    return set_breakpoints(
-        "DOM Element Creation Breakpoints",
-        [
-            "chrome!blink::Document::CreateRawElement",
-            "chrome!blink::Document::createElement",
-            "chrome!blink::HTMLElement::insertAdjacentHTML"
-        ],
-        "DOM clobbering, XSS sink analysis"
-    );
+    return _bpFromConfig("element");
 }
 
 function bp_nav() {
-    return set_breakpoints(
-        "Navigation Breakpoints",
-        [
-            "chrome!blink::LocalDOMWindow::setLocation",
-            "chrome!blink::Location::assign",
-            "chrome!blink::Location::replace",
-            "chrome!blink::FrameLoader::StartNavigation"
-        ],
-        "Navigation hijacking, URL spoofing"
-    );
+    return _bpFromConfig("nav");
 }
 
 function bp_pm() {
-    return set_breakpoints(
-        "postMessage Breakpoints",
-        [
-            "chrome!blink::LocalDOMWindow::postMessage",
-            "chrome!blink::MessageEvent::Create"
-        ],
-        "Cross-origin message interception"
-    );
+    return _bpFromConfig("pm");
 }
 
 function bp_fetch() {
-    return set_breakpoints(
-        "Fetch/XHR Breakpoints",
-        [
-            "chrome!blink::FetchManager::Fetch",
-            "chrome!blink::XMLHttpRequest::send",
-            "chrome!blink::XMLHttpRequest::open"
-        ],
-        "Request interception, CORS bypass"
-    );
+    return _bpFromConfig("fetch");
 }
 
 /// =============================================================================
@@ -2597,68 +2427,33 @@ function bp_fetch() {
 /// =============================================================================
 
 function v8_help() {
-    host.diagnostics.debugLog(`
-=== V8 Exploitation Hooks ===
-
-  !bp_compile   - Break on script compilation
-  !bp_gc        - Break on garbage collection
-  !bp_wasm      - Break on WebAssembly compilation  
-  !bp_jit       - Break on JIT code generation
-
-  Target module: chrome.dll (v8 is statically linked)
-  
-  Tips:
-  - V8 symbols are large, use: .symopt+0x10 for deferred loading
-  - For heap inspection: dt chrome!v8::internal::Heap
-  
-`);
+    Logger.section("V8 Exploitation Hooks");
+    Logger.info("  !bp_compile   - Break on script compilation");
+    Logger.info("  !bp_gc        - Break on garbage collection");
+    Logger.info("  !bp_wasm      - Break on WebAssembly compilation");
+    Logger.info("  !bp_jit       - Break on JIT code generation");
+    Logger.empty();
+    Logger.info("  Target module: chrome.dll (v8 is statically linked)");
+    Logger.empty();
+    Logger.info("  Tips:");
+    Logger.info("  - V8 symbols are large, use: .symopt+0x10 for deferred loading");
+    Logger.info("  - For heap inspection: dt chrome!v8::internal::Heap");
+    Logger.empty();
     return "";
 }
 
 function bp_compile() {
-    return set_breakpoints(
-        "V8 Script Compilation Breakpoints",
-        [
-            "chrome!v8::Script::Compile",
-            "chrome!v8::ScriptCompiler::Compile",
-            "chrome!v8::internal::Compiler::Compile"
-        ],
-        "Analyzing JIT compilation, CSP bypass"
-    );
+    return _bpFromConfig("compile");
 }
 
 function bp_gc() {
-    return set_breakpoints(
-        "V8 Garbage Collection Breakpoints",
-        [
-            "chrome!v8::internal::Heap::CollectGarbage",
-            "chrome!v8::internal::Heap::PerformGarbageCollection",
-            "chrome!v8::internal::MarkCompactCollector::CollectGarbage"
-        ],
-        "UAF exploitation, heap grooming"
-    );
+    return _bpFromConfig("gc");
 }
 
 function bp_wasm() {
-    return set_breakpoints(
-        "WebAssembly Breakpoints",
-        [
-            "chrome!v8::internal::wasm::CompileLazy",
-            "chrome!v8::internal::wasm::WasmEngine::SyncCompile",
-            "chrome!v8::internal::wasm::WasmCodeManager::Commit"
-        ],
-        "WASM JIT bugs, RWX page analysis"
-    );
+    return _bpFromConfig("wasm");
 }
 
 function bp_jit() {
-    return set_breakpoints(
-        "V8 JIT Code Generation Breakpoints",
-        [
-            "chrome!v8::internal::compiler::PipelineImpl::GenerateCode",
-            "chrome!v8::internal::Builtins::Generate_*",
-            "chrome!v8::internal::MacroAssembler::Call"
-        ],
-        "JIT spray, code injection analysis"
-    );
+    return _bpFromConfig("jit");
 }

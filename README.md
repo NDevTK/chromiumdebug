@@ -39,6 +39,34 @@ Then in WinDbg: `!chelp`
 | `!bp_ipc` | Break on IPC message dispatch |
 | `!trace_ipc` | Enable IPC message logging |
 
+### Site Isolation Analysis
+| Command | Description |
+|---------|-------------|
+| `!site_iso` | Check Site Isolation status (flags & runtime checks) |
+
+### Blink DOM Hooks
+| Command | Description |
+|---------|-------------|
+| `!bp_element` | Break on DOM element creation |
+| `!bp_nav` | Break on navigation/location changes |
+| `!bp_pm` | Break on postMessage (cross-origin comms) |
+| `!bp_fetch` | Break on fetch/XHR requests |
+
+### V8 Exploitation Hooks
+| Command | Description |
+|---------|-------------|
+| `!bp_compile` | Break on script compilation |
+| `!bp_gc` | Break on garbage collection |
+| `!bp_wasm` | Break on WebAssembly compilation |
+| `!bp_jit` | Break on JIT code generation |
+
+### V8 Pointer Compression
+| Command | Description |
+|---------|-------------|
+| `!v8_cage` | Show V8 cage base address |
+| `!decompress(ptr)` | Decompress a 32-bit V8 compressed pointer |
+| `!decompress_gc(ptr)` | Decompress Oilpan/cppgc pointer |
+
 ### Vulnerability Hunting
 | Command | Description |
 |---------|-------------|
