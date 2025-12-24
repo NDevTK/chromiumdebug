@@ -11,7 +11,7 @@
 var g_rendererAttachCommands = [];
 
 /// Constants
-const MAX_PATCHES = 10;
+const MAX_PATCHES = 50;
 const MAX_CALLER_DISPLAY = 3;
 const BROWSER_CMDLINE_MIN_LENGTH = 500;
 const USER_MODE_ADDR_LIMIT = "0x7fffffffffff";
@@ -205,29 +205,182 @@ class MemoryUtils {
 
     static decompressCppgcPtr(compressedPtr, contextAddr) {
         const kPointerCompressionShift = 3n;
-        const kPointerCompressionMask = 0x3FFFFFFFFn;
-        let base;
-
-        if (contextAddr) {
-            var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
-            const invMask = BigInt("0xFFFFFFFC00000000");
-            const cageBaseAddr = context & invMask;
-            base = cageBaseAddr | kPointerCompressionMask;
-        } else {
-            var cageBase = this.getCppgcCageBase();
-            if (!cageBase) return null;
-            base = BigInt("0x" + cageBase);
-        }
+        const kCageBaseMask = BigInt("0xFFFFFFFC00000000"); // 16GB alignment?
 
         var compressed = this.parseBigInt(compressedPtr);
-        var signExtended = (compressed >= BigInt("0x80000000")) ?
-            (BigInt("0xFFFFFFFF00000000") | compressed) : compressed;
+        if (compressed === 0n) return null;
 
-        var shifted = signExtended << kPointerCompressionShift;
-        shifted = shifted & BigInt("0xFFFFFFFFFFFFFFFF");
-        var fullPtr = shifted & base;
+        // Sign-extend if necessary (assuming 32-bit signed compressed value mostly positive)
+        // If compressed is treated as unsigned 32-bit:
+        if (compressed < 0n) compressed = compressed & 0xFFFFFFFFn;
 
-        return fullPtr.toString(16);
+        // Shift
+        var offset = compressed << kPointerCompressionShift;
+
+        // Combine with Cage Base
+        if (contextAddr) {
+            var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
+            var base = context & kCageBaseMask;
+            var fullPtr = base | offset;
+            return fullPtr.toString(16);
+        } else {
+            // Fallback to global cage base if available
+            var cage = this.getCppgcCageBase();
+            if (cage) {
+                var base = BigInt("0x" + cage);
+                return (base | offset).toString(16);
+            }
+        }
+
+        return null;
+    }
+
+    /// Write bytes to memory
+    static writeMemory(addr, bytes) {
+        var ctl = SymbolUtils.getControl();
+        var hexBytes = bytes.map(b => b.toString(16).padStart(2, '0')).join(" ");
+        var cmd = "eb 0x" + addr + " " + hexBytes;
+        ctl.ExecuteCommand(cmd);
+    }
+
+    /// Write string to memory (overwriting existing buffer)
+    static writeStringImpl(implAddr, newString) {
+        var ctl = SymbolUtils.getControl();
+        var hexAddr = implAddr.toString().startsWith("0x") ? implAddr : "0x" + implAddr;
+
+        var is8Bit = false;
+        var currentLen = 0;
+        var headerParsed = false;
+
+        // Try raw memory read first (more reliable than dx symbols sometimes)
+        // Layout assumption (x64):
+        // +0: RefCount (4b)
+        // +4: Length (4b)
+        // +8: Hash/Flags (4b)
+        try {
+            var cmd = "dd " + hexAddr + " L4";
+            var out = ctl.ExecuteCommand(cmd);
+            for (var line of out) {
+                // Logger.info("  [Debug] Raw Header: " + line); // Dump for analysis
+                var parts = line.toString().trim().split(/\s+/);
+                if (parts.length >= 4) {
+                    // parts[0] is addr
+                    // parts[1] (Offset 0), parts[2] (Offset 4), parts[3] (Offset 8)
+
+                    var val1 = parseInt(parts[1], 16);
+                    var val2 = parseInt(parts[2], 16);
+
+                    // Heuristic: Length usually logical (e.g. < 1000). RefCount can be large/small.
+                    // If dx failed, we rely on these.
+
+                    // Assume +4 is length for now, but check if correct
+                    var lenStr = parts[2];
+                    if (lenStr) {
+                        currentLen = parseInt(lenStr, 16);
+                        headerParsed = true;
+                    }
+                }
+                break;
+            }
+        } catch (e) { }
+
+        // Fallback to dx if raw read failed or yielded 0 (and we suspect it's wrong)
+        if (!headerParsed || currentLen === 0) {
+            // ... existing dx logic ...
+            // (Omitting here to keep it clean, but if raw failed, dx likely will too)
+        }
+
+        // Try dx for 8bit if raw didn't confirm
+        try {
+            var cmd = "dx ((WTF::StringImpl*)" + hexAddr + ")->is8Bit()";
+            var out = ctl.ExecuteCommand(cmd);
+            for (var line of out) {
+                if (line.toString().includes("true")) is8Bit = true;
+            }
+        } catch (e) { }
+
+        // Logger.info("  [Debug] StringImpl (Raw): Addr=" + hexAddr + " Len=" + currentLen + " 8Bit=" + is8Bit);
+
+        if (currentLen === 0) {
+            Logger.warn("  [Warning] Length detected as 0. This might be empty string OR read failure.");
+            // If we write to 0 length, we corrupt memory if it's not actually 0.
+            // If target string is empty, we shouldn't be here (attr loop check).
+            // But let's allow writing if user forces? No, unsafe.
+            if (newString.length > 0) {
+                Logger.error("Cannot overwrite: Existing string length appears to be 0 or unreadable.");
+                return;
+            }
+        }
+
+        if (newString.length > currentLen) {
+            Logger.warn("New string length (" + newString.length + ") > current capacity (" + currentLen + "). Truncating.");
+            newString = newString.substring(0, currentLen);
+        }
+
+        // Data Address
+        // If 64-bit, header is usually 12 bytes or 16 bytes aligned.
+        // Data likely at +12 or +16.
+        // dx &characters... is best.
+        var dataAddr = null;
+
+        // Try dx
+        try {
+            var charType = is8Bit ? "characters8" : "characters16";
+            var cmd = "dx &((WTF::StringImpl*)" + hexAddr + ")->" + charType + "()[0]";
+            var out = ctl.ExecuteCommand(cmd);
+            for (var line of out) {
+                var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
+                if (m) dataAddr = m[1];
+            }
+        } catch (e) { }
+
+        // Fallback: Assume offset 12 (packed) or 16 (aligned)
+        if (!dataAddr) {
+            // StringImpl is explicitly aligned?
+            // Usually sizeof(StringImpl) = 12 on 32-bit (?), 16 on 64-bit (due to alignment padding after offset 12?)
+            // Let's assume +12 if header is 3x4 bytes.
+            // But on x64, 16 is safer guess?
+            var baseInt = BigInt(hexAddr);
+            // Verify if data is at +16
+            // We can check if existing chars match?
+            // Too complex.
+            // Let's default to +16 for x64.
+            var offset = 16n; // 12 + 4 padding
+            // Wait, flags is at +8. +12 might be data?
+            // If is8Bit, it might be +12.
+            // If 16Bit, it must be aligned?
+            // Layout Analysis:
+            // +0: RefCount
+            // +4: Length
+            // +8: Hash/Flags
+            // +12: Data Start (packed)
+            dataAddr = (baseInt + 12n).toString(16);
+            Logger.warn("  [Warning] guessing data address at offset +0xC.");
+        }
+
+        // Write
+        if (is8Bit) {
+            var bytes = [];
+            for (var i = 0; i < newString.length; i++) bytes.push(newString.charCodeAt(i));
+            this.writeMemory(dataAddr, bytes);
+        } else {
+            // 16-bit write
+            var bytes = [];
+            for (var i = 0; i < newString.length; i++) {
+                var c = newString.charCodeAt(i);
+                bytes.push(c & 0xFF);
+                bytes.push((c >> 8) & 0xFF);
+            }
+            this.writeMemory(dataAddr, bytes);
+        }
+
+        // Update length
+        // ed expects hex by default (usually), or we explicitly use 0x prefix.
+        // If length is 13, toString(16) is "d".
+        var lenCmd = "ed " + hexAddr + "+4 0x" + newString.length.toString(16);
+        ctl.ExecuteCommand(lenCmd);
+
+        Logger.info("Overwrote string in memory at 0x" + dataAddr + ".");
     }
 }
 
@@ -422,6 +575,689 @@ function readUrlStringFromDx(addr, typeCast) {
         }
     } catch (e) { }
     return null;
+}
+
+/// =============================================================================
+/// BLINK DOM UNWRAPPING UTILITIES
+/// =============================================================================
+
+/// BlinkUnwrap: Utility class for traversing Blink DOM objects using pointer decompression
+class BlinkUnwrap {
+    /// Get LocalFrame from WebLocalFrameImpl
+    /// Path: WebLocalFrameImpl -> frame_ (compressed) -> LocalFrame
+    static getLocalFrame(webFrameAddr) {
+        var webFrameHex = webFrameAddr.toString().startsWith("0x") ? webFrameAddr : "0x" + webFrameAddr;
+        var frameCompressed = getCompressedMember(webFrameHex, "(blink::WebLocalFrameImpl*)", "frame_");
+        if (frameCompressed === null) return null;
+        return MemoryUtils.decompressCppgcPtr(frameCompressed, webFrameAddr);
+    }
+
+    /// Get LocalDOMWindow from LocalFrame
+    /// Path: LocalFrame -> dom_window_ (compressed) -> LocalDOMWindow
+    static getDomWindow(localFrameAddr) {
+        var frameHex = localFrameAddr.toString().startsWith("0x") ? localFrameAddr : "0x" + localFrameAddr;
+        var windowCompressed = getCompressedMember(frameHex, "(blink::LocalFrame*)", "dom_window_");
+        if (windowCompressed === null) return null;
+        return MemoryUtils.decompressCppgcPtr(windowCompressed, localFrameAddr);
+    }
+
+    /// Get Document from LocalDOMWindow
+    /// Path: LocalDOMWindow -> document_ (compressed) -> Document
+    static getDocument(domWindowAddr) {
+        var windowHex = domWindowAddr.toString().startsWith("0x") ? domWindowAddr : "0x" + domWindowAddr;
+        var docCompressed = getCompressedMember(windowHex, "(blink::LocalDOMWindow*)", "document_");
+        if (docCompressed === null) return null;
+        return MemoryUtils.decompressCppgcPtr(docCompressed, domWindowAddr);
+    }
+
+    /// Get Document directly from LocalFrame (convenience method)
+    static getDocumentFromFrame(localFrameAddr) {
+        var domWindow = this.getDomWindow(localFrameAddr);
+        if (!domWindow || domWindow === "0") return null;
+        return this.getDocument(domWindow);
+    }
+
+    /// Get SecurityOrigin URL from Document
+    static getSecurityOriginUrl(documentAddr) {
+        try {
+            var ctl = SymbolUtils.getControl();
+            var docHex = documentAddr.toString().startsWith("0x") ? documentAddr : "0x" + documentAddr;
+            var cmd = "dx -r3 ((blink::Document*)" + docHex + ")->GetExecutionContext()->GetSecurityOrigin()->ToUrlOrigin().GetDebugString()";
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                var lineStr = line.toString();
+                var urlMatch = lineStr.match(/"([^"]+)"/);
+                if (urlMatch) return urlMatch[1];
+            }
+            return readUrlStringFromDx(documentAddr.replace(/^0x/, ""), "(blink::Document*)");
+        } catch (e) { }
+        return null;
+    }
+
+    /// Get Document URL
+    static getDocumentUrl(documentAddr) {
+        var docHex = documentAddr.toString().replace(/^0x/, "");
+        return readUrlStringFromDx(docHex, "(blink::Document*)");
+    }
+
+    /// Get first child of a node (ContainerNode::first_child_)
+    static getFirstChild(nodeAddr) {
+        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var childCompressed = getCompressedMember(nodeHex, "(blink::ContainerNode*)", "first_child_");
+        if (childCompressed === null) return null;
+        return MemoryUtils.decompressCppgcPtr(childCompressed, nodeAddr);
+    }
+
+    /// Get next sibling of a node (Node::next_)
+    static getNextSibling(nodeAddr) {
+        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var siblingCompressed = getCompressedMember(nodeHex, "(blink::Node*)", "next_");
+        if (siblingCompressed === null) return null;
+        return MemoryUtils.decompressCppgcPtr(siblingCompressed, nodeAddr);
+    }
+
+    /// Helper: Parse string from dx output
+    static _parseStringFromDxOutput(output) {
+        for (var line of output) {
+            var s = line.toString();
+            // Check for [AsciiText] : "value" or [Text] : "value"
+            var match = s.match(/\[(Ascii)?Text\]\s*:\s*"([^"]+)"/);
+            if (match) return match[2];
+            // Check for "value" (simple quote)
+            var match2 = s.match(/^"([^"]+)"$/);
+            if (match2) return match2[1];
+            // Fallback: look for any quoted string with Text label
+            if (s.indexOf("Text") !== -1) {
+                var m = s.match(/"([^"]+)"/);
+                if (m) return m[1];
+            }
+        }
+        return null;
+    }
+
+    /// Get node name (tag name)
+    static getNodeName(nodeAddr) {
+        var ctl = SymbolUtils.getControl();
+        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+
+        try {
+            // Read node_flags_ to check type (avoid virtual calls)
+            var cmd = "dx -r0 ((blink::Node*)" + nodeHex + ")->node_flags_";
+            var output = ctl.ExecuteCommand(cmd);
+            var flags = null;
+            for (var line of output) {
+                var s = line.toString();
+                // Match decimal or hex from "node_flags_ : value"
+                var m = s.match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                if (m) {
+                    var valStr = m[1];
+                    flags = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                    break;
+                }
+            }
+
+            if (flags !== null) {
+                var type = flags & 0xF;
+                // kElementNode = 1
+                if (type === 1) {
+                    var cmdE = "dx -r2 ((blink::Element*)" + nodeHex + ")->tag_name_.impl_->local_name_";
+                    var res = BlinkUnwrap._parseStringFromDxOutput(ctl.ExecuteCommand(cmdE));
+                    if (res) return res;
+                    return "ELEMENT (Name unreadable)";
+                }
+                if (type === 3) return "#text";
+                if (type === 8) return "#comment";
+                if (type === 9) return "#document";
+                if (type === 10) return "#doctype";
+                if (type === 11) return "#document-fragment";
+            }
+        } catch (e) { }
+
+        // Fallback: Try virtual function if flags check failed
+        try {
+            var cmd = "dx -r2 ((blink::Node*)" + nodeHex + ")->nodeName()";
+            var res = BlinkUnwrap._parseStringFromDxOutput(ctl.ExecuteCommand(cmd));
+            if (res) return res;
+        } catch (e) { }
+
+        return null;
+    }
+    /// Helper: Traverse attributes of an element
+    /// callback(name, baseExpression) -> return true to stop
+    static _traverseAttributes(elementAddr, callback) {
+        var elemHex;
+        try {
+            var s = elementAddr.toString();
+            if (s.startsWith("0x")) elemHex = s;
+            else if (/^\d+$/.test(s)) elemHex = "0x" + BigInt(s).toString(16);
+            else elemHex = "0x" + s;
+        } catch (e) { elemHex = "0x" + elementAddr; }
+
+        var dataCompressed = getCompressedMember(elemHex, "(blink::Element*)", "element_data_");
+        if (!dataCompressed || dataCompressed == 0n) return;
+
+        var dataAddr = MemoryUtils.decompressCppgcPtr(dataCompressed, elemHex);
+        if (!dataAddr || dataAddr === "0") return;
+
+        var ctl = SymbolUtils.getControl();
+
+        // Bitfield
+        var bitField = 0;
+        try {
+            var cmd = "dx -r0 ((blink::ElementData*)0x" + dataAddr + ")->bit_field_.bits_";
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                if (m) {
+                    var valStr = m[1];
+                    bitField = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                    break;
+                }
+            }
+        } catch (e) { }
+
+        var isUnique = bitField & 1;
+        var arraySize = (bitField >> 1) & 0xFFFFFFF;
+        var count = isUnique ? 0 : arraySize;
+
+        if (isUnique) {
+            try {
+                var sizeCmd = "dx -r0 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_.size_";
+                var sizeOut = ctl.ExecuteCommand(sizeCmd);
+                for (var line of sizeOut) {
+                    var m = line.toString().match(/:\s*(\d+)/);
+                    if (m) { count = parseInt(m[1]); break; }
+                }
+            } catch (e) { }
+        }
+
+        for (var i = 0; i < count; i++) {
+            try {
+                var base = isUnique
+                    ? "((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_[" + i + "]"
+                    : "((blink::ShareableElementData*)0x" + dataAddr + ")->attribute_array_[" + i + "]";
+
+                var nameStr = "";
+                var nCmd = "dx -r2 " + base + ".name_.impl_->local_name_";
+                var nOut = ctl.ExecuteCommand(nCmd);
+                nameStr = BlinkUnwrap._parseStringFromDxOutput(nOut);
+
+                if (!nameStr) {
+                    var fallbackCmd = "dx -r1 " + base + ".name_";
+                    var fallbackOut = ctl.ExecuteCommand(fallbackCmd);
+                    for (var line of fallbackOut) {
+                        var m = line.toString().match(/:\s*\.\s+([^\s\[]+)/);
+                        if (m) { nameStr = m[1]; break; }
+                    }
+                }
+
+                if (nameStr) {
+                    if (callback(nameStr, base) === true) return;
+                }
+            } catch (e) { }
+        }
+    }
+
+    /// Get all attributes of an element as an array of objects
+    static getAttributes(elementAddr) {
+        var attrs = [];
+        var ctl = SymbolUtils.getControl();
+
+        BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
+            var valStr = "";
+            var vOut = ctl.ExecuteCommand("dx -r2 " + base + ".value_");
+            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
+            if (!valStr) {
+                for (var line of vOut) {
+                    var m = line.toString().match(/\"([^\"]*)\"/);
+                    if (m) { valStr = m[1]; break; }
+                    m = line.toString().match(/:\s*\.\s+(.+?)\s*\[Type/);
+                    if (m) { valStr = m[1]; break; }
+                }
+            }
+            attrs.push({ name: name, value: valStr || "" });
+        });
+        return attrs;
+    }
+
+    /// Get specific attribute value
+    static getAttribute(elementAddr, attrName) {
+        var val = null;
+        var ctl = SymbolUtils.getControl();
+        BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
+            if (name === attrName) {
+                var vOut = ctl.ExecuteCommand("dx -r2 " + base + ".value_");
+                val = BlinkUnwrap._parseStringFromDxOutput(vOut);
+                if (!val) {
+                    for (var line of vOut) {
+                        var m = line.toString().match(/\"([^\"]*)\"/);
+                        if (m) { val = m[1]; break; }
+                    }
+                }
+                return true; // Stop
+            }
+        });
+        return val;
+    }
+
+    /// Find StringImpl address for attribute modification
+    static findAttributeStringImplAddress(elementAddr, attrName) {
+        var result = null;
+        var ctl = SymbolUtils.getControl();
+
+        BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
+            if (name === attrName) {
+                var ptrCmd = "dx -r0 " + base + ".value_.string_.impl_.ptr_";
+                var out = ctl.ExecuteCommand(ptrCmd);
+                for (var line of out) {
+                    var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
+                    if (m) {
+                        result = m[1];
+                        return true;
+                    }
+                }
+            }
+        });
+        return result;
+    }
+}
+
+/// Helper: Get frame by index from frame map
+function _getFrameByIndex(idx) {
+    var ctl = SymbolUtils.getControl();
+    var lazyInstanceAddr = _findFrameMapAddress(ctl);
+    if (!lazyInstanceAddr) return null;
+    var mapAddr = _readFrameMapPointer(lazyInstanceAddr);
+    if (!mapAddr) return null;
+    var frames = _parseFrameMapEntries(ctl, mapAddr);
+    if (idx < 0 || idx >= frames.length) return null;
+    return frames[idx];
+}
+
+/// Set an attribute value on an element (Direct Memory Modification)
+function frame_setattr(elementAddr, attrName, attrValue) {
+    if (isEmpty(elementAddr) || isEmpty(attrName)) {
+        Logger.showUsage("Set Element Attribute", "!frame_setattr <element_addr> <attr_name> <attr_value>", [
+            "!frame_setattr 0x12345678 \"id\" \"newId\"",
+            "!frame_setattr 0x12345678 \"src\" \"https://example.com\""
+        ]);
+        Logger.info("Get element address from !frame_elem command first.");
+        Logger.empty();
+        return "";
+    }
+
+    var elemHex = elementAddr.toString().startsWith("0x") ? elementAddr : "0x" + elementAddr;
+    var attr = attrName.replace(/"/g, "");
+    var value = attrValue ? attrValue.replace(/"/g, "") : "";
+
+    Logger.section("Set Attribute (Direct Memory): " + attr);
+    Logger.info("Element: " + elemHex);
+    Logger.info("Target Value: \"" + value + "\"");
+    Logger.empty();
+
+    var implAddr = BlinkUnwrap.findAttributeStringImplAddress(elemHex, attr);
+    if (!implAddr || implAddr === "0") {
+        Logger.error("Attribute '" + attr + "' not found on element.");
+        Logger.info("This command modifies EXISTING attributes in memory.");
+        Logger.info("To add a new attribute, the browser must allocate memory first.");
+        return "";
+    }
+
+    Logger.info("Found StringImpl at: " + implAddr);
+
+    // Check if new string fits (hacky safety check done in writeStringImpl)
+    // If it's too long, it will be truncated.
+    MemoryUtils.writeStringImpl(implAddr, value);
+
+    Logger.info("Attribute value overwritten directly in memory.");
+    Logger.info("Verify with !frame_getattr " + elemHex + " \"" + attr + "\"");
+
+    Logger.empty();
+    return "";
+}
+
+/// =============================================================================
+/// PER-FRAME DEVTOOLS COMMANDS
+/// =============================================================================
+
+/// Get Document object for frame at index
+function frame_document(idx) {
+    if (idx === undefined || idx === null || idx === "") {
+        Logger.showUsage("Frame Document", "!frame_doc <frame_index>", ["!frame_doc 0", "!frame_doc 1"]);
+        Logger.info("Use !frames to list all frames with indices.");
+        Logger.empty();
+        return "";
+    }
+
+    var frameIdx = parseInt(idx);
+    var frame = _getFrameByIndex(frameIdx);
+    if (!frame) {
+        Logger.error("Frame not found at index " + frameIdx + ". Use !frames to list frames.");
+        return "";
+    }
+
+    Logger.section("Frame Document - Index " + frameIdx);
+
+    var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
+    if (!localFrame || localFrame === "0") {
+        Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
+        return "";
+    }
+    Logger.info("LocalFrame:      0x" + localFrame);
+
+    var domWindow = BlinkUnwrap.getDomWindow(localFrame);
+    if (!domWindow || domWindow === "0") {
+        Logger.error("Could not get LocalDOMWindow from LocalFrame");
+        return "";
+    }
+    Logger.info("LocalDOMWindow:  0x" + domWindow);
+
+    var document = BlinkUnwrap.getDocument(domWindow);
+    if (!document || document === "0") {
+        Logger.error("Could not get Document from LocalDOMWindow");
+        return "";
+    }
+    Logger.info("Document:        0x" + document);
+
+    var url = BlinkUnwrap.getDocumentUrl(document);
+    if (url) Logger.info("URL:             " + url);
+
+    Logger.empty();
+    Logger.info("Inspect with:");
+    Logger.info("  dx ((blink::Document*)0x" + document + ")");
+    Logger.info("  dx ((blink::Document*)0x" + document + ")->documentElement()");
+    Logger.empty();
+    return "0x" + document;
+}
+
+/// Get LocalDOMWindow object for frame at index
+function frame_window(idx) {
+    if (idx === undefined || idx === null || idx === "") {
+        Logger.showUsage("Frame Window", "!frame_win <frame_index>", ["!frame_win 0", "!frame_win 1"]);
+        Logger.info("Use !frames to list all frames with indices.");
+        Logger.empty();
+        return "";
+    }
+
+    var frameIdx = parseInt(idx);
+    var frame = _getFrameByIndex(frameIdx);
+    if (!frame) {
+        Logger.error("Frame not found at index " + frameIdx + ". Use !frames to list frames.");
+        return "";
+    }
+
+    Logger.section("Frame Window - Index " + frameIdx);
+
+    var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
+    if (!localFrame || localFrame === "0") {
+        Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
+        return "";
+    }
+    Logger.info("LocalFrame:      0x" + localFrame);
+
+    var domWindow = BlinkUnwrap.getDomWindow(localFrame);
+    if (!domWindow || domWindow === "0") {
+        Logger.error("Could not get LocalDOMWindow from LocalFrame");
+        return "";
+    }
+    Logger.info("LocalDOMWindow:  0x" + domWindow);
+
+    Logger.empty();
+    Logger.info("Inspect with:");
+    Logger.info("  dx ((blink::LocalDOMWindow*)0x" + domWindow + ")");
+    Logger.info("  dx ((blink::LocalDOMWindow*)0x" + domWindow + ")->location()");
+    Logger.empty();
+    return "0x" + domWindow;
+}
+
+/// Get SecurityOrigin for frame at index
+function frame_origin(idx) {
+    if (idx === undefined || idx === null || idx === "") {
+        Logger.showUsage("Frame Origin", "!frame_origin <frame_index>", ["!frame_origin 0", "!frame_origin 1"]);
+        Logger.info("Use !frames to list all frames with indices.");
+        Logger.empty();
+        return "";
+    }
+
+    var frameIdx = parseInt(idx);
+    var frame = _getFrameByIndex(frameIdx);
+    if (!frame) {
+        Logger.error("Frame not found at index " + frameIdx + ". Use !frames to list frames.");
+        return "";
+    }
+
+    Logger.section("Frame Origin - Index " + frameIdx);
+
+    var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
+    if (!localFrame || localFrame === "0") {
+        Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
+        return "";
+    }
+
+    var domWindow = BlinkUnwrap.getDomWindow(localFrame);
+    if (!domWindow || domWindow === "0") {
+        Logger.error("Could not get LocalDOMWindow from LocalFrame");
+        return "";
+    }
+
+    var document = BlinkUnwrap.getDocument(domWindow);
+    if (!document || document === "0") {
+        Logger.error("Could not get Document from LocalDOMWindow");
+        return "";
+    }
+
+    var originUrl = BlinkUnwrap.getSecurityOriginUrl(document);
+    var docUrl = BlinkUnwrap.getDocumentUrl(document);
+
+    Logger.info("Document:        0x" + document);
+    if (docUrl) Logger.info("Document URL:    " + docUrl);
+    if (originUrl) Logger.info("Security Origin: " + originUrl);
+    else Logger.info("Security Origin: (use dx to inspect)");
+
+    Logger.empty();
+    Logger.info("Inspect with:");
+    Logger.info("  dx ((blink::Document*)0x" + document + ")->GetExecutionContext()->GetSecurityOrigin()");
+    Logger.empty();
+    return originUrl || "";
+}
+
+/// List elements by tag name in a frame
+function frame_elements(idx, tagName) {
+    if (idx === undefined || idx === null || idx === "") {
+        Logger.showUsage("Frame Elements", "!frame_elem <frame_index> [tag_name]", ["!frame_elem 0", "!frame_elem 0 \"div\"", "!frame_elem 1 \"iframe\""]);
+        Logger.info("Use !frames to list all frames with indices.");
+        Logger.empty();
+        return "";
+    }
+
+    var frameIdx = parseInt(idx);
+    var frame = _getFrameByIndex(frameIdx);
+    if (!frame) {
+        Logger.error("Frame not found at index " + frameIdx + ". Use !frames to list frames.");
+        return "";
+    }
+
+    var filterTag = tagName ? tagName.toLowerCase().replace(/"/g, "") : null;
+    Logger.section("Frame Elements - Index " + frameIdx + (filterTag ? " (tag: " + filterTag + ")" : ""));
+
+    var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
+    if (!localFrame || localFrame === "0") {
+        Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
+        return "";
+    }
+
+    var document = BlinkUnwrap.getDocumentFromFrame(localFrame);
+    if (!document || document === "0") {
+        Logger.error("Could not get Document from LocalFrame");
+        return "";
+    }
+
+    Logger.info("Document: 0x" + document);
+    Logger.empty();
+
+    try {
+        if (filterTag) {
+            Logger.info("Searching for <" + filterTag + "> elements (DOM Walk)...");
+            Logger.empty();
+
+            var startNode = BlinkUnwrap.getFirstChild(document);
+            if (!startNode || startNode === "0") {
+                Logger.info("  Document is empty (no children).");
+                return "";
+            }
+
+            var stack = [startNode];
+            var visited = 0;
+            var found = 0;
+            var MAX_NODES = 5000;
+
+            while (stack.length > 0) {
+                if (visited > MAX_NODES) {
+                    Logger.warn("  Traversal limit reached (" + MAX_NODES + " nodes).");
+                    break;
+                }
+
+                var node = stack.pop();
+                visited++;
+
+                // Process Node
+                var nodeName = BlinkUnwrap.getNodeName(node);
+
+
+
+                // Compare case-insensitive
+                if (nodeName && nodeName.toLowerCase() === filterTag) {
+                    // Extract ID/Class if possible for context? 
+                    // For now just address and tag
+                    Logger.info("  [" + found + "] 0x" + node + " <" + nodeName + ">");
+                    found++;
+                }
+
+                // TRAVERSAL: Push Sibling then Child (DFS order: Process child first)
+                var sibling = BlinkUnwrap.getNextSibling(node);
+                if (sibling && sibling !== "0") {
+                    stack.push(sibling);
+                }
+
+                var child = BlinkUnwrap.getFirstChild(node);
+                if (child && child !== "0") {
+                    stack.push(child);
+                }
+            }
+
+            if (found === 0) Logger.info("  No <" + filterTag + "> elements found.");
+            else Logger.info("  Found " + found + " element(s).");
+
+        } else {
+            Logger.info("Document structure:");
+            Logger.info("  dx ((blink::Document*)0x" + document + ")->documentElement()");
+            Logger.info("  dx ((blink::Document*)0x" + document + ")->body()");
+            Logger.info("  dx ((blink::Document*)0x" + document + ")->head()");
+            Logger.empty();
+            Logger.info("Query elements by tag:");
+            Logger.info("  !frame_elem " + frameIdx + " \"div\"");
+            Logger.info("  !frame_elem " + frameIdx + " \"iframe\"");
+            Logger.info("  !frame_elem " + frameIdx + " \"script\"");
+        }
+    } catch (e) {
+        Logger.error("Error querying elements: " + e.message);
+    }
+
+    Logger.empty();
+    return "";
+}
+
+/// Get an attribute value from an element
+/// Get an attribute value from an element
+function frame_getattr(elementAddr, attrName) {
+    if (isEmpty(elementAddr) || isEmpty(attrName)) {
+        Logger.showUsage("Get Element Attribute", "!frame_getattr <element_addr> <attr_name>", [
+            "!frame_getattr 0x12345678 \"id\"",
+            "!frame_getattr 0x12345678 \"src\""
+        ]);
+        Logger.info("Get element address from !frame_elem command first.");
+        Logger.empty();
+        return "";
+    }
+
+    var elemHex = elementAddr.toString().startsWith("0x") ? elementAddr : "0x" + elementAddr;
+    var attr = attrName.replace(/"/g, "");
+
+    Logger.section("Get Attribute: " + attr);
+    Logger.info("Element: " + elemHex);
+    Logger.empty();
+
+    var val = BlinkUnwrap.getAttribute(elemHex, attr);
+    if (val !== null) {
+        Logger.info("Value: \"" + val + "\"");
+        return val;
+    }
+
+    Logger.info("Attribute not found or empty.");
+    Logger.empty();
+    return "";
+}
+
+
+
+
+
+/// List all attributes of an element
+function frame_attrs(elementAddr) {
+    if (isEmpty(elementAddr)) {
+        Logger.showUsage("Frame Attributes", "!frame_attrs <element_addr>", ["!frame_attrs 0x12345678"]);
+        return "";
+    }
+
+    var attrs = BlinkUnwrap.getAttributes(elementAddr);
+
+    Logger.section("Element Attributes: " + elementAddr);
+    if (attrs.length === 0) {
+        Logger.info("(No explicit attributes)");
+    } else {
+        for (var a of attrs) {
+            Logger.info("  " + a.name + "=\"" + a.value + "\"");
+        }
+    }
+
+    Logger.empty();
+    return "";
+}
+
+/// Inspect a Blink Node/Object (Debugging helper)
+function blink_unwrap(addrStr) {
+    if (isEmpty(addrStr)) {
+        Logger.showUsage("Blink Unwrap", "!blink_unwrap <address>", ["!blink_unwrap 0x12ac004e2340"]);
+        return "";
+    }
+
+    var addr = addrStr.toString().startsWith("0x") ? addrStr : "0x" + addrStr;
+    Logger.section("Blink Object Inspection: " + addr);
+
+    var ctl = SymbolUtils.getControl();
+    try {
+        Logger.info("[*] Checking nodeName():");
+        var cmd = "dx -r2 ((blink::Node*)" + addr + ")->nodeName()";
+        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
+
+        Logger.info("[*] Checking IsElementNode():");
+        cmd = "dx ((blink::Node*)" + addr + ")->IsElementNode()";
+        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
+
+        Logger.info("[*] Object Dump (blink::Node*):");
+        cmd = "dx -r1 ((blink::Node*)" + addr + ")";
+        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
+
+        Logger.info("[*] Checking nodeName via TagName (Element attempt):");
+        cmd = "dx -r2 ((blink::Element*)" + addr + ")->tag_name_.impl_->local_name_";
+        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
+
+    } catch (e) {
+        Logger.error("Error inspecting object: " + e.message);
+    }
+
+    Logger.empty();
+    return "";
 }
 
 class ProcessUtils {
@@ -642,10 +1478,19 @@ function initializeScript() {
         new host.functionAlias(bp_jit, "bp_jit"),
         // V8 Pointer Compression
         new host.functionAlias(v8_cage_info, "v8_cage"),
+        new host.functionAlias(blink_unwrap, "blink_unwrap"),
         new host.functionAlias(decompress, "decompress"),
         new host.functionAlias(decompress_gc, "decompress_gc"),
         // Site Isolation
-        new host.functionAlias(site_isolation_status, "site_iso")
+        new host.functionAlias(site_isolation_status, "site_iso"),
+        // Per-Frame DOM Inspection
+        new host.functionAlias(frame_document, "frame_doc"),
+        new host.functionAlias(frame_window, "frame_win"),
+        new host.functionAlias(frame_origin, "frame_origin"),
+        new host.functionAlias(frame_elements, "frame_elem"),
+        new host.functionAlias(frame_getattr, "frame_getattr"),
+        new host.functionAlias(frame_setattr, "frame_setattr"),
+        new host.functionAlias(frame_attrs, "frame_attrs")
     ];
 }
 
@@ -708,10 +1553,21 @@ function help() {
 
     Logger.info("BLINK DOM HOOKS:");
     Logger.info("  !blink_help           - Show full Blink DOM help");
+    Logger.info("  !blink_unwrap(addr)   - Inspect Blink Node/Object");
     Logger.info("  !bp_element           - Break on DOM element creation");
     Logger.info("  !bp_nav               - Break on navigation");
     Logger.info("  !bp_pm                - Break on postMessage");
     Logger.info("  !bp_fetch             - Break on Fetch/XHR");
+    Logger.empty();
+
+    Logger.info("PER-FRAME DOM INSPECTION:");
+    Logger.info("  !frame_doc(idx)       - Get Document for frame at index");
+    Logger.info("  !frame_win(idx)       - Get LocalDOMWindow for frame at index");
+    Logger.info("  !frame_origin(idx)    - Get SecurityOrigin for frame at index");
+    Logger.info("  !frame_elem(idx,tag)  - List elements by tag name in frame");
+    Logger.info("  !frame_getattr(el,a)  - Get attribute value from element");
+    Logger.info("  !frame_setattr(el,a,v)- Set attribute value on element");
+    Logger.info("  !frame_attrs(el)      - List all attributes of element");
     Logger.empty();
 
     Logger.info("V8 EXPLOITATION HOOKS:");
@@ -1460,8 +2316,8 @@ function spoof_origin(targetUrl) {
         return "";
     }
 
-    // Parse target URL to get host
-    var targetHost = CommandLineUtils.getHostFromUrl(targetUrl);
+    // Use raw input as target (stripping quotes) to allow any value
+    var targetHost = targetUrl.replace(/"/g, "");
 
     // Get current origin from !site
     Logger.info("  Target: " + targetHost);
