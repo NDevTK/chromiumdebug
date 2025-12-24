@@ -2301,43 +2301,51 @@ function patch_function(funcName, returnValue) {
 }
 
 /// Usage: !spoof_origin "https://target.com"
+/// Spoofs the current origin to a target origin
+/// Patches both host and full URL occurrences in memory
 function spoof_origin(targetUrl) {
     Logger.section("Spoof Origin");
 
     var ctl = SymbolUtils.getControl();
 
     if (isEmpty(targetUrl)) {
-        Logger.info("  Usage: !spoof(\"https://target.com\")");
+        Logger.info("  Usage: !spoof_origin(\"https://target.com\")");
         Logger.empty();
-        Logger.info("  Example: !spoof(\"https://google.com\")");
+        Logger.info("  Examples:");
+        Logger.info("    !spoof_origin(\"https://google.com\")");
+        Logger.info("    !spoof_origin(\"chrome://settings\")");
+        Logger.info("    !spoof_origin(\"file://localhost\")");
         Logger.empty();
-        Logger.info("  Auto-detects current origin and patches all occurrences.");
+        Logger.info("  Patches all occurrences of current origin in memory.");
         Logger.empty();
         return "";
     }
 
-    // Extract host from target URL (stripping quotes first)
-    var rawTarget = targetUrl.replace(/"/g, "");
-    var targetHost = CommandLineUtils.getHostFromUrl(rawTarget);
+    // Strip quotes from target and normalize (remove trailing slash)
+    var targetOrigin = targetUrl.replace(/"/g, "").replace(/\/+$/, "");
 
-    // Get current origin from !site
-    Logger.info("  Target: " + targetHost);
+    // Parse target into scheme and host
+    var targetMatch = targetOrigin.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
+    if (!targetMatch) {
+        Logger.warn("Invalid URL format. Use scheme://host (e.g., https://example.com)");
+        return "";
+    }
+    var targetScheme = targetMatch[1];
+    var targetHost = targetMatch[2];
+
+    // Get current origin from renderer_site
+    Logger.info("  Target: " + targetOrigin);
     Logger.info("  Detecting current origin...");
 
-    var currentHost = "";
+    var currentOrigin = "";
     try {
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            var extracted = CommandLineUtils.getHostFromUrl(site);
-            // Verify it looks like a domain if it didn't come from a URL match
-            // (getHostFromUrl returns raw input fallback, so we check for dot or if it changed)
-            if (extracted !== site || site.indexOf(".") !== -1) {
-                currentHost = extracted;
-            }
+            currentOrigin = site.replace(/\/+$/, "");
         }
     } catch (e) { }
 
-    if (!currentHost) {
+    if (!currentOrigin) {
         Logger.empty();
         Logger.warn("Could not detect current origin.");
         Logger.info("Make sure you're in a renderer with a loaded page.");
@@ -2345,52 +2353,122 @@ function spoof_origin(targetUrl) {
         return "";
     }
 
-    Logger.info("  Current: " + currentHost);
+    // Parse current into scheme and host
+    var currentMatch = currentOrigin.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
+    if (!currentMatch) {
+        Logger.warn("Could not parse current origin: " + currentOrigin);
+        return "";
+    }
+    var currentScheme = currentMatch[1];
+    var currentHost = currentMatch[2];
+
+    Logger.info("  Current: " + currentOrigin);
+    Logger.info("  Current Host: " + currentHost + " -> Target Host: " + targetHost);
     Logger.empty();
 
-    if (targetHost.length > currentHost.length) {
-        Logger.warn("Target longer than current, may corrupt memory.");
-        Logger.empty();
-    }
+    // Helper function to patch ASCII strings
+    function patchAsciiString(searchStr, replaceStr, label) {
+        try {
+            var searchCmd = 's -a 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
+            var output = ctl.ExecuteCommand(searchCmd);
 
-    try {
-        Logger.info("  Searching for \"" + currentHost + "\"...");
-
-        // Search entire user-mode address space
-        var searchCmd = 's -a 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + currentHost + '"';
-        var output = ctl.ExecuteCommand(searchCmd);
-
-        var addresses = [];
-        for (var line of output) {
-            var addr = SymbolUtils.extractAddress(line);
-            if (addr) {
-                addresses.push(addr);
+            var addresses = [];
+            for (var line of output) {
+                var addr = SymbolUtils.extractAddress(line);
+                if (addr) addresses.push(addr);
             }
-        }
 
-        if (addresses.length === 0) {
-            Logger.info("  No matches found.");
-            Logger.empty();
-            return "";
-        }
+            if (addresses.length === 0) {
+                Logger.info("  " + label + ": No ASCII matches found");
+                return 0;
+            }
 
-        Logger.info("  Found " + addresses.length + " occurrence(s), patching...");
-        Logger.empty();
+            var patched = 0;
+            for (var addr of addresses) {
+                try {
+                    // Build byte string for eb command
+                    var byteStr = "";
+                    for (var i = 0; i < replaceStr.length; i++) {
+                        byteStr += " " + replaceStr.charCodeAt(i).toString(16).padStart(2, '0');
+                    }
+                    // Add null terminator if replacement is shorter
+                    if (replaceStr.length < searchStr.length) {
+                        byteStr += " 00";
+                    }
+                    ctl.ExecuteCommand('eb 0x' + addr + byteStr);
+                    patched++;
+                } catch (e) { }
+            }
 
-        var patched = 0;
-        for (var addr of addresses) {
-            try {
-                ctl.ExecuteCommand('ea ' + addr + ' "' + targetHost + '"');
-                patched++;
-            } catch (e) { }
-        }
-
-        Logger.info("  Patched " + patched + " location(s)");
-        Logger.empty();
-
-    } catch (e) {
-        Logger.error("Error: " + e.message);
+            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " ASCII occurrences");
+            return patched;
+        } catch (e) { return 0; }
     }
+
+    // Helper function to patch Unicode (UTF-16) strings
+    function patchUnicodeString(searchStr, replaceStr, label) {
+        try {
+            var searchCmd = 's -u 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
+            var output = ctl.ExecuteCommand(searchCmd);
+
+            var addresses = [];
+            for (var line of output) {
+                var addr = SymbolUtils.extractAddress(line);
+                if (addr) addresses.push(addr);
+            }
+
+            if (addresses.length === 0) {
+                Logger.info("  " + label + ": No Unicode matches found");
+                return 0;
+            }
+
+            var patched = 0;
+            for (var addr of addresses) {
+                try {
+                    // Build UTF-16 byte string (little endian)
+                    var byteStr = "";
+                    for (var i = 0; i < replaceStr.length; i++) {
+                        var code = replaceStr.charCodeAt(i);
+                        byteStr += " " + (code & 0xFF).toString(16).padStart(2, '0');
+                        byteStr += " " + ((code >> 8) & 0xFF).toString(16).padStart(2, '0');
+                    }
+                    // Add null terminator if replacement is shorter
+                    if (replaceStr.length < searchStr.length) {
+                        byteStr += " 00 00";
+                    }
+                    ctl.ExecuteCommand('eb 0x' + addr + byteStr);
+                    patched++;
+                } catch (e) { }
+            }
+
+            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " Unicode occurrences");
+            return patched;
+        } catch (e) { return 0; }
+    }
+
+    var totalPatched = 0;
+
+    // Patch protocol/scheme (SecurityOrigin's protocol_ field)
+    if (currentScheme !== targetScheme && targetScheme.length <= currentScheme.length) {
+        totalPatched += patchAsciiString(currentScheme, targetScheme, "Scheme");
+    } else if (currentScheme === targetScheme) {
+        Logger.info("  Schemes are identical (" + currentScheme + "), skipping");
+    } else if (targetScheme.length > currentScheme.length) {
+        Logger.warn("Target scheme longer than current (" + targetScheme.length + " > " + currentScheme.length + "), cannot patch");
+    }
+
+    // Patch host (SecurityOrigin's host_ field)
+    if (currentHost !== targetHost && targetHost.length <= currentHost.length) {
+        totalPatched += patchAsciiString(currentHost, targetHost, "Host");
+    } else if (currentHost === targetHost) {
+        Logger.info("  Hosts are identical (" + currentHost + "), skipping");
+    } else if (targetHost.length > currentHost.length) {
+        Logger.warn("Target host longer than current (" + targetHost.length + " > " + currentHost.length + "), cannot patch");
+    }
+
+    Logger.empty();
+    Logger.info("  Total: Patched " + totalPatched + " locations");
+    Logger.empty();
 
     return "";
 }
