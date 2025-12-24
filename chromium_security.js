@@ -1158,9 +1158,12 @@ function frame_elements(idx, tagName) {
                     stack.push(sibling);
                 }
 
-                var child = BlinkUnwrap.getFirstChild(node);
-                if (child && child !== "0") {
-                    stack.push(child);
+                // Only traverse children for ContainerNodes (skip text/comments/doctype)
+                if (nodeName && nodeName !== "#text" && nodeName !== "#comment" && nodeName !== "#doctype") {
+                    var child = BlinkUnwrap.getFirstChild(node);
+                    if (child && child !== "0") {
+                        stack.push(child);
+                    }
                 }
             }
 
