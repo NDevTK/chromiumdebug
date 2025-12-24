@@ -410,7 +410,8 @@ class CommandLineUtils {
 
     static getHostFromUrl(url) {
         if (!url) return "";
-        var match = url.match(/^https?:\/\/([^\/]+)/);
+        // Match any scheme (http, https, chrome, file, etc.)
+        var match = url.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^\/]+)/);
         return match ? match[1] : url;
     }
 }
@@ -2315,8 +2316,9 @@ function spoof_origin(targetUrl) {
         return "";
     }
 
-    // Use raw input as target (stripping quotes) to allow any value
-    var targetHost = targetUrl.replace(/"/g, "");
+    // Extract host from target URL (stripping quotes first)
+    var rawTarget = targetUrl.replace(/"/g, "");
+    var targetHost = CommandLineUtils.getHostFromUrl(rawTarget);
 
     // Get current origin from !site
     Logger.info("  Target: " + targetHost);
@@ -2326,17 +2328,19 @@ function spoof_origin(targetUrl) {
     try {
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            // User requested support for any URL/Scheme.
-            // Previously we extracted host, but that caused issues with scheme mismatches (e.g. double https://).
-            // We now use the full site string as the search pattern.
-            currentHost = site;
+            var extracted = CommandLineUtils.getHostFromUrl(site);
+            // Verify it looks like a domain if it didn't come from a URL match
+            // (getHostFromUrl returns raw input fallback, so we check for dot or if it changed)
+            if (extracted !== site || site.indexOf(".") !== -1) {
+                currentHost = extracted;
+            }
         }
     } catch (e) { }
 
     if (!currentHost) {
         Logger.empty();
-        Logger.warn("Could not detect current origin_lock.");
-        Logger.info("Make sure you're in a renderer with a loaded page and correct symbols.");
+        Logger.warn("Could not detect current origin.");
+        Logger.info("Make sure you're in a renderer with a loaded page.");
         Logger.empty();
         return "";
     }
