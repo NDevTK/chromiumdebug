@@ -304,7 +304,8 @@ const BREAKPOINT_CONFIGS = {
     nav: {
         title: "Navigation Breakpoints",
         targets: [
-            "chrome!blink::LocalDOMWindow::setLocation",
+
+            "chrome!blink::Location::SetLocation",
             "chrome!blink::Location::assign",
             "chrome!blink::Location::replace",
             "chrome!blink::FrameLoader::StartNavigation"
@@ -314,7 +315,7 @@ const BREAKPOINT_CONFIGS = {
     pm: {
         title: "postMessage Breakpoints",
         targets: [
-            "chrome!blink::LocalDOMWindow::postMessage",
+            "chrome!blink::LocalDOMWindow::DispatchPostMessage",
             "chrome!blink::MessageEvent::Create"
         ],
         desc: "Cross-origin message interception"
@@ -358,7 +359,7 @@ const BREAKPOINT_CONFIGS = {
     jit: {
         title: "V8 JIT Code Generation Breakpoints",
         targets: [
-            "chrome!v8::internal::compiler::PipelineImpl::GenerateCode",
+            "chrome!v8::internal::OptimizedCompilationJob::ExecuteJob",
             "chrome!v8::internal::Builtins::Generate_*",
             "chrome!v8::internal::MacroAssembler::Call"
         ],
