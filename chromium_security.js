@@ -860,6 +860,24 @@ class BlinkUnwrap {
         });
         return result;
     }
+
+    /// Inspect a Blink Node using robust logic
+    static inspectNode(nodeAddr) {
+        var addr = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        Logger.section("Blink Object Inspection: " + addr);
+
+        // Use robust name resolution
+        var name = BlinkUnwrap.getNodeName(addr);
+        Logger.info("Resolved Node Name: " + (name ? name : "(Unable to resolve)"));
+
+        // Standard Object Dump
+        Logger.info("[*] Object Dump (blink::Node*):");
+        var ctl = SymbolUtils.getControl();
+        try {
+            var cmd = "dx -r1 ((blink::Node*)" + addr + ")";
+            for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
+        } catch (e) { Logger.error("Error dumping object: " + e.message); }
+    }
 }
 
 /// Helper: Get frame by index from frame map
@@ -1231,29 +1249,10 @@ function blink_unwrap(addrStr) {
         return "";
     }
 
-    var addr = addrStr.toString().startsWith("0x") ? addrStr : "0x" + addrStr;
-    Logger.section("Blink Object Inspection: " + addr);
-
-    var ctl = SymbolUtils.getControl();
     try {
-        Logger.info("[*] Checking nodeName():");
-        var cmd = "dx -r2 ((blink::Node*)" + addr + ")->nodeName()";
-        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
-
-        Logger.info("[*] Checking IsElementNode():");
-        cmd = "dx ((blink::Node*)" + addr + ")->IsElementNode()";
-        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
-
-        Logger.info("[*] Object Dump (blink::Node*):");
-        cmd = "dx -r1 ((blink::Node*)" + addr + ")";
-        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
-
-        Logger.info("[*] Checking nodeName via TagName (Element attempt):");
-        cmd = "dx -r2 ((blink::Element*)" + addr + ")->tag_name_.impl_->local_name_";
-        for (var line of ctl.ExecuteCommand(cmd)) Logger.info("    " + line);
-
+        BlinkUnwrap.inspectNode(addrStr);
     } catch (e) {
-        Logger.error("Error inspecting object: " + e.message);
+        Logger.error("Error in blink_unwrap: " + e.message);
     }
 
     Logger.empty();
