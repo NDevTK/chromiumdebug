@@ -362,6 +362,8 @@ class MemoryUtils {
         if (is8Bit) {
             var bytes = [];
             for (var i = 0; i < newString.length; i++) bytes.push(newString.charCodeAt(i));
+            // Pad remainder with nulls
+            while (bytes.length < currentLen) bytes.push(0);
             this.writeMemory(dataAddr, bytes);
         } else {
             // 16-bit write
@@ -371,6 +373,8 @@ class MemoryUtils {
                 bytes.push(c & 0xFF);
                 bytes.push((c >> 8) & 0xFF);
             }
+            // Pad remainder with nulls (2 bytes per char)
+            while (bytes.length < currentLen * 2) bytes.push(0);
             this.writeMemory(dataAddr, bytes);
         }
 
@@ -2369,10 +2373,16 @@ function spoof_origin(targetUrl) {
     Logger.info("  Current Host: " + currentHost + " -> Target Host: " + targetHost);
     Logger.empty();
 
-    // Helper function to patch ASCII strings
-    function patchAsciiString(searchStr, replaceStr, label) {
+    // Helper function to patch strings (ASCII or Unicode)
+    function patchString(searchStr, replaceStr, label, isUnicode) {
+        if (replaceStr.length > searchStr.length) {
+            Logger.warn("  " + label + ": Replacement string too long (" + replaceStr.length + " > " + searchStr.length + "). Aborting to prevent overflow.");
+            return 0;
+        }
+
         try {
-            var searchCmd = 's -a 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
+            var cmdType = isUnicode ? "-u" : "-a";
+            var searchCmd = 's ' + cmdType + ' 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
             var output = ctl.ExecuteCommand(searchCmd);
 
             var addresses = [];
@@ -2382,69 +2392,37 @@ function spoof_origin(targetUrl) {
             }
 
             if (addresses.length === 0) {
-                Logger.info("  " + label + ": No ASCII matches found");
+                // optional: lessen noise by checking if we really expect it
+                // Logger.info("  " + label + ": No " + (isUnicode ? "Unicode" : "ASCII") + " matches found");
                 return 0;
             }
 
             var patched = 0;
             for (var addr of addresses) {
                 try {
-                    // Build byte string for eb command
-                    var byteStr = "";
-                    for (var i = 0; i < replaceStr.length; i++) {
-                        byteStr += " " + replaceStr.charCodeAt(i).toString(16).padStart(2, '0');
-                    }
-                    // Pad remainder with nulls
-                    for (var k = replaceStr.length; k < searchStr.length; k++) {
-                        byteStr += " 00";
-                    }
-                    ctl.ExecuteCommand('eb 0x' + addr + byteStr);
-                    patched++;
-                } catch (e) { }
-            }
-
-            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " ASCII occurrences");
-            return patched;
-        } catch (e) { return 0; }
-    }
-
-    // Helper function to patch Unicode (UTF-16) strings
-    function patchUnicodeString(searchStr, replaceStr, label) {
-        try {
-            var searchCmd = 's -u 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
-            var output = ctl.ExecuteCommand(searchCmd);
-
-            var addresses = [];
-            for (var line of output) {
-                var addr = SymbolUtils.extractAddress(line);
-                if (addr) addresses.push(addr);
-            }
-
-            if (addresses.length === 0) {
-                Logger.info("  " + label + ": No Unicode matches found");
-                return 0;
-            }
-
-            var patched = 0;
-            for (var addr of addresses) {
-                try {
-                    // Build UTF-16 byte string (little endian)
                     var byteStr = "";
                     for (var i = 0; i < replaceStr.length; i++) {
                         var code = replaceStr.charCodeAt(i);
-                        byteStr += " " + (code & 0xFF).toString(16).padStart(2, '0');
-                        byteStr += " " + ((code >> 8) & 0xFF).toString(16).padStart(2, '0');
+                        if (isUnicode) {
+                            byteStr += " " + (code & 0xFF).toString(16).padStart(2, '0');
+                            byteStr += " " + ((code >> 8) & 0xFF).toString(16).padStart(2, '0');
+                        } else {
+                            byteStr += " " + code.toString(16).padStart(2, '0');
+                        }
                     }
+
                     // Pad remainder with nulls
+                    var charLen = isUnicode ? 2 : 1;
                     for (var k = replaceStr.length; k < searchStr.length; k++) {
-                        byteStr += " 00 00";
+                        byteStr += (isUnicode ? " 00 00" : " 00");
                     }
+
                     ctl.ExecuteCommand('eb 0x' + addr + byteStr);
                     patched++;
                 } catch (e) { }
             }
 
-            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " Unicode occurrences");
+            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " " + (isUnicode ? "Unicode" : "ASCII") + " occurrences");
             return patched;
         } catch (e) { return 0; }
     }
@@ -2452,21 +2430,19 @@ function spoof_origin(targetUrl) {
     var totalPatched = 0;
 
     // Patch protocol/scheme (SecurityOrigin's protocol_ field)
-    if (currentScheme !== targetScheme && targetScheme.length <= currentScheme.length) {
-        totalPatched += patchAsciiString(currentScheme, targetScheme, "Scheme");
-    } else if (currentScheme === targetScheme) {
+    if (currentScheme !== targetScheme) {
+        totalPatched += patchString(currentScheme, targetScheme, "Scheme (ASCII)", false);
+        totalPatched += patchString(currentScheme, targetScheme, "Scheme (Unicode)", true);
+    } else {
         Logger.info("  Schemes are identical (" + currentScheme + "), skipping");
-    } else if (targetScheme.length > currentScheme.length) {
-        Logger.warn("Target scheme longer than current (" + targetScheme.length + " > " + currentScheme.length + "), cannot patch");
     }
 
     // Patch host (SecurityOrigin's host_ field)
-    if (currentHost !== targetHost && targetHost.length <= currentHost.length) {
-        totalPatched += patchAsciiString(currentHost, targetHost, "Host");
-    } else if (currentHost === targetHost) {
+    if (currentHost !== targetHost) {
+        totalPatched += patchString(currentHost, targetHost, "Host (ASCII)", false);
+        totalPatched += patchString(currentHost, targetHost, "Host (Unicode)", true);
+    } else {
         Logger.info("  Hosts are identical (" + currentHost + "), skipping");
-    } else if (targetHost.length > currentHost.length) {
-        Logger.warn("Target host longer than current (" + targetHost.length + " > " + currentHost.length + "), cannot patch");
     }
 
     Logger.empty();
