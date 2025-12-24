@@ -1,13 +1,13 @@
 # Chromium Security Research WinDbg Toolkit
 
-An experimental WinDbg debugging toolkit for Chromium security researchers.  
+An experimental WinDbg debugging toolkit for Chromium security researchers  
 Inspired by <https://github.com/shhnjk/spoof.js>
 
 ## Quick Start
 - Install Chrome Canary <https://www.google.com/chrome/canary/>
 - Install WinDbg from MS Store <https://apps.microsoft.com/detail/9pgjgd53tn86>
 - Download repository and run `debug_chrome.bat`
-- When it says BUSY you need to click Break to use the command line.
+- When it says BUSY you need to click Break to use the command line
 
 Then in WinDbg: `!chelp`
 
