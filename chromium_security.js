@@ -9,7 +9,8 @@
 
 /// Global state
 var g_rendererAttachCommands = [];
-var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string}>
+var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string, pid: number}>
+var g_exitHandlerRegistered = false;
 
 /// Constants
 const MAX_PATCHES = 50;
@@ -1470,6 +1471,7 @@ function initializeScript() {
         // Spoofing & patching
         new host.functionAlias(patch_function, "patch"),
         new host.functionAlias(spoof_origin, "spoof"),
+        new host.functionAlias(on_process_exit, "on_process_exit"),
         // Cross-process execution
         new host.functionAlias(run_in_renderer, "run_renderer"),
         new host.functionAlias(run_in_browser, "run_browser"),
@@ -2324,6 +2326,53 @@ function patch_function(funcName, returnValue) {
     return "";
 }
 
+/// Helper: Ensure the exit process handler is registered
+function _ensureExitHandler() {
+    if (g_exitHandlerRegistered) return;
+
+    // Register a silent handler for Process Exit (epr)
+    // We use ; g at the end to auto-continue unless we want to stop (we don't)
+    var cmd = "sxe -c \"!on_process_exit; g\" epr";
+    try {
+        var ctl = SymbolUtils.getControl();
+        ctl.ExecuteCommand(cmd);
+        g_exitHandlerRegistered = true;
+        Logger.info("  [Setup] Registered process exit handler for cleanup.");
+    } catch (e) {
+        Logger.warn("  [Setup] Failed to register process exit handler.");
+    }
+}
+
+/// Helper: Handler for process exit (runs on every process exit)
+function on_process_exit() {
+    // This runs frequently, so keep it lightweight and silent unless action is taken
+    try {
+        if (g_spoofMap.size === 0) return;
+
+        // Get current PID
+        var currentPid = host.currentProcess.Id;
+
+        // Check if this PID is in our spoof map
+        var idsToRemove = [];
+        for (var entry of g_spoofMap) {
+            var clientId = entry[0];
+            var activeSpoof = entry[1];
+            if (activeSpoof.pid === currentPid) {
+                idsToRemove.push(clientId);
+            }
+        }
+
+        // Cleanup
+        for (var id of idsToRemove) {
+            var spoof = g_spoofMap.get(id);
+            g_spoofMap.delete(id);
+            Logger.info("\n  [Cleanup] Spoof state cleaned up for PID " + currentPid + " (Url: " + spoof.currentUrl + ")");
+        }
+    } catch (e) {
+        // Suppress errors in exit handler to avoid spam
+    }
+}
+
 /// Usage: !spoof_origin "https://target.com"
 /// Spoofs the current origin to a target origin
 /// Patches both host and full URL occurrences in memory
@@ -2511,8 +2560,11 @@ function spoof_origin(targetUrl) {
             Logger.info("  Reverted to true origin. Clearing spoof state.");
             g_spoofMap.delete(clientId);
         } else {
-            Logger.info("  Spoof active. Updating state.");
-            g_spoofMap.set(clientId, { currentUrl: targetOrigin });
+            // New spoof - store state WITH PID
+            var currentPid = host.currentProcess.Id;
+            g_spoofMap.set(clientId, { currentUrl: targetOrigin, pid: currentPid });
+            _ensureExitHandler();
+
         }
     } else {
         Logger.warn("  Could not determine Client ID. State not updated.");
