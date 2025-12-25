@@ -551,11 +551,13 @@ function getCompressedMember(baseAddr, typeCast, memberName) {
         var out = ctl.ExecuteCommand(cmd);
         for (var line of out) {
             var l = line.toString();
-            var m = l.match(/: (0x[0-9a-fA-F`]+)/);
+            var m = l.match(/:\s*(0x[0-9a-fA-F`]+)/);
             if (m) {
                 var addr = m[1].replace(/`/g, "");
-                var ptrVal = host.memory.readMemoryValues(host.parseInt64(addr, 16), 1, 4)[0];
-                return ptrVal;
+                try {
+                    var ptrVal = host.memory.readMemoryValues(host.parseInt64(addr, 16), 1, 4)[0];
+                    return ptrVal;
+                } catch (e) { Logger.error("ReadMem failed: " + e.message); }
             }
         }
     } catch (e) { }
@@ -650,7 +652,8 @@ class BlinkUnwrap {
         var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
         var childCompressed = getCompressedMember(nodeHex, "(blink::ContainerNode*)", "first_child_");
         if (childCompressed === null) return null;
-        return MemoryUtils.decompressCppgcPtr(childCompressed, nodeAddr);
+        var res = MemoryUtils.decompressCppgcPtr(childCompressed, nodeAddr);
+        return res;
     }
 
     /// Get next sibling of a node (Node::next_)
@@ -671,6 +674,11 @@ class BlinkUnwrap {
             // Check for "value" (simple quote)
             var match2 = s.match(/^"([^"]+)"$/);
             if (match2) return match2[1];
+
+            // Check for Prop : "value"
+            var match3 = s.match(/:\s*"([^"]+)"/);
+            if (match3) return match3[1];
+
             // Fallback: look for any quoted string with Text label
             if (s.indexOf("Text") !== -1) {
                 var m = s.match(/"([^"]+)"/);
@@ -705,7 +713,7 @@ class BlinkUnwrap {
                 var type = flags & 0xF;
                 // kElementNode = 1
                 if (type === 1) {
-                    var cmdE = "dx -r2 ((blink::Element*)" + nodeHex + ")->tag_name_.impl_->local_name_";
+                    var cmdE = "dx -r2 ((blink::Element*)" + nodeHex + ")->tag_name_.impl_->local_name_.string_";
                     var res = BlinkUnwrap._parseStringFromDxOutput(ctl.ExecuteCommand(cmdE));
                     if (res) return res;
                     return "ELEMENT (Name unreadable)";
@@ -783,7 +791,7 @@ class BlinkUnwrap {
                     : "((blink::ShareableElementData*)0x" + dataAddr + ")->attribute_array_[" + i + "]";
 
                 var nameStr = "";
-                var nCmd = "dx -r2 " + base + ".name_.impl_->local_name_";
+                var nCmd = "dx -r2 " + base + ".name_.impl_->local_name_.string_";
                 var nOut = ctl.ExecuteCommand(nCmd);
                 nameStr = BlinkUnwrap._parseStringFromDxOutput(nOut);
 
@@ -1146,8 +1154,6 @@ function frame_elements(idx, tagName) {
                 // Process Node
                 var nodeName = BlinkUnwrap.getNodeName(node);
 
-
-
                 // Compare case-insensitive
                 if (nodeName && nodeName.toLowerCase() === filterTag) {
                     // Extract ID/Class if possible for context? 
@@ -1163,7 +1169,8 @@ function frame_elements(idx, tagName) {
                 }
 
                 // Only traverse children for ContainerNodes (skip text/comments/doctype)
-                if (nodeName && nodeName !== "#text" && nodeName !== "#comment" && nodeName !== "#doctype") {
+                // If nodeName is null (unknown), we assume it might have children and try anyway
+                if (!nodeName || (nodeName !== "#text" && nodeName !== "#comment" && nodeName !== "#doctype")) {
                     var child = BlinkUnwrap.getFirstChild(node);
                     if (child && child !== "0") {
                         stack.push(child);
@@ -2890,7 +2897,7 @@ function _getFrameLabelId(ctl, renderFrame) {
 /// Helper: Display single frame info
 function _displayFrameInfo(ctl, f, index) {
     var rfId = _getFrameLabelId(ctl, f.renderFrame);
-    Logger.info("  [" + index + "] RenderFrameImpl:  " + f.renderFrame + " (ID: " + rfId + ")");
+    Logger.info("  [Index: " + index + "] RenderFrameImpl:  " + f.renderFrame);
     Logger.info("       WebFrame:         " + f.webFrame);
 
     var urlStr = _extractFrameUrl(ctl, f);
