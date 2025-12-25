@@ -1309,6 +1309,9 @@ class ProcessUtils {
         var pidToSysId = this.getPidToSysIdMap();
         var results = [];
 
+        // Remember original process to restore after iteration
+        var originalId = this.getCurrentSysId();
+
         for (var proc of processes) {
             try {
                 var pid = parseInt(proc.Id.toString());
@@ -1333,14 +1336,24 @@ class ProcessUtils {
                 results.push(procObj);
             } catch (e) { }
         }
+
+        // Restore original process context
+        try {
+            if (originalId !== null && originalId !== 0) {
+                SymbolUtils.execute("|" + originalId + "s");
+            }
+            MemoryUtils.invalidateCaches();
+        } catch (e) { }
+
         return results;
     }
 
-    static getInfoSafe(proc, sysId) {
+    static getInfoSafe(proc, sysId, skipContextSwitch) {
         var cmdLine = "";
         var readSuccess = false;
         try {
-            if (sysId !== undefined && sysId !== null && sysId !== "?") {
+            // Only switch context if not skipped (caller may have already switched)
+            if (!skipContextSwitch && sysId !== undefined && sysId !== null && sysId !== "?") {
                 try { SymbolUtils.execute("|" + sysId + "s"); } catch (e) { }
             }
             cmdLine = CommandLineUtils.get();
@@ -1382,17 +1395,28 @@ class ProcessUtils {
         var processes = this.getList(filterType);
         if (processes.length === 0) return 0;
 
+        // Remember original process to restore after iteration
+        var originalId = this.getCurrentSysId();
         var count = 0;
         for (var proc of processes) {
             if (proc.sysId === "?" || proc.sysId === null) continue;
             try {
                 SymbolUtils.execute("|" + proc.sysId + "s");
+                MemoryUtils.invalidateCaches(); // Clear cached cage bases for new process
                 var result = callback(proc);
                 count++;
                 if (result === false) break;
             } catch (e) { Logger.error("Error in process " + proc.pid + ": " + e.message); }
         }
-        try { SymbolUtils.execute("|0s"); } catch (e) { }
+        // Restore original process context
+        try {
+            if (originalId !== null && originalId !== 0) {
+                SymbolUtils.execute("|" + originalId + "s");
+            } else {
+                SymbolUtils.execute("|0s");
+            }
+            MemoryUtils.invalidateCaches();
+        } catch (e) { }
         return count;
     }
 
@@ -1717,17 +1741,31 @@ function get_browser_sysid() {
     var processes = host.currentSession.Processes;
     var pidToSysId = ProcessUtils.getPidToSysIdMap();
 
+    // Remember original process to restore after searching
+    var originalId = ProcessUtils.getCurrentSysId();
+    var result = null;
+
     for (var proc of processes) {
         var pid = parseInt(proc.Id.toString());
         if (pidToSysId.has(pid)) {
             var sysId = pidToSysId.get(pid);
             var info = ProcessUtils.getInfoSafe(proc, sysId);
             if (info.type === "browser") {
-                return sysId;
+                result = sysId;
+                break;
             }
         }
     }
-    return null;
+
+    // Restore original process context
+    try {
+        if (originalId !== null && originalId !== 0) {
+            SymbolUtils.execute("|" + originalId + "s");
+        }
+        MemoryUtils.invalidateCaches();
+    } catch (e) { }
+
+    return result;
 }
 
 /// Helper: Get map of Renderer Client ID -> Site Lock URL
@@ -1742,6 +1780,9 @@ function get_site_locks(browserSysId, childIds) {
         return locks;
     }
 
+    // Remember original process to restore after querying
+    var originalId = ProcessUtils.getCurrentSysId();
+
     try {
         // Step 1: Get the GetInstance symbol address
         var funcAddr = null;
@@ -1754,12 +1795,13 @@ function get_site_locks(browserSysId, childIds) {
                     break;
                 }
             }
-        } catch (xErr) { return locks; }
-        if (!funcAddr) return locks;
+        } catch (xErr) { /* continue with null funcAddr */ }
 
-        // Step 2: Find a browser with chrome.dll and accessible singleton
+        if (!funcAddr) {
+            // Early exit - will restore in finally
+            return locks;
+        }
 
-        // Get all browser process IDs
         // Step 2: Find a browser with chrome.dll and accessible singleton
         var instanceAddr = null;
         var workingBrowserId = null;
@@ -1822,9 +1864,18 @@ function get_site_locks(browserSysId, childIds) {
             } catch (e) { }
         });
 
-        if (!instanceAddr) return locks;
+        if (!instanceAddr) {
+            // Early exit - will restore in finally
+            return locks;
+        }
 
-        // Step 3: Enumerate all entries in security_state_ map
+        // Step 3: Switch to browser context for dx command
+        try {
+            SymbolUtils.execute("|" + workingBrowserId + "s");
+            MemoryUtils.invalidateCaches();
+        } catch (e) { }
+
+        // Step 4: Enumerate all entries in security_state_ map
         try {
             var enumCmd = "dx -r6 ((chrome!content::ChildProcessSecurityPolicyImpl*)" + instanceAddr + ")->security_state_";
 
@@ -1863,9 +1914,17 @@ function get_site_locks(browserSysId, childIds) {
                 locks.set(currentChildId.toString(), currentLockUrl);
             }
         } catch (e) { }
-    } catch (e) { }
 
-    return locks;
+        return locks;
+    } finally {
+        // Always restore original process context
+        try {
+            if (originalId !== null && originalId !== 0) {
+                SymbolUtils.execute("|" + originalId + "s");
+            }
+            MemoryUtils.invalidateCaches();
+        } catch (e) { }
+    }
 }
 
 
@@ -2484,27 +2543,35 @@ function spoof_origin(targetUrl) {
             var patched = 0;
             for (var addr of addresses) {
                 try {
-                    // Heuristic: Check if this is a StringImpl and patch length
                     // StringImpl Layout (approx): RefCount(+0), Length(+4), Hash(+8), Data(+12)
                     // So Length is at Data - 8.
-                    // Risk: If this is randomly a 5 on the stack, we change it to 4. Acceptable for debug tool.
+                    // Try multiple offsets to find the length field for variable-length string support
                     var addrVal = host.parseInt64(addr, 16);
-                    var lenAddr = addrVal.subtract(8);
+                    var lengthUpdated = false;
 
-                    try {
-                        // Check if existing length matches searchStr.length
-                        var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
-                        if (ptrVal === searchStr.length) {
-                            // Update length to replaceStr.length
-                            var newLen = replaceStr.length;
-                            var writeCmd = "ed 0x" + lenAddr.toString(16) + " " + newLen;
-                            ctl.ExecuteCommand(writeCmd);
-                            // Logger.info("    (Adjusted StringImpl length at 0x" + lenAddr.toString(16) + ")");
+                    // Try offset -8 first (standard StringImpl layout)
+                    var lenOffsets = [-8, -4, -12];
+                    for (var offsetIdx = 0; offsetIdx < lenOffsets.length && !lengthUpdated; offsetIdx++) {
+                        try {
+                            var lenAddr = addrVal.add(lenOffsets[offsetIdx]);
+                            var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
+
+                            // Check if this looks like a valid length field:
+                            // - Must be >= searchStr.length (could be capacity, not length)
+                            // - Must be reasonable (< 10000 chars for a URL)
+                            if (ptrVal >= searchStr.length && ptrVal <= searchStr.length + 10 && ptrVal < 10000) {
+                                // Update length to replaceStr.length
+                                var newLen = replaceStr.length;
+                                var writeCmd = "ed 0x" + lenAddr.toString(16) + " 0x" + newLen.toString(16);
+                                ctl.ExecuteCommand(writeCmd);
+                                lengthUpdated = true;
+                            }
+                        } catch (e) {
+                            // Ignore read errors, try next offset
                         }
-                    } catch (e) {
-                        // Should not happen if addr is valid, but ignore
                     }
 
+                    // Write the replacement string data
                     var byteStr = "";
                     for (var i = 0; i < replaceStr.length; i++) {
                         var code = replaceStr.charCodeAt(i);
@@ -2516,7 +2583,7 @@ function spoof_origin(targetUrl) {
                         }
                     }
 
-                    // Pad remainder with nulls
+                    // Pad remainder with nulls to overwrite old longer string
                     var charLen = isUnicode ? 2 : 1;
                     for (var k = replaceStr.length; k < searchStr.length; k++) {
                         byteStr += (isUnicode ? " 00 00" : " 00");
