@@ -250,58 +250,51 @@ class MemoryUtils {
         var ctl = SymbolUtils.getControl();
         var hexAddr = implAddr.toString().startsWith("0x") ? implAddr : "0x" + implAddr;
 
-        var is8Bit = false;
+        var is8Bit = true; // Default to 8-bit (ASCII) - most strings are ASCII
         var currentLen = 0;
         var headerParsed = false;
+        var flags = 0;
 
         // Try raw memory read first (more reliable than dx symbols sometimes)
         // Layout assumption (x64):
         // +0: RefCount (4b)
         // +4: Length (4b)
-        // +8: Hash/Flags (4b)
+        // +8: Hash/Flags (4b) - Bit 0 of flags (at offset +8) often indicates is_8bit
         try {
             var cmd = "dd " + hexAddr + " L4";
             var out = ctl.ExecuteCommand(cmd);
             for (var line of out) {
-                // Logger.info("  [Debug] Raw Header: " + line); // Dump for analysis
                 var parts = line.toString().trim().split(/\s+/);
                 if (parts.length >= 4) {
-                    // parts[0] is addr
-                    // parts[1] (Offset 0), parts[2] (Offset 4), parts[3] (Offset 8)
+                    // parts[1] = RefCount, parts[2] = Length, parts[3] = Hash/Flags
+                    currentLen = parseInt(parts[2], 16);
+                    flags = parseInt(parts[3], 16);
+                    headerParsed = true;
 
-                    var val1 = parseInt(parts[1], 16);
-                    var val2 = parseInt(parts[2], 16);
-
-                    // Heuristic: Length usually logical (e.g. < 1000). RefCount can be large/small.
-                    // If dx failed, we rely on these.
-
-                    // Assume +4 is length for now, but check if correct
-                    var lenStr = parts[2];
-                    if (lenStr) {
-                        currentLen = parseInt(lenStr, 16);
-                        headerParsed = true;
-                    }
+                    // In WTF::StringImpl, the is_8bit flag is typically in the lower bits
+                    // If bit 0 of hash_and_flags is 1, it's 8-bit
+                    // This varies by Chromium version, so we check multiple patterns
+                    // Low bit = 1 often means 8-bit
+                    is8Bit = (flags & 1) === 1;
                 }
                 break;
             }
         } catch (e) { }
 
-        // Fallback to dx if raw read failed or yielded 0 (and we suspect it's wrong)
-        if (!headerParsed || currentLen === 0) {
-            // ... existing dx logic ...
-            // (Omitting here to keep it clean, but if raw failed, dx likely will too)
-        }
-
-        // Try dx for 8bit if raw didn't confirm
+        // Try dx for is8Bit if raw didn't confirm
         try {
             var cmd = "dx ((WTF::StringImpl*)" + hexAddr + ")->is8Bit()";
             var out = ctl.ExecuteCommand(cmd);
             for (var line of out) {
-                if (line.toString().includes("true")) is8Bit = true;
+                var lineStr = line.toString();
+                if (lineStr.includes("true") || lineStr.includes("1")) is8Bit = true;
+                else if (lineStr.includes("false") || lineStr.includes("0")) is8Bit = false;
             }
-        } catch (e) { }
+        } catch (e) {
+            // dx failed - rely on flags check or default
+        }
 
-        // Logger.info("  [Debug] StringImpl (Raw): Addr=" + hexAddr + " Len=" + currentLen + " 8Bit=" + is8Bit);
+        Logger.info("  String: Len=" + currentLen + " is8Bit=" + is8Bit + " (Flags=0x" + flags.toString(16) + ")");
 
         if (currentLen === 0) {
             Logger.warn("  [Warning] Length detected as 0. This might be empty string OR read failure.");
@@ -541,6 +534,22 @@ function extractUrlFromLine(lineStr) {
     return urlMatch ? urlMatch[1] : null;
 }
 
+/// Helper: Normalize an address to hex format with 0x prefix
+/// Handles: decimal numbers, hex strings with/without 0x prefix, BigInt
+function normalizeAddress(addr) {
+    if (addr === null || addr === undefined) return null;
+    var addrStr = addr.toString();
+    if (addrStr.startsWith("0x") || addrStr.startsWith("0X")) {
+        return addrStr;
+    } else if (/^\d+$/.test(addrStr)) {
+        // Decimal number - convert to hex
+        return "0x" + BigInt(addrStr).toString(16);
+    } else {
+        // Assume hex without prefix
+        return "0x" + addrStr;
+    }
+}
+
 /// Helper: Get a compressed member pointer value using symbols
 /// @param baseAddr - Base address (with or without 0x prefix)
 /// @param typeCast - Type cast string, e.g. "(blink::WebLocalFrameImpl*)"
@@ -671,21 +680,34 @@ class BlinkUnwrap {
         for (var line of output) {
             var s = line.toString();
             // Check for [AsciiText] : "value" or [Text] : "value"
-            var match = s.match(/\[(Ascii)?Text\]\s*:\s*"([^"]+)"/);
+            var match = s.match(/\[(Ascii)?Text\]\s*:\s*"([^"]*)"/);
             if (match) return match[2];
-            // Check for "value" (simple quote)
+
+            // Check for "value" (simple quote) - but not empty
             var match2 = s.match(/^"([^"]+)"$/);
             if (match2) return match2[1];
 
-            // Check for Prop : "value"
+            // Check for Prop : "value" pattern
             var match3 = s.match(/:\s*"([^"]+)"/);
             if (match3) return match3[1];
+
+            // Check for string_ : ... "value" pattern
+            var match4 = s.match(/string_.*"([^"]+)"/);
+            if (match4) return match4[1];
+
+            // Check for impl_ with quoted string
+            var match5 = s.match(/impl_.*"([^"]+)"/);
+            if (match5) return match5[1];
 
             // Fallback: look for any quoted string with Text label
             if (s.indexOf("Text") !== -1) {
                 var m = s.match(/"([^"]+)"/);
                 if (m) return m[1];
             }
+
+            // Look for URL patterns (often appear in attribute values)
+            var urlMatch = s.match(/(https?:\/\/[^\s"]+)/);
+            if (urlMatch) return urlMatch[1];
         }
         return null;
     }
@@ -739,22 +761,50 @@ class BlinkUnwrap {
     }
     /// Helper: Traverse attributes of an element
     /// callback(name, baseExpression) -> return true to stop
-    static _traverseAttributes(elementAddr, callback) {
-        var elemHex;
-        try {
-            var s = elementAddr.toString();
-            if (s.startsWith("0x")) elemHex = s;
-            else if (/^\d+$/.test(s)) elemHex = "0x" + BigInt(s).toString(16);
-            else elemHex = "0x" + s;
-        } catch (e) { elemHex = "0x" + elementAddr; }
-
-        var dataCompressed = getCompressedMember(elemHex, "(blink::Element*)", "element_data_");
-        if (!dataCompressed || dataCompressed == 0n) return;
-
-        var dataAddr = MemoryUtils.decompressCppgcPtr(dataCompressed, elemHex);
-        if (!dataAddr || dataAddr === "0") return;
+    /// @param elementAddr - Element address
+    /// @param callback - Function to call for each attribute
+    /// @param debug - If true, output debug info
+    static _traverseAttributes(elementAddr, callback, debug) {
+        var elemHex = normalizeAddress(elementAddr);
+        if (!elemHex) {
+            if (debug) Logger.warn("_traverseAttributes: Invalid element address");
+            return;
+        }
 
         var ctl = SymbolUtils.getControl();
+
+        // First, try to read element_data_ as a compressed pointer
+        var dataCompressed = getCompressedMember(elemHex, "(blink::Element*)", "element_data_");
+
+        if (debug) {
+            Logger.info("  [Debug] Element: " + elemHex);
+            Logger.info("  [Debug] element_data_ compressed: " + (dataCompressed !== null ? "0x" + dataCompressed.toString(16) : "null"));
+        }
+
+        // If compressed pointer approach failed, try direct dx access
+        if (!dataCompressed || dataCompressed == 0n) {
+            // Try direct dx to see if element_data_ exists
+            if (debug) {
+                try {
+                    var dxCmd = "dx -r1 ((blink::Element*)" + elemHex + ")->element_data_";
+                    var dxOut = ctl.ExecuteCommand(dxCmd);
+                    for (var line of dxOut) {
+                        Logger.info("  [Debug] dx element_data_: " + line.toString());
+                    }
+                } catch (e) {
+                    Logger.info("  [Debug] dx element_data_ failed: " + e.message);
+                }
+            }
+            return;
+        }
+
+        var dataAddr = MemoryUtils.decompressCppgcPtr(dataCompressed, elemHex);
+
+        if (debug) {
+            Logger.info("  [Debug] ElementData decompressed: 0x" + dataAddr);
+        }
+
+        if (!dataAddr || dataAddr === "0") return;
 
         // Bitfield
         var bitField = 0;
@@ -775,15 +825,42 @@ class BlinkUnwrap {
         var arraySize = (bitField >> 1) & 0xFFFFFFF;
         var count = isUnique ? 0 : arraySize;
 
+        if (debug) {
+            Logger.info("  [Debug] bitField: 0x" + bitField.toString(16) + " isUnique: " + isUnique + " arraySize: " + arraySize);
+        }
+
         if (isUnique) {
             try {
                 var sizeCmd = "dx -r0 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_.size_";
                 var sizeOut = ctl.ExecuteCommand(sizeCmd);
                 for (var line of sizeOut) {
-                    var m = line.toString().match(/:\s*(\d+)/);
-                    if (m) { count = parseInt(m[1]); break; }
+                    if (debug) Logger.info("  [Debug] attribute_vector_.size_ output: " + line.toString());
+                    // Match both hex (0x1) and decimal (1) values
+                    var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                    if (m) {
+                        var valStr = m[1];
+                        count = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                        break;
+                    }
                 }
-            } catch (e) { }
+            } catch (e) {
+                if (debug) Logger.info("  [Debug] attribute_vector_.size_ failed: " + e.message);
+            }
+
+            // Fallback: Try to enumerate via dx -r2 on attribute_vector_ directly
+            if (count === 0 && debug) {
+                try {
+                    var enumCmd = "dx -r2 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_";
+                    var enumOut = ctl.ExecuteCommand(enumCmd);
+                    for (var line of enumOut) {
+                        Logger.info("  [Debug] attribute_vector_ enum: " + line.toString());
+                    }
+                } catch (e) {
+                    Logger.info("  [Debug] attribute_vector_ enum failed: " + e.message);
+                }
+            }
+
+            if (debug) Logger.info("  [Debug] Final count: " + count);
         }
 
         for (var i = 0; i < count; i++) {
@@ -820,16 +897,44 @@ class BlinkUnwrap {
 
         BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
             var valStr = "";
-            var vOut = ctl.ExecuteCommand("dx -r2 " + base + ".value_");
-            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
+
+            // Try multiple paths to extract the value (same as getAttribute)
+            // Path 1: Direct value_ access
+            try {
+                var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
+                valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
+            } catch (e) { }
+
+            // Path 2: Try value_.string_ for AtomicString
             if (!valStr) {
-                for (var line of vOut) {
-                    var m = line.toString().match(/\"([^\"]*)\"/);
-                    if (m) { valStr = m[1]; break; }
-                    m = line.toString().match(/:\s*\.\s+(.+?)\s*\[Type/);
-                    if (m) { valStr = m[1]; break; }
-                }
+                try {
+                    var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
+                    valStr = BlinkUnwrap._parseStringFromDxOutput(vOut2);
+                } catch (e) { }
             }
+
+            // Path 3: Direct AtomicString impl access  
+            if (!valStr) {
+                try {
+                    var vOut3 = ctl.ExecuteCommand("dx -r2 " + base + ".value_.impl_");
+                    valStr = BlinkUnwrap._parseStringFromDxOutput(vOut3);
+                } catch (e) { }
+            }
+
+            // Path 4: Fallback to looking for any quoted string
+            if (!valStr) {
+                try {
+                    var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
+                    for (var line of vOut4) {
+                        var lineStr = line.toString();
+                        if (lineStr.indexOf("value_") !== -1 || lineStr.indexOf("Value") !== -1) {
+                            var m = lineStr.match(/"([^"]+)"/);
+                            if (m) { valStr = m[1]; break; }
+                        }
+                    }
+                } catch (e) { }
+            }
+
             attrs.push({ name: name, value: valStr || "" });
         });
         return attrs;
@@ -841,15 +946,47 @@ class BlinkUnwrap {
         var ctl = SymbolUtils.getControl();
         BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
             if (name === attrName) {
-                var vOut = ctl.ExecuteCommand("dx -r2 " + base + ".value_");
-                val = BlinkUnwrap._parseStringFromDxOutput(vOut);
-                if (!val) {
-                    for (var line of vOut) {
-                        var m = line.toString().match(/\"([^\"]*)\"/);
-                        if (m) { val = m[1]; break; }
+                // Try multiple paths to extract the value
+                // Path 1: Direct value_ access with deeper recursion
+                try {
+                    var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
+                    val = BlinkUnwrap._parseStringFromDxOutput(vOut);
+                    if (val) return true;
+                } catch (e) { }
+
+                // Path 2: Try value_.string_ for AtomicString
+                try {
+                    var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
+                    val = BlinkUnwrap._parseStringFromDxOutput(vOut2);
+                    if (val) return true;
+                } catch (e) { }
+
+                // Path 3: Direct AtomicString impl access
+                try {
+                    var vOut3 = ctl.ExecuteCommand("dx -r2 " + base + ".value_.impl_");
+                    val = BlinkUnwrap._parseStringFromDxOutput(vOut3);
+                    if (val) return true;
+                } catch (e) { }
+
+                // Path 4: Fallback to looking for any quoted string in dx output
+                try {
+                    var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
+                    for (var line of vOut4) {
+                        var lineStr = line.toString();
+                        // Look for value_ with quoted string
+                        if (lineStr.indexOf("value_") !== -1 || lineStr.indexOf("Value") !== -1) {
+                            var m = lineStr.match(/"([^"]+)"/);
+                            if (m) { val = m[1]; return true; }
+                        }
                     }
-                }
-                return true; // Stop
+                    // If still not found, try any quoted string after passing the name
+                    for (var line of vOut4) {
+                        var m = line.toString().match(/"([^"]+)"/);
+                        if (m) { val = m[1]; return true; }
+                    }
+                } catch (e) { }
+
+                return true; // Stop iteration even if not found
             }
         });
         return val;
@@ -919,7 +1056,7 @@ function frame_setattr(elementAddr, attrName, attrValue) {
         return "";
     }
 
-    var elemHex = elementAddr.toString().startsWith("0x") ? elementAddr : "0x" + elementAddr;
+    var elemHex = normalizeAddress(elementAddr);
     var attr = attrName.replace(/"/g, "");
     var value = attrValue ? attrValue.replace(/"/g, "") : "";
 
@@ -1215,7 +1352,7 @@ function frame_getattr(elementAddr, attrName) {
         return "";
     }
 
-    var elemHex = elementAddr.toString().startsWith("0x") ? elementAddr : "0x" + elementAddr;
+    var elemHex = normalizeAddress(elementAddr);
     var attr = attrName.replace(/"/g, "");
 
     Logger.section("Get Attribute: " + attr);
@@ -1238,17 +1375,65 @@ function frame_getattr(elementAddr, attrName) {
 
 
 /// List all attributes of an element
-function frame_attrs(elementAddr) {
+function frame_attrs(elementAddr, debug) {
     if (isEmpty(elementAddr)) {
-        Logger.showUsage("Frame Attributes", "!frame_attrs <element_addr>", ["!frame_attrs 0x12345678"]);
+        Logger.showUsage("Frame Attributes", "!frame_attrs <element_addr>", [
+            "!frame_attrs 0x12345678",
+            "!frame_attrs(0x12345678, true)  - Enable debug output"
+        ]);
         return "";
     }
 
-    var attrs = BlinkUnwrap.getAttributes(elementAddr);
+    var elemHex = normalizeAddress(elementAddr);
+    var enableDebug = debug === true || debug === "true";
 
-    Logger.section("Element Attributes: " + elementAddr);
+    Logger.section("Element Attributes: " + elemHex);
+
+    if (enableDebug) {
+        Logger.info("Debug mode enabled:");
+        Logger.empty();
+    }
+
+    var attrs = [];
+    var ctl = SymbolUtils.getControl();
+
+    BlinkUnwrap._traverseAttributes(elemHex, (name, base) => {
+        var valStr = "";
+
+        // Try multiple paths to extract the value
+        try {
+            var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
+            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
+        } catch (e) { }
+
+        if (!valStr) {
+            try {
+                var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
+                valStr = BlinkUnwrap._parseStringFromDxOutput(vOut2);
+            } catch (e) { }
+        }
+
+        if (!valStr) {
+            try {
+                var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
+                for (var line of vOut4) {
+                    var lineStr = line.toString();
+                    if (lineStr.indexOf("value_") !== -1) {
+                        var m = lineStr.match(/"([^"]+)"/);
+                        if (m) { valStr = m[1]; break; }
+                    }
+                }
+            } catch (e) { }
+        }
+
+        attrs.push({ name: name, value: valStr || "" });
+    }, enableDebug);
+
     if (attrs.length === 0) {
-        Logger.info("(No explicit attributes)");
+        Logger.info("(No explicit attributes found)");
+        Logger.empty();
+        Logger.info("Try with debug: !frame_attrs(" + elemHex + ", true)");
+        Logger.info("Or inspect directly: dx ((blink::Element*)" + elemHex + ")");
     } else {
         for (var a of attrs) {
             Logger.info("  " + a.name + "=\"" + a.value + "\"");
