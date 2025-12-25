@@ -18,6 +18,9 @@ const MAX_CALLER_DISPLAY = 3;
 const BROWSER_CMDLINE_MIN_LENGTH = 500;
 const USER_MODE_ADDR_LIMIT = "0x7fffffffffff";
 const MIN_PTR_VALUE_LENGTH = 4;
+const MAX_DOM_TRAVERSAL_NODES = 5000;
+const STRINGIMPL_DATA_OFFSET = 12; // Offset from StringImpl to character data
+const MAX_URL_STRING_LENGTH = 10000; // Maximum reasonable URL length for validation
 
 /// Helper: Check if string is empty or null
 function isEmpty(str) {
@@ -712,6 +715,54 @@ class BlinkUnwrap {
         return null;
     }
 
+    /// Helper: Extract attribute value using multiple fallback paths
+    /// @param base - Base dx expression for the attribute (e.g., "((blink::UniqueElementData*)0x...)->attribute_vector_[0]")
+    /// @returns The attribute value string or null
+    static _extractAttributeValue(base) {
+        var ctl = SymbolUtils.getControl();
+        var valStr = null;
+
+        // Path 1: Direct value_ access
+        try {
+            var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
+            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
+            if (valStr) return valStr;
+        } catch (e) { }
+
+        // Path 2: Try value_.string_ for AtomicString
+        try {
+            var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
+            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut2);
+            if (valStr) return valStr;
+        } catch (e) { }
+
+        // Path 3: Direct AtomicString impl access
+        try {
+            var vOut3 = ctl.ExecuteCommand("dx -r2 " + base + ".value_.impl_");
+            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut3);
+            if (valStr) return valStr;
+        } catch (e) { }
+
+        // Path 4: Fallback to looking for any quoted string in dx output
+        try {
+            var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
+            for (var line of vOut4) {
+                var lineStr = line.toString();
+                if (lineStr.indexOf("value_") !== -1 || lineStr.indexOf("Value") !== -1) {
+                    var m = lineStr.match(/"([^"]+)"/);
+                    if (m) return m[1];
+                }
+            }
+            // Last resort: any quoted string
+            for (var line of vOut4) {
+                var m = line.toString().match(/"([^"]+)"/);
+                if (m) return m[1];
+            }
+        } catch (e) { }
+
+        return null;
+    }
+
     /// Get node name (tag name)
     static getNodeName(nodeAddr) {
         var ctl = SymbolUtils.getControl();
@@ -893,48 +944,9 @@ class BlinkUnwrap {
     /// Get all attributes of an element as an array of objects
     static getAttributes(elementAddr) {
         var attrs = [];
-        var ctl = SymbolUtils.getControl();
 
         BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
-            var valStr = "";
-
-            // Try multiple paths to extract the value (same as getAttribute)
-            // Path 1: Direct value_ access
-            try {
-                var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
-                valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
-            } catch (e) { }
-
-            // Path 2: Try value_.string_ for AtomicString
-            if (!valStr) {
-                try {
-                    var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
-                    valStr = BlinkUnwrap._parseStringFromDxOutput(vOut2);
-                } catch (e) { }
-            }
-
-            // Path 3: Direct AtomicString impl access  
-            if (!valStr) {
-                try {
-                    var vOut3 = ctl.ExecuteCommand("dx -r2 " + base + ".value_.impl_");
-                    valStr = BlinkUnwrap._parseStringFromDxOutput(vOut3);
-                } catch (e) { }
-            }
-
-            // Path 4: Fallback to looking for any quoted string
-            if (!valStr) {
-                try {
-                    var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
-                    for (var line of vOut4) {
-                        var lineStr = line.toString();
-                        if (lineStr.indexOf("value_") !== -1 || lineStr.indexOf("Value") !== -1) {
-                            var m = lineStr.match(/"([^"]+)"/);
-                            if (m) { valStr = m[1]; break; }
-                        }
-                    }
-                } catch (e) { }
-            }
-
+            var valStr = BlinkUnwrap._extractAttributeValue(base);
             attrs.push({ name: name, value: valStr || "" });
         });
         return attrs;
@@ -943,50 +955,10 @@ class BlinkUnwrap {
     /// Get specific attribute value
     static getAttribute(elementAddr, attrName) {
         var val = null;
-        var ctl = SymbolUtils.getControl();
         BlinkUnwrap._traverseAttributes(elementAddr, (name, base) => {
             if (name === attrName) {
-                // Try multiple paths to extract the value
-                // Path 1: Direct value_ access with deeper recursion
-                try {
-                    var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
-                    val = BlinkUnwrap._parseStringFromDxOutput(vOut);
-                    if (val) return true;
-                } catch (e) { }
-
-                // Path 2: Try value_.string_ for AtomicString
-                try {
-                    var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
-                    val = BlinkUnwrap._parseStringFromDxOutput(vOut2);
-                    if (val) return true;
-                } catch (e) { }
-
-                // Path 3: Direct AtomicString impl access
-                try {
-                    var vOut3 = ctl.ExecuteCommand("dx -r2 " + base + ".value_.impl_");
-                    val = BlinkUnwrap._parseStringFromDxOutput(vOut3);
-                    if (val) return true;
-                } catch (e) { }
-
-                // Path 4: Fallback to looking for any quoted string in dx output
-                try {
-                    var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
-                    for (var line of vOut4) {
-                        var lineStr = line.toString();
-                        // Look for value_ with quoted string
-                        if (lineStr.indexOf("value_") !== -1 || lineStr.indexOf("Value") !== -1) {
-                            var m = lineStr.match(/"([^"]+)"/);
-                            if (m) { val = m[1]; return true; }
-                        }
-                    }
-                    // If still not found, try any quoted string after passing the name
-                    for (var line of vOut4) {
-                        var m = line.toString().match(/"([^"]+)"/);
-                        if (m) { val = m[1]; return true; }
-                    }
-                } catch (e) { }
-
-                return true; // Stop iteration even if not found
+                val = BlinkUnwrap._extractAttributeValue(base);
+                return true; // Stop iteration
             }
         });
         return val;
@@ -1279,15 +1251,23 @@ function frame_elements(idx, tagName) {
             var stack = [startNode];
             var visited = 0;
             var found = 0;
-            var MAX_NODES = 5000;
+            var maxNodes = MAX_DOM_TRAVERSAL_NODES;
+            var visitedSet = new Set(); // Track visited nodes to prevent infinite loops
 
             while (stack.length > 0) {
-                if (visited > MAX_NODES) {
-                    Logger.warn("  Traversal limit reached (" + MAX_NODES + " nodes).");
+                if (visited > maxNodes) {
+                    Logger.warn("  Traversal limit reached (" + maxNodes + " nodes).");
                     break;
                 }
 
                 var node = stack.pop();
+
+                // Skip if already visited (prevents infinite loops from corrupted DOM)
+                var nodeKey = node.toString();
+                if (visitedSet.has(nodeKey)) {
+                    continue;
+                }
+                visitedSet.add(nodeKey);
                 visited++;
 
                 // Process Node
@@ -1303,7 +1283,7 @@ function frame_elements(idx, tagName) {
 
                 // TRAVERSAL: Push Sibling then Child (DFS order: Process child first)
                 var sibling = BlinkUnwrap.getNextSibling(node);
-                if (sibling && sibling !== "0") {
+                if (sibling && sibling !== "0" && !visitedSet.has(sibling.toString())) {
                     stack.push(sibling);
                 }
 
@@ -1311,7 +1291,7 @@ function frame_elements(idx, tagName) {
                 // If nodeName is null (unknown), we assume it might have children and try anyway
                 if (!nodeName || (nodeName !== "#text" && nodeName !== "#comment" && nodeName !== "#doctype")) {
                     var child = BlinkUnwrap.getFirstChild(node);
-                    if (child && child !== "0") {
+                    if (child && child !== "0" && !visitedSet.has(child.toString())) {
                         stack.push(child);
                     }
                 }
@@ -1339,7 +1319,6 @@ function frame_elements(idx, tagName) {
     return "";
 }
 
-/// Get an attribute value from an element
 /// Get an attribute value from an element
 function frame_getattr(elementAddr, attrName) {
     if (isEmpty(elementAddr) || isEmpty(attrName)) {
@@ -1370,10 +1349,6 @@ function frame_getattr(elementAddr, attrName) {
     return "";
 }
 
-
-
-
-
 /// List all attributes of an element
 function frame_attrs(elementAddr, debug) {
     if (isEmpty(elementAddr)) {
@@ -1395,37 +1370,9 @@ function frame_attrs(elementAddr, debug) {
     }
 
     var attrs = [];
-    var ctl = SymbolUtils.getControl();
 
     BlinkUnwrap._traverseAttributes(elemHex, (name, base) => {
-        var valStr = "";
-
-        // Try multiple paths to extract the value
-        try {
-            var vOut = ctl.ExecuteCommand("dx -r3 " + base + ".value_");
-            valStr = BlinkUnwrap._parseStringFromDxOutput(vOut);
-        } catch (e) { }
-
-        if (!valStr) {
-            try {
-                var vOut2 = ctl.ExecuteCommand("dx -r3 " + base + ".value_.string_");
-                valStr = BlinkUnwrap._parseStringFromDxOutput(vOut2);
-            } catch (e) { }
-        }
-
-        if (!valStr) {
-            try {
-                var vOut4 = ctl.ExecuteCommand("dx -r4 " + base);
-                for (var line of vOut4) {
-                    var lineStr = line.toString();
-                    if (lineStr.indexOf("value_") !== -1) {
-                        var m = lineStr.match(/"([^"]+)"/);
-                        if (m) { valStr = m[1]; break; }
-                    }
-                }
-            } catch (e) { }
-        }
-
+        var valStr = BlinkUnwrap._extractAttributeValue(base);
         attrs.push({ name: name, value: valStr || "" });
     }, enableDebug);
 
@@ -2741,10 +2688,10 @@ function spoof_origin(targetUrl) {
                             var lenAddr = addrVal.add(lenOffsets[offsetIdx]);
                             var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
 
-                            // Check if this looks like a valid length field:
-                            // - Must be >= searchStr.length (could be capacity, not length)
-                            // - Must be reasonable (< 10000 chars for a URL)
-                            if (ptrVal >= searchStr.length && ptrVal <= searchStr.length + 10 && ptrVal < 10000) {
+                            // Memory safety: Only update length if we're confident this is the length field
+                            // - Must EXACTLY match searchStr.length (not just >= to prevent false positives)
+                            // - Must be reasonable (<MAX_URL_STRING_LENGTH chars for a URL)
+                            if (ptrVal === searchStr.length && ptrVal < MAX_URL_STRING_LENGTH) {
                                 // Update length to replaceStr.length
                                 var newLen = replaceStr.length;
                                 var writeCmd = "ed 0x" + lenAddr.toString(16) + " 0x" + newLen.toString(16);
@@ -3514,8 +3461,6 @@ function bp_bad_message() {
     return set_breakpoints(
         "Bad Message Breakpoints (Security Violations)",
         [
-            "chrome!mojo::ReportBadMessage",
-            "chrome!mojo::ReportBadMessage",
             "chrome!mojo::ReportBadMessage"
         ],
         "Breaking on security violations (check message string)"

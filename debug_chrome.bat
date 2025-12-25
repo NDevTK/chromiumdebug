@@ -14,6 +14,17 @@ SET "WINDBG_EXE=WinDbgX.exe"
 SET "SCRIPT_DIR=%~dp0"
 SET "WINDBG_SCRIPT=%SCRIPT_DIR%chromium_security.js"
 
+:: Validate Chrome Canary installation
+if not exist "%CHROME_PATH%" (
+    echo [ERROR] Chrome Canary not found at:
+    echo   %CHROME_PATH%
+    echo.
+    echo Please install Chrome Canary or update CHROME_PATH in this script.
+    echo Download: https://www.google.com/chrome/canary/
+    pause
+    exit /b 1
+)
+
 :: Generate unique profile directory to isolate debug sessions
 :: Uses relative path - DebugProfile folder next to this script
 for /f %%a in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TIMESTAMP=%%a"
