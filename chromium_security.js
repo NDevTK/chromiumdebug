@@ -9,6 +9,7 @@
 
 /// Global state
 var g_rendererAttachCommands = [];
+var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string}>
 
 /// Constants
 const MAX_PATCHES = 50;
@@ -2002,6 +2003,10 @@ function chrome_processes() {
             } else if (pInfo.extra) {
                 displayExtra = pInfo.extra;
             }
+            // Check for spoofing
+            if (g_spoofMap.has(pInfo.clientId)) {
+                displayExtra += " [SPOOFED: " + g_spoofMap.get(pInfo.clientId).currentUrl + "]";
+            }
         }
 
         var sysIdStr = pInfo.sysId !== null ? pInfo.sysId.toString() : "?";
@@ -2081,7 +2086,12 @@ function renderer_site() {
 
     Logger.empty();
     Logger.info("  Renderer Client ID: " + clientId);
-    Logger.info("  Locked Site:        " + site);
+    if (g_spoofMap.has(clientId)) {
+        Logger.info("  Locked Site:        " + site + " (Browser)");
+        Logger.info("  Spoofed Site:       " + g_spoofMap.get(clientId).currentUrl + " (Active)");
+    } else {
+        Logger.info("  Locked Site:        " + site);
+    }
     Logger.empty();
 
     return site;
@@ -2347,19 +2357,25 @@ function spoof_origin(targetUrl) {
     var targetScheme = targetMatch[1];
     var targetHost = targetMatch[2];
 
-    // Get current origin from renderer_site
+    // Get current origin from renderer_site (this is the TRUE browser-side origin)
     Logger.info("  Target: " + targetOrigin);
-    Logger.info("  Detecting current origin...");
+    Logger.info("  Detecting true origin...");
 
-    var currentOrigin = "";
+    var trueOrigin = "";
+    var clientId = null;
     try {
+        // We need to parse client ID to look up in spoof map
+        var cmdLine = getCommandLine();
+        var clientMatch = cmdLine ? cmdLine.match(/--renderer-client-id=(\d+)/) : null;
+        if (clientMatch) clientId = clientMatch[1];
+
         var site = renderer_site();
         if (site && site !== "" && site !== "(unknown)") {
-            currentOrigin = site.replace(/\/+$/, "");
+            trueOrigin = site.replace(/\/+$/, "");
         }
     } catch (e) { }
 
-    if (!currentOrigin) {
+    if (!trueOrigin) {
         Logger.empty();
         Logger.warn("Could not detect current origin.");
         Logger.info("Make sure you're in a renderer with a loaded page.");
@@ -2367,20 +2383,34 @@ function spoof_origin(targetUrl) {
         return "";
     }
 
+    // Determine what is currently in memory (Source)
+    var currentOrigin = trueOrigin;
+    if (clientId && g_spoofMap.has(clientId)) {
+        currentOrigin = g_spoofMap.get(clientId).currentUrl;
+        Logger.info("  [State] Detected active spoof: " + currentOrigin);
+    } else {
+        Logger.info("  [State] No active spoof detected. Using true origin.");
+    }
+
     // Parse current into scheme and host
     var currentMatch = currentOrigin.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
     if (!currentMatch) {
-        Logger.warn("Could not parse current origin: " + currentOrigin);
+        Logger.warn("Could not parse source origin: " + currentOrigin);
         return "";
     }
     var currentScheme = currentMatch[1];
     var currentHost = currentMatch[2];
 
-    Logger.info("  Current: " + currentOrigin);
+    if (currentOrigin === targetOrigin) {
+        Logger.info("  Target matches current detected origin. No changes needed.");
+        return "";
+    }
+
+    Logger.info("  Source: " + currentOrigin);
     Logger.info("  Current Host: " + currentHost + " -> Target Host: " + targetHost);
     Logger.empty();
 
-    // Helper function to patch strings (ASCII or Unicode)
+    // Helper function to patch strings (ASCII ONLY)
     function patchString(searchStr, replaceStr, label, isUnicode) {
         if (replaceStr.length > searchStr.length) {
             Logger.warn("  " + label + ": Replacement string too long (" + replaceStr.length + " > " + searchStr.length + "). Aborting to prevent overflow.");
@@ -2399,14 +2429,33 @@ function spoof_origin(targetUrl) {
             }
 
             if (addresses.length === 0) {
-                // optional: lessen noise by checking if we really expect it
-                // Logger.info("  " + label + ": No " + (isUnicode ? "Unicode" : "ASCII") + " matches found");
                 return 0;
             }
 
             var patched = 0;
             for (var addr of addresses) {
                 try {
+                    // Heuristic: Check if this is a StringImpl and patch length
+                    // StringImpl Layout (approx): RefCount(+0), Length(+4), Hash(+8), Data(+12)
+                    // So Length is at Data - 8.
+                    // Risk: If this is randomly a 5 on the stack, we change it to 4. Acceptable for debug tool.
+                    var addrVal = host.parseInt64(addr, 16);
+                    var lenAddr = addrVal.subtract(8);
+
+                    try {
+                        // Check if existing length matches searchStr.length
+                        var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
+                        if (ptrVal === searchStr.length) {
+                            // Update length to replaceStr.length
+                            var newLen = replaceStr.length;
+                            var writeCmd = "ed 0x" + lenAddr.toString(16) + " " + newLen;
+                            ctl.ExecuteCommand(writeCmd);
+                            // Logger.info("    (Adjusted StringImpl length at 0x" + lenAddr.toString(16) + ")");
+                        }
+                    } catch (e) {
+                        // Should not happen if addr is valid, but ignore
+                    }
+
                     var byteStr = "";
                     for (var i = 0; i < replaceStr.length; i++) {
                         var code = replaceStr.charCodeAt(i);
@@ -2439,7 +2488,7 @@ function spoof_origin(targetUrl) {
     // Patch protocol/scheme (SecurityOrigin's protocol_ field)
     if (currentScheme !== targetScheme) {
         totalPatched += patchString(currentScheme, targetScheme, "Scheme (ASCII)", false);
-        totalPatched += patchString(currentScheme, targetScheme, "Scheme (Unicode)", true);
+        // UNICODE PATCHING REMOVED
     } else {
         Logger.info("  Schemes are identical (" + currentScheme + "), skipping");
     }
@@ -2447,7 +2496,7 @@ function spoof_origin(targetUrl) {
     // Patch host (SecurityOrigin's host_ field)
     if (currentHost !== targetHost) {
         totalPatched += patchString(currentHost, targetHost, "Host (ASCII)", false);
-        totalPatched += patchString(currentHost, targetHost, "Host (Unicode)", true);
+        // UNICODE PATCHING REMOVED
     } else {
         Logger.info("  Hosts are identical (" + currentHost + "), skipping");
     }
@@ -2455,6 +2504,19 @@ function spoof_origin(targetUrl) {
     Logger.empty();
     Logger.info("  Total: Patched " + totalPatched + " locations");
     Logger.empty();
+
+    // Update State
+    if (clientId) {
+        if (targetOrigin === trueOrigin) {
+            Logger.info("  Reverted to true origin. Clearing spoof state.");
+            g_spoofMap.delete(clientId);
+        } else {
+            Logger.info("  Spoof active. Updating state.");
+            g_spoofMap.set(clientId, { currentUrl: targetOrigin });
+        }
+    } else {
+        Logger.warn("  Could not determine Client ID. State not updated.");
+    }
 
     return "";
 }
