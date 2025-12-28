@@ -13,6 +13,7 @@ var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string, pid: number}>
 var g_exitHandlerRegistered = false;
 
 /// Constants
+const DEBUG_MODE = false; // Set to true to enable verbose error logging
 const MAX_PATCHES = 50;
 const MAX_CALLER_DISPLAY = 3;
 const BROWSER_CMDLINE_MIN_LENGTH = 500;
@@ -21,10 +22,23 @@ const MIN_PTR_VALUE_LENGTH = 4;
 const MAX_DOM_TRAVERSAL_NODES = 5000;
 const STRINGIMPL_DATA_OFFSET = 12; // Offset from StringImpl to character data
 const MAX_URL_STRING_LENGTH = 10000; // Maximum reasonable URL length for validation
+const MAX_BACKWARD_SCAN_BYTES = 1536; // 1.5KB backward scan limit for vtable detection
+const MAX_INTEGRITY_DISPLAY_LENGTH = 25; // Truncation length for integrity level display
+const CMDLINE_DISPLAY_LENGTH = 200; // Truncation length for command line display
+const ELEMENT_DATA_UNIQUE_FLAG = 0x1; // Bit 0 indicates UniqueElementData vs ShareableElementData
+const ELEMENT_DATA_ARRAY_SIZE_MASK = 0xFFFFFFF; // Bits 1-28 contain array size
+const MIN_VALID_VTABLE_ADDR = 0x10000; // Minimum valid address for vtable pointer validation
 
 /// Helper: Check if string is empty or null
 function isEmpty(str) {
     return !str || str === "";
+}
+
+/// Helper: Parse integer from string, auto-detecting hex (0x prefix) or decimal
+function parseIntAuto(str) {
+    if (!str) return 0;
+    var s = str.toString().trim();
+    return s.startsWith("0x") || s.startsWith("0X") ? parseInt(s, 16) : parseInt(s, 10);
 }
 
 /// Helper: Register sxe cpr handler for renderer attach
@@ -74,6 +88,13 @@ class Logger {
         this.log("  [ERROR] " + msg + "\n\n");
     }
 
+    /// Debug output - only logs when DEBUG_MODE is true
+    static debug(msg) {
+        if (DEBUG_MODE) {
+            this.log("  [DEBUG] " + msg + "\n");
+        }
+    }
+
     static separator(width = 40) {
         this.log("  " + "-".repeat(width) + "\n");
     }
@@ -118,13 +139,13 @@ class SymbolUtils {
                 var addr = this.extractAddress(line);
                 if (addr) return addr;
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("findSymbolAddress failed: " + e.message); }
         return null;
     }
 
     /// Execute command with fallback on error (DRY helper)
     static tryExecute(cmd, fallback = []) {
-        try { return this.getControl().ExecuteCommand(cmd); } catch (e) { return fallback; }
+        try { return this.getControl().ExecuteCommand(cmd); } catch (e) { Logger.debug("tryExecute '" + cmd + "' failed: " + e.message); return fallback; }
     }
 
     static execute(cmd) {
@@ -139,7 +160,7 @@ class SymbolUtils {
                 var match = line.toString().match(/=\s+([0-9a-fA-F`]+)/);
                 if (match) return match[1].replace(/`/g, "");
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("evaluate failed: " + e.message); }
         return null;
     }
 
@@ -198,7 +219,7 @@ class MemoryUtils {
                     if (dMatch) return dMatch[1].replace(/`/g, "");
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("readGlobalPointer failed for " + symbolName + ": " + e.message); }
         return null;
     }
 
@@ -233,8 +254,8 @@ class MemoryUtils {
         var compressed = this.parseBigInt(compressedPtr);
 
         // Sign-extend 32-bit (V8 uses signed offsets)
-        if (compressed > 0x7FFFFFFF) {
-            compressed = compressed - BigInt("0x100000000");
+        if (compressed > 0x7FFFFFFFn) {
+            compressed = compressed - 0x100000000n;
         }
 
         var fullPtr = base + compressed;
@@ -248,8 +269,8 @@ class MemoryUtils {
         var compressed = this.parseBigInt(compressedPtr);
         if (compressed === 0n) return null;
 
-        // Sign-extend if necessary
-        if (compressed < 0n) compressed = compressed & 0xFFFFFFFFn;
+        // Mask to 32-bit unsigned value
+        compressed = compressed & 0xFFFFFFFFn;  // Use BigInt literal for consistency
 
         // Shift
         var offset = compressed << kPointerCompressionShift;
@@ -260,7 +281,7 @@ class MemoryUtils {
             try {
                 var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
                 base = context & kCageBaseMask;
-            } catch (e) { }
+            } catch (e) { Logger.debug("Context address parse failed: " + e.message); }
         }
 
         if (base === 0n) {
@@ -302,9 +323,8 @@ class MemoryUtils {
     /// Write a 64-bit integer (U64)
     static writeU64(addr, value) {
         var ctl = SymbolUtils.getControl();
+        // toString(16) works for both Number and BigInt
         var valStr = value.toString(16);
-        // Handle BigInt if passed
-        if (typeof value === 'bigint') valStr = value.toString(16);
         var cmd = "eq 0x" + addr + " 0x" + valStr;
         ctl.ExecuteCommand(cmd);
     }
@@ -316,7 +336,6 @@ class MemoryUtils {
 
         var is8Bit = true; // Default to 8-bit (ASCII) - most strings are ASCII
         var currentLen = 0;
-        var headerParsed = false;
         var flags = 0;
 
         // Try raw memory read first (more reliable than dx symbols sometimes)
@@ -333,7 +352,6 @@ class MemoryUtils {
                     // parts[1] = RefCount, parts[2] = Length, parts[3] = Hash/Flags
                     currentLen = parseInt(parts[2], 16);
                     flags = parseInt(parts[3], 16);
-                    headerParsed = true;
 
                     // In WTF::StringImpl, the is_8bit flag is typically in the lower bits
                     // If bit 0 of hash_and_flags is 1, it's 8-bit
@@ -343,7 +361,7 @@ class MemoryUtils {
                 }
                 break;
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("writeStringImpl header read failed: " + e.message); }
 
         // Try dx for is8Bit if raw didn't confirm
         try {
@@ -364,11 +382,11 @@ class MemoryUtils {
             Logger.warn("  [Warning] Length detected as 0. This might be empty string OR read failure.");
             // If we write to 0 length, we corrupt memory if it's not actually 0.
             // If target string is empty, we shouldn't be here (attr loop check).
-            // But let's allow writing if user forces? No, unsafe.
+            // Memory safety: Do not proceed if we can't verify the length field.
             if (newString.length > 0) {
                 Logger.error("Cannot overwrite: Existing string length appears to be 0 or unreadable.");
-                return;
             }
+            return; // Always return when currentLen is 0 to prevent memory corruption
         }
 
         if (newString.length > currentLen) {
@@ -391,7 +409,7 @@ class MemoryUtils {
                 var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
                 if (m) dataAddr = m[1];
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("writeStringImpl dx characters failed: " + e.message); }
 
         // Fallback: Assume offset 12 (packed) or 16 (aligned)
         if (!dataAddr) {
@@ -400,33 +418,20 @@ class MemoryUtils {
             // Let's assume +12 if header is 3x4 bytes.
             // But on x64, 16 is safer guess?
             var baseInt = BigInt(hexAddr);
-            // Verify if data is at +16
-            // We can check if existing chars match?
-            // Too complex.
-            // Let's default to +16 for x64.
-            var offset = 16n; // 12 + 4 padding
-            // Wait, flags is at +8. +12 might be data?
-            // If is8Bit, it might be +12.
-            // If 16Bit, it must be aligned?
-            // Layout Analysis:
-            // +0: RefCount
-            // +4: Length
-            // +8: Hash/Flags
-            // +12: Data Start (packed)
-            dataAddr = (baseInt + 12n).toString(16);
+            // Data starts after header (RefCount:4 + Length:4 + Hash/Flags:4 = 12 bytes)
+            // Use the defined constant for consistency
+            dataAddr = (baseInt + BigInt(STRINGIMPL_DATA_OFFSET)).toString(16);
             Logger.warn("  [Warning] guessing data address at offset +0xC.");
         }
 
         // Write
+        var bytes = [];
         if (is8Bit) {
-            var bytes = [];
             for (var i = 0; i < newString.length; i++) bytes.push(newString.charCodeAt(i));
             // Pad remainder with nulls
             while (bytes.length < currentLen) bytes.push(0);
-            this.writeMemory(dataAddr, bytes);
         } else {
             // 16-bit write
-            var bytes = [];
             for (var i = 0; i < newString.length; i++) {
                 var c = newString.charCodeAt(i);
                 bytes.push(c & 0xFF);
@@ -434,8 +439,8 @@ class MemoryUtils {
             }
             // Pad remainder with nulls (2 bytes per char)
             while (bytes.length < currentLen * 2) bytes.push(0);
-            this.writeMemory(dataAddr, bytes);
         }
+        this.writeMemory(dataAddr, bytes);
 
         // Update length
         // ed expects hex by default (usually), or we explicitly use 0x prefix.
@@ -466,8 +471,13 @@ class CommandLineUtils {
         return switches;
     }
 
+    static escapeRegExp(str) {
+        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
     static getSwitch(cmdLine, name) {
-        var match = cmdLine.match(new RegExp("--" + name + "(=([^\\s\"]+|\"[^\"]*\"))?"));
+        var escapedName = this.escapeRegExp(name);
+        var match = cmdLine.match(new RegExp("--" + escapedName + "(=([^\\s\"]+|\"[^\"]*\"))?"));
         return match ? (match[2] || "true").replace(/"/g, "") : null;
     }
 
@@ -490,7 +500,7 @@ class BreakpointManager {
             var cmd = (typeof t === 'string') ? ("bp " + t) : (t.cmd ? t.cmd : "bp " + t.sym);
 
             Logger.info(cmd + desc);
-            try { ctl.ExecuteCommand(cmd); } catch (e) { }
+            try { ctl.ExecuteCommand(cmd); } catch (e) { Logger.debug("Breakpoint set failed for " + sym + ": " + e.message); }
         }
 
         if (description) Logger.info("Useful for: " + description + "\n");
@@ -614,6 +624,17 @@ function normalizeAddress(addr) {
     }
 }
 
+/// Helper: Check if a pointer value is valid (not null/zero)
+/// Handles various representations: null, "0", "00000000", 0, BigInt(0), etc.
+function isValidPointer(ptr) {
+    if (ptr === null || ptr === undefined) return false;
+    if (ptr === 0 || ptr === 0n) return false;
+    var str = ptr.toString().replace(/`/g, "");
+    if (str === "0" || str === "00000000" || str === "0000000000000000") return false;
+    if (str === "0x0" || str === "0x00000000" || str === "0x0000000000000000") return false;
+    return true;
+}
+
 /// Helper: Get a compressed member pointer value using symbols
 /// @param baseAddr - Base address (with or without 0x prefix)
 /// @param typeCast - Type cast string, e.g. "(blink::WebLocalFrameImpl*)"
@@ -635,7 +656,7 @@ function getCompressedMember(baseAddr, typeCast, memberName) {
                 } catch (e) { Logger.error("ReadMem failed: " + e.message); }
             }
         }
-    } catch (e) { }
+    } catch (e) { Logger.debug("getCompressedMember failed: " + e.message); }
     return null;
 }
 
@@ -655,8 +676,100 @@ function readUrlStringFromDx(addr, typeCast) {
                 if (m) return m[1];
             }
         }
-    } catch (e) { }
+    } catch (e) { Logger.debug("readUrlStringFromDx failed: " + e.message); }
     return null;
+}
+
+/// Helper: Patch strings in memory (used by spoof_origin)
+/// @param ctl - Debugger control object
+/// @param searchStr - String to search for
+/// @param replaceStr - Replacement string
+/// @param label - Label for logging
+/// @param isUnicode - Whether to search for Unicode strings
+/// @returns Number of patched occurrences
+function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
+    if (replaceStr.length > searchStr.length) {
+        Logger.warn("  " + label + ": Replacement string too long (" + replaceStr.length + " > " + searchStr.length + "). Aborting to prevent overflow.");
+        return 0;
+    }
+
+    try {
+        var cmdType = isUnicode ? "-u" : "-a";
+        var searchCmd = 's ' + cmdType + ' 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
+        var output = ctl.ExecuteCommand(searchCmd);
+
+        var addresses = [];
+        for (var line of output) {
+            var addr = SymbolUtils.extractAddress(line);
+            if (addr) addresses.push(addr);
+        }
+
+        if (addresses.length === 0) {
+            return 0;
+        }
+
+        var patched = 0;
+        for (var addr of addresses) {
+            try {
+                // StringImpl Layout (approx): RefCount(+0), Length(+4), Hash(+8), Data(+12)
+                // So Length is at Data - 8.
+                // Try multiple offsets to find the length field for variable-length string support
+                var addrVal = host.parseInt64(addr, 16);
+                var lengthUpdated = false;
+
+                // Try multiple offsets for StringImpl length field:
+                // -8: Standard layout (Data at +12, Length at +4, so Data - Length = -8)
+                // -4: Alternate layout with different padding
+                // -12: Older StringImpl layouts
+                var lenOffsets = [-8, -4, -12];
+                for (var offsetIdx = 0; offsetIdx < lenOffsets.length && !lengthUpdated; offsetIdx++) {
+                    try {
+                        var lenAddr = addrVal.add(lenOffsets[offsetIdx]);
+                        var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
+
+                        // Memory safety: Only update length if we're confident this is the length field
+                        // - Must EXACTLY match searchStr.length (not just >= to prevent false positives)
+                        // - Must be reasonable (<MAX_URL_STRING_LENGTH chars for a URL)
+                        if (ptrVal === searchStr.length && ptrVal < MAX_URL_STRING_LENGTH) {
+                            // Update length to replaceStr.length
+                            var newLen = replaceStr.length;
+                            MemoryUtils.writeU32(lenAddr, newLen);
+                            lengthUpdated = true;
+                        }
+                    } catch (e) {
+                        // Ignore read errors, try next offset
+                    }
+                }
+
+                // Write the replacement string data
+                var bytes = [];
+                for (var i = 0; i < replaceStr.length; i++) {
+                    var code = replaceStr.charCodeAt(i);
+                    if (isUnicode) {
+                        bytes.push(code & 0xFF);
+                        bytes.push((code >> 8) & 0xFF);
+                    } else {
+                        bytes.push(code & 0xFF);
+                    }
+                }
+
+                // Pad remainder with nulls to overwrite old longer string
+                for (var k = replaceStr.length; k < searchStr.length; k++) {
+                    if (isUnicode) { bytes.push(0); bytes.push(0); }
+                    else bytes.push(0);
+                }
+
+                MemoryUtils.writeMemory(addr, bytes);
+                patched++;
+            } catch (e) { Logger.debug("Memory write failed at " + addr + ": " + e.message); }
+        }
+
+        Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " " + (isUnicode ? "Unicode" : "ASCII") + " occurrences");
+        return patched;
+    } catch (e) {
+        Logger.debug("_patchStringInMemory failed: " + e.message);
+        return 0;
+    }
 }
 
 /// =============================================================================
@@ -668,7 +781,8 @@ class BlinkUnwrap {
     /// Get LocalFrame from WebLocalFrameImpl
     /// Path: WebLocalFrameImpl -> frame_ (compressed) -> LocalFrame
     static getLocalFrame(webFrameAddr) {
-        var webFrameHex = webFrameAddr.toString().startsWith("0x") ? webFrameAddr : "0x" + webFrameAddr;
+        var webFrameHex = normalizeAddress(webFrameAddr);
+        if (!webFrameHex) return null;
         var frameCompressed = getCompressedMember(webFrameHex, "(blink::WebLocalFrameImpl*)", "frame_");
         if (frameCompressed === null) return null;
         return MemoryUtils.decompressCppgcPtr(frameCompressed, webFrameAddr);
@@ -677,7 +791,8 @@ class BlinkUnwrap {
     /// Get LocalDOMWindow from LocalFrame
     /// Path: LocalFrame -> dom_window_ (compressed) -> LocalDOMWindow
     static getDomWindow(localFrameAddr) {
-        var frameHex = localFrameAddr.toString().startsWith("0x") ? localFrameAddr : "0x" + localFrameAddr;
+        var frameHex = normalizeAddress(localFrameAddr);
+        if (!frameHex) return null;
         var windowCompressed = getCompressedMember(frameHex, "(blink::LocalFrame*)", "dom_window_");
         if (windowCompressed === null) return null;
         return MemoryUtils.decompressCppgcPtr(windowCompressed, localFrameAddr);
@@ -686,7 +801,8 @@ class BlinkUnwrap {
     /// Get Document from LocalDOMWindow
     /// Path: LocalDOMWindow -> document_ (compressed) -> Document
     static getDocument(domWindowAddr) {
-        var windowHex = domWindowAddr.toString().startsWith("0x") ? domWindowAddr : "0x" + domWindowAddr;
+        var windowHex = normalizeAddress(domWindowAddr);
+        if (!windowHex) return null;
         var docCompressed = getCompressedMember(windowHex, "(blink::LocalDOMWindow*)", "document_");
         if (docCompressed === null) return null;
         return MemoryUtils.decompressCppgcPtr(docCompressed, domWindowAddr);
@@ -703,7 +819,8 @@ class BlinkUnwrap {
     static getSecurityOriginUrl(documentAddr) {
         try {
             var ctl = SymbolUtils.getControl();
-            var docHex = documentAddr.toString().startsWith("0x") ? documentAddr : "0x" + documentAddr;
+            var docHex = normalizeAddress(documentAddr);
+            if (!docHex) return null;
             var cmd = "dx -r3 ((blink::Document*)" + docHex + ")->GetExecutionContext()->GetSecurityOrigin()->ToUrlOrigin().GetDebugString()";
             var output = ctl.ExecuteCommand(cmd);
             for (var line of output) {
@@ -766,11 +883,11 @@ class BlinkUnwrap {
         if (!objHex) return false;
 
         var ctl = SymbolUtils.getControl();
+        var addrCmd = ""; // Declared outside try for error reporting
         try {
             // First get the address of the member
-            var addrCmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
+            addrCmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
             var addrOutput = ctl.ExecuteCommand(addrCmd);
-            var memberAddr = null;
             var memberAddr = null;
             for (var line of addrOutput) {
                 // Fix: Require space after colon
@@ -783,7 +900,6 @@ class BlinkUnwrap {
             if (!memberAddr) return false;
 
             // Determine value format
-            var writeValue = value;
             var writeValue = value;
             if (typeof value === "string") {
                 if (value.toLowerCase() === "true") writeValue = "1";
@@ -818,7 +934,6 @@ class BlinkUnwrap {
         } catch (e) {
             Logger.error("setCppMember failed: " + e.message);
             Logger.info("Command was: " + (typeof addrCmd !== 'undefined' ? addrCmd : "addrCmd not set"));
-            Logger.info("Write cmd: " + (typeof writeCmd !== 'undefined' ? writeCmd : "writeCmd not set"));
         }
         return false;
     }
@@ -872,23 +987,11 @@ class BlinkUnwrap {
                     members.push({ name: noColonMatch[1], value: "{...}", type: noColonMatch[2] });
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("getCppMembers parse error: " + e.message); }
         return members;
     }
 
-    /// Common Blink type casts to try when type is unknown
-    static get BLINK_TYPE_CASTS() {
-        return [
-            "(blink::LocalFrame*)",
-            "(blink::Document*)",
-            "(blink::LocalDOMWindow*)",
-            "(blink::Element*)",
-            "(blink::Node*)",
-            "(blink::SecurityOrigin*)",
-            "(blink::HTMLIFrameElement*)",
-            "(blink::HTMLElement*)"
-        ];
-    }
+
 
 
 
@@ -918,8 +1021,9 @@ class BlinkUnwrap {
                     var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
                     if (matchMangled) {
                         var rawName = matchMangled[1];
-                        if (rawName.endsWith("blink") && rawName.length > 5) {
-                            rawName = rawName.substring(0, rawName.length - 5);
+                        // Strip "blink" suffix from mangled names (5 = "blink".length)
+                        if (rawName.endsWith("blink") && rawName.length > "blink".length) {
+                            rawName = rawName.substring(0, rawName.length - "blink".length);
                         }
                         var fullType = (rawName.indexOf("::") === -1) ? "blink::" + rawName : rawName;
                         if (debug) Logger.info("  [Debug] Detected Type (Mangled): " + fullType);
@@ -940,7 +1044,8 @@ class BlinkUnwrap {
             var targetAddrInt = BigInt(objHex);
 
             // Scan backwards up to 1.5KB (Blink objects can be large)
-            for (var offset = 8; offset < 1536; offset += 8) {
+            // Increment by 8 bytes (pointer size on 64-bit) to check each potential vtable location
+            for (var offset = 8; offset < MAX_BACKWARD_SCAN_BYTES; offset += 8) {
                 var candidateAddrBase = targetAddrInt - BigInt(offset);
                 var candidateHex = "0x" + candidateAddrBase.toString(16);
 
@@ -950,7 +1055,7 @@ class BlinkUnwrap {
                 } catch (re) { continue; }
 
                 // Check if this value is a symbol ending in ::vftable or ??_7
-                if (val.compareTo(0x10000) < 0) continue;
+                if (val.compareTo(MIN_VALID_VTABLE_ADDR) < 0) continue;
                 var sym = SymbolUtils.getSymbolName(val.toString(16));
 
                 if (sym && (sym.indexOf("::vftable") !== -1 || sym.indexOf("??_7") !== -1)) {
@@ -987,29 +1092,17 @@ class BlinkUnwrap {
         return null;
     }
 
-    /// Get C++ member with fallback across multiple Blink types
+    /// Get C++ member using detected type
     /// @param objectAddr - Address of the object
     /// @param memberPath - Member name
     /// @returns Object with {value, type, raw, typeCast} or null
     static getCppMemberWithFallback(objectAddr, memberPath) {
-        // 1. Try detected type first
+        // Try detected type
         var detectedType = this.detectType(objectAddr);
         if (detectedType) {
             var result = this.getCppMember(objectAddr, detectedType, memberPath);
             if (result) {
                 result.typeCast = detectedType;
-                return result;
-            }
-        }
-
-        // 2. Fallback to list
-        for (var typeCast of this.BLINK_TYPE_CASTS) {
-            // Skip if identical to detected (already tried)
-            if (typeCast === detectedType) continue;
-
-            var result = this.getCppMember(objectAddr, typeCast, memberPath);
-            if (result) {
-                result.typeCast = typeCast;
                 return result;
             }
         }
@@ -1051,23 +1144,21 @@ class BlinkUnwrap {
         return null;
     }
 
-    /// Set C++ member with fallback across multiple Blink types
+    /// Set C++ member using detected type
     /// @param objectAddr - Address of the object
     /// @param memberPath - Member name
     /// @param value - Value to write
     /// @returns true if successful
     static setCppMemberWithFallback(objectAddr, memberPath, value) {
-        for (var typeCast of this.BLINK_TYPE_CASTS) {
-            if (this.setCppMember(objectAddr, typeCast, memberPath, value)) {
+        var detectedType = this.detectType(objectAddr);
+        if (detectedType) {
+            if (this.setCppMember(objectAddr, detectedType, memberPath, value)) {
                 return true;
             }
         }
         return false;
     }
 
-    /// Get C++ members with fallback across multiple Blink types
-    /// @param objectAddr - Address of the object
-    /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
     /// Get C++ members with fallback across multiple Blink types
     /// @param objectAddr - Address of the object
     /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
@@ -1095,7 +1186,8 @@ class BlinkUnwrap {
 
     /// Get first child of a node (ContainerNode::first_child_)
     static getFirstChild(nodeAddr) {
-        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var nodeHex = normalizeAddress(nodeAddr);
+        if (!nodeHex) return null;
         var childCompressed = getCompressedMember(nodeHex, "(blink::ContainerNode*)", "first_child_");
         if (childCompressed === null) return null;
         var res = MemoryUtils.decompressCppgcPtr(childCompressed, nodeAddr);
@@ -1104,7 +1196,8 @@ class BlinkUnwrap {
 
     /// Get next sibling of a node (Node::next_)
     static getNextSibling(nodeAddr) {
-        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var nodeHex = normalizeAddress(nodeAddr);
+        if (!nodeHex) return null;
         var siblingCompressed = getCompressedMember(nodeHex, "(blink::Node*)", "next_");
         if (siblingCompressed === null) return null;
         return MemoryUtils.decompressCppgcPtr(siblingCompressed, nodeAddr);
@@ -1198,7 +1291,8 @@ class BlinkUnwrap {
     /// Get node name (tag name)
     static getNodeName(nodeAddr) {
         var ctl = SymbolUtils.getControl();
-        var nodeHex = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var nodeHex = normalizeAddress(nodeAddr);
+        if (!nodeHex) return null;
 
         try {
             // Read node_flags_ to check type (avoid virtual calls)
@@ -1208,10 +1302,9 @@ class BlinkUnwrap {
             for (var line of output) {
                 var s = line.toString();
                 // Match decimal or hex from "node_flags_ : value"
-                var m = s.match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                var m = s.match(/:[ ]*(0x[0-9a-fA-F]+|\d+)/);
                 if (m) {
-                    var valStr = m[1];
-                    flags = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                    flags = parseIntAuto(m[1]);
                     break;
                 }
             }
@@ -1265,7 +1358,7 @@ class BlinkUnwrap {
         }
 
         // If compressed pointer approach failed, try direct dx access
-        if (!dataCompressed || dataCompressed == 0n) {
+        if (!dataCompressed || dataCompressed === 0) {
             // Try direct dx to see if element_data_ exists
             if (debug) {
                 try {
@@ -1287,7 +1380,7 @@ class BlinkUnwrap {
             Logger.info("  [Debug] ElementData decompressed: 0x" + dataAddr);
         }
 
-        if (!dataAddr || dataAddr === "0") return;
+        if (!isValidPointer(dataAddr)) return;
 
         // Bitfield
         var bitField = 0;
@@ -1297,15 +1390,14 @@ class BlinkUnwrap {
             for (var line of output) {
                 var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
                 if (m) {
-                    var valStr = m[1];
-                    bitField = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                    bitField = parseIntAuto(m[1]);
                     break;
                 }
             }
         } catch (e) { }
 
-        var isUnique = bitField & 1;
-        var arraySize = (bitField >> 1) & 0xFFFFFFF;
+        var isUnique = bitField & ELEMENT_DATA_UNIQUE_FLAG;
+        var arraySize = (bitField >> 1) & ELEMENT_DATA_ARRAY_SIZE_MASK;
         var count = isUnique ? 0 : arraySize;
 
         if (debug) {
@@ -1319,10 +1411,9 @@ class BlinkUnwrap {
                 for (var line of sizeOut) {
                     if (debug) Logger.info("  [Debug] attribute_vector_.size_ output: " + line.toString());
                     // Match both hex (0x1) and decimal (1) values
-                    var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                    var m = line.toString().match(/:[ ]*(0x[0-9a-fA-F]+|\d+)/);
                     if (m) {
-                        var valStr = m[1];
-                        count = valStr.startsWith("0x") ? parseInt(valStr, 16) : parseInt(valStr);
+                        count = parseIntAuto(m[1]);
                         break;
                     }
                 }
@@ -1369,7 +1460,7 @@ class BlinkUnwrap {
                 if (nameStr) {
                     if (callback(nameStr, base) === true) return;
                 }
-            } catch (e) { }
+            } catch (e) { Logger.debug("Attribute traversal error at index " + i + ": " + e.message); }
         }
     }
 
@@ -1419,7 +1510,11 @@ class BlinkUnwrap {
 
     /// Inspect a Blink Node using robust logic
     static inspectNode(nodeAddr) {
-        var addr = nodeAddr.toString().startsWith("0x") ? nodeAddr : "0x" + nodeAddr;
+        var addr = normalizeAddress(nodeAddr);
+        if (!addr) {
+            Logger.error("Invalid node address");
+            return;
+        }
         Logger.section("Blink Object Inspection: " + addr);
 
         // Use robust name resolution
@@ -1534,21 +1629,21 @@ function frame_document(idx) {
     Logger.section("Frame Document - Index " + frameIdx);
 
     var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
-    if (!localFrame || localFrame === "0") {
+    if (!isValidPointer(localFrame)) {
         Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
         return "";
     }
     Logger.info("LocalFrame:      0x" + localFrame);
 
     var domWindow = BlinkUnwrap.getDomWindow(localFrame);
-    if (!domWindow || domWindow === "0") {
+    if (!isValidPointer(domWindow)) {
         Logger.error("Could not get LocalDOMWindow from LocalFrame");
         return "";
     }
     Logger.info("LocalDOMWindow:  0x" + domWindow);
 
     var document = BlinkUnwrap.getDocument(domWindow);
-    if (!document || document === "0") {
+    if (!isValidPointer(document)) {
         Logger.error("Could not get Document from LocalDOMWindow");
         return "";
     }
@@ -1584,14 +1679,14 @@ function frame_window(idx) {
     Logger.section("Frame Window - Index " + frameIdx);
 
     var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
-    if (!localFrame || localFrame === "0") {
+    if (!isValidPointer(localFrame)) {
         Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
         return "";
     }
     Logger.info("LocalFrame:      0x" + localFrame);
 
     var domWindow = BlinkUnwrap.getDomWindow(localFrame);
-    if (!domWindow || domWindow === "0") {
+    if (!isValidPointer(domWindow)) {
         Logger.error("Could not get LocalDOMWindow from LocalFrame");
         return "";
     }
@@ -1624,19 +1719,19 @@ function frame_origin(idx) {
     Logger.section("Frame Origin - Index " + frameIdx);
 
     var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
-    if (!localFrame || localFrame === "0") {
+    if (!isValidPointer(localFrame)) {
         Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
         return "";
     }
 
     var domWindow = BlinkUnwrap.getDomWindow(localFrame);
-    if (!domWindow || domWindow === "0") {
+    if (!isValidPointer(domWindow)) {
         Logger.error("Could not get LocalDOMWindow from LocalFrame");
         return "";
     }
 
     var document = BlinkUnwrap.getDocument(domWindow);
-    if (!document || document === "0") {
+    if (!isValidPointer(document)) {
         Logger.error("Could not get Document from LocalDOMWindow");
         return "";
     }
@@ -1676,13 +1771,13 @@ function frame_elements(idx, tagName) {
     Logger.section("Frame Elements - Index " + frameIdx + (filterTag ? " (tag: " + filterTag + ")" : ""));
 
     var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
-    if (!localFrame || localFrame === "0") {
+    if (!isValidPointer(localFrame)) {
         Logger.error("Could not get LocalFrame from WebLocalFrameImpl");
         return "";
     }
 
     var document = BlinkUnwrap.getDocumentFromFrame(localFrame);
-    if (!document || document === "0") {
+    if (!isValidPointer(document)) {
         Logger.error("Could not get Document from LocalFrame");
         return "";
     }
@@ -1716,7 +1811,7 @@ function frame_elements(idx, tagName) {
                 var node = stack.pop();
 
                 // Skip if already visited (prevents infinite loops from corrupted DOM)
-                var nodeKey = node.toString();
+                var nodeKey = normalizeAddress(node);
                 if (visitedSet.has(nodeKey)) {
                     continue;
                 }
@@ -1736,7 +1831,8 @@ function frame_elements(idx, tagName) {
 
                 // TRAVERSAL: Push Sibling then Child (DFS order: Process child first)
                 var sibling = BlinkUnwrap.getNextSibling(node);
-                if (sibling && sibling !== "0" && !visitedSet.has(sibling.toString())) {
+                var siblingKey = sibling ? normalizeAddress(sibling) : null;
+                if (sibling && sibling !== "0" && siblingKey && !visitedSet.has(siblingKey)) {
                     stack.push(sibling);
                 }
 
@@ -1744,7 +1840,8 @@ function frame_elements(idx, tagName) {
                 // If nodeName is null (unknown), we assume it might have children and try anyway
                 if (!nodeName || (nodeName !== "#text" && nodeName !== "#comment" && nodeName !== "#doctype")) {
                     var child = BlinkUnwrap.getFirstChild(node);
-                    if (child && child !== "0" && !visitedSet.has(child.toString())) {
+                    var childKey = child ? normalizeAddress(child) : null;
+                    if (child && child !== "0" && childKey && !visitedSet.has(childKey)) {
                         stack.push(child);
                     }
                 }
@@ -1865,15 +1962,15 @@ function frame_attrs(objectAddr, debug) {
             // To be robust, let's just use the cached or find cage.
             if (!MemoryUtils._cppgcCageBase) MemoryUtils.findCageBases();
 
-            var ptrVal = 0n;
+            var ptrVal = null;
             if (MemoryUtils._cppgcCageBase) {
                 ptrVal = MemoryUtils.decompressCppgcPtr(val32);
             }
 
             if (val32 === 0) {
                 Logger.info("  [Analysis] Member/Pointer is NULL (0x0).");
-            } else if (ptrVal && ptrVal > 0n) {
-                var targetHex = "0x" + ptrVal.toString(16);
+            } else if (ptrVal && ptrVal !== "0") {
+                var targetHex = "0x" + ptrVal;
                 Logger.info("  [Analysis] Address contains a generic pointer or Member<T>.");
                 Logger.info("  Value: " + targetHex);
                 Logger.info("  !frame_attrs " + targetHex);
@@ -1898,7 +1995,6 @@ function frame_attrs(objectAddr, debug) {
 
             // If value is {...} or a complex object, try to get its address
             if (displayVal === "{...}" || displayVal.indexOf("{...}") !== -1) {
-                // Get the member's pointer address
                 // Get the member's pointer address
                 var memberAddr = BlinkUnwrap.getMemberPointer(objHex, result.typeCast, m.name);
                 if (memberAddr) {
@@ -2183,6 +2279,17 @@ function initializeScript() {
     ];
 }
 
+/// Clean up global state when script is unloaded (prevents issues on reload)
+function uninitializeScript() {
+    // Reset global state to prevent stale data on script reload
+    g_rendererAttachCommands = [];
+    g_spoofMap.clear();
+    g_exitHandlerRegistered = false;
+
+    // Invalidate cached memory addresses
+    MemoryUtils.invalidateCaches();
+}
+
 /// Initialize the Chrome debugging environment
 function chrome_init() {
     Logger.header("Chromium Security Research Debugger - Initialized");
@@ -2248,7 +2355,7 @@ function help() {
     Logger.info("  !bp_fetch             - Break on Fetch/XHR");
     Logger.empty();
 
-    Logger.info("PER-FRAME DOM INSPECTION (DOM attrs + C++ members):");
+    Logger.info("PER-FRAME INSPECTION (DOM attrs + C++ members):");
     Logger.info("  !frame_doc(idx)       - Get Document for frame at index");
     Logger.info("  !frame_win(idx)       - Get LocalDOMWindow for frame at index");
     Logger.info("  !frame_origin(idx)    - Get SecurityOrigin for frame at index");
@@ -2481,7 +2588,7 @@ function get_site_locks(browserSysId, childIds) {
                                 var poiMatch = poiLine.toString().match(/= ([0-9a-fA-F`]+)/);
                                 if (poiMatch) {
                                     var ptrVal = poiMatch[1].replace(/`/g, "");
-                                    if (ptrVal !== "0" && ptrVal !== "00000000" && ptrVal.length > MIN_PTR_VALUE_LENGTH) {
+                                    if (isValidPointer(ptrVal) && ptrVal.length > MIN_PTR_VALUE_LENGTH) {
                                         var candidateAddr = "0x" + ptrVal;
 
                                         // Verify memory is accessible
@@ -2601,9 +2708,8 @@ function chrome_process_type() {
     // If renderer, also show the locked site
     if (info.type === "renderer") {
         try {
-            var site = renderer_site();
-            // renderer_site already prints output, but let's make it cleaner
-        } catch (e) { }
+            renderer_site(); // Prints site info directly
+        } catch (e) { Logger.debug("renderer_site failed: " + e.message); }
     }
 
     return info.type;
@@ -2636,14 +2742,14 @@ function chrome_cmdline() {
     Logger.displaySwitches(switches, processSwitches);
 
     Logger.info("Full command line:");
-    Logger.info(cmdLine.substring(0, 200) + "...");
+    Logger.info(cmdLine.substring(0, CMDLINE_DISPLAY_LENGTH) + "...");
     Logger.empty();
 
     return "";
 }
 
 
-// / List all Chrome processes in the debug session with site isolation info
+/// List all Chrome processes in the debug session with site isolation info
 function chrome_processes() {
     Logger.section("Chrome Processes in Debug Session");
 
@@ -2955,10 +3061,11 @@ function patch_function(funcName, returnValue) {
                     MemoryUtils.writeMemory(funcAddr, [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
                 } else {
                     // mov eax, VALUE; ret
+                    // Use unsigned right shift (>>>) to handle large positive values correctly
                     var b0 = retVal & 0xFF;
-                    var b1 = (retVal >> 8) & 0xFF;
-                    var b2 = (retVal >> 16) & 0xFF;
-                    var b3 = (retVal >> 24) & 0xFF;
+                    var b1 = (retVal >>> 8) & 0xFF;
+                    var b2 = (retVal >>> 16) & 0xFF;
+                    var b3 = (retVal >>> 24) & 0xFF;
                     MemoryUtils.writeMemory(funcAddr, [0xB8, b0, b1, b2, b3, 0xC3]);
                 }
 
@@ -3163,102 +3270,18 @@ function spoof_origin(targetUrl) {
     Logger.info("  Current Host: " + currentHost + " -> Target Host: " + targetHost);
     Logger.empty();
 
-    // Helper function to patch strings (ASCII ONLY)
-    function patchString(searchStr, replaceStr, label, isUnicode) {
-        if (replaceStr.length > searchStr.length) {
-            Logger.warn("  " + label + ": Replacement string too long (" + replaceStr.length + " > " + searchStr.length + "). Aborting to prevent overflow.");
-            return 0;
-        }
-
-        try {
-            var cmdType = isUnicode ? "-u" : "-a";
-            var searchCmd = 's ' + cmdType + ' 0 L?' + USER_MODE_ADDR_LIMIT + ' "' + searchStr + '"';
-            var output = ctl.ExecuteCommand(searchCmd);
-
-            var addresses = [];
-            for (var line of output) {
-                var addr = SymbolUtils.extractAddress(line);
-                if (addr) addresses.push(addr);
-            }
-
-            if (addresses.length === 0) {
-                return 0;
-            }
-
-            var patched = 0;
-            for (var addr of addresses) {
-                try {
-                    // StringImpl Layout (approx): RefCount(+0), Length(+4), Hash(+8), Data(+12)
-                    // So Length is at Data - 8.
-                    // Try multiple offsets to find the length field for variable-length string support
-                    var addrVal = host.parseInt64(addr, 16);
-                    var lengthUpdated = false;
-
-                    // Try offset -8 first (standard StringImpl layout)
-                    var lenOffsets = [-8, -4, -12];
-                    for (var offsetIdx = 0; offsetIdx < lenOffsets.length && !lengthUpdated; offsetIdx++) {
-                        try {
-                            var lenAddr = addrVal.add(lenOffsets[offsetIdx]);
-                            var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
-
-                            // Memory safety: Only update length if we're confident this is the length field
-                            // - Must EXACTLY match searchStr.length (not just >= to prevent false positives)
-                            // - Must be reasonable (<MAX_URL_STRING_LENGTH chars for a URL)
-                            if (ptrVal === searchStr.length && ptrVal < MAX_URL_STRING_LENGTH) {
-                                // Update length to replaceStr.length
-                                var newLen = replaceStr.length;
-                                MemoryUtils.writeU32(lenAddr, newLen);
-                                lengthUpdated = true;
-                            }
-                        } catch (e) {
-                            // Ignore read errors, try next offset
-                        }
-                    }
-
-                    // Write the replacement string data
-                    // Write the replacement string data
-                    var bytes = [];
-                    for (var i = 0; i < replaceStr.length; i++) {
-                        var code = replaceStr.charCodeAt(i);
-                        if (isUnicode) {
-                            bytes.push(code & 0xFF);
-                            bytes.push((code >> 8) & 0xFF);
-                        } else {
-                            bytes.push(code & 0xFF);
-                        }
-                    }
-
-                    // Pad remainder with nulls to overwrite old longer string
-                    var charLen = isUnicode ? 2 : 1;
-                    for (var k = replaceStr.length; k < searchStr.length; k++) {
-                        if (isUnicode) { bytes.push(0); bytes.push(0); }
-                        else bytes.push(0);
-                    }
-
-                    MemoryUtils.writeMemory(addr, bytes);
-                    patched++;
-                } catch (e) { }
-            }
-
-            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " " + (isUnicode ? "Unicode" : "ASCII") + " occurrences");
-            return patched;
-        } catch (e) { return 0; }
-    }
-
     var totalPatched = 0;
 
     // Patch protocol/scheme (SecurityOrigin's protocol_ field)
     if (currentScheme !== targetScheme) {
-        totalPatched += patchString(currentScheme, targetScheme, "Scheme (ASCII)", false);
-        // UNICODE PATCHING REMOVED
+        totalPatched += _patchStringInMemory(ctl, currentScheme, targetScheme, "Scheme (ASCII)", false);
     } else {
         Logger.info("  Schemes are identical (" + currentScheme + "), skipping");
     }
 
     // Patch host (SecurityOrigin's host_ field)
     if (currentHost !== targetHost) {
-        totalPatched += patchString(currentHost, targetHost, "Host (ASCII)", false);
-        // UNICODE PATCHING REMOVED
+        totalPatched += _patchStringInMemory(ctl, currentHost, targetHost, "Host (ASCII)", false);
     } else {
         Logger.info("  Hosts are identical (" + currentHost + "), skipping");
     }
@@ -3444,13 +3467,7 @@ function isProcessType(targetType) {
     return getProcessType() === targetType;
 }
 
-/// Check if current process is a renderer
-function is_renderer() {
-    var result = isProcessType("renderer");
-    Logger.info("  Current process is " + (result ? "a RENDERER" : "NOT a renderer"));
-    Logger.empty();
-    return result;
-}
+
 
 
 /// Check sandbox status for ALL processes
@@ -3495,7 +3512,9 @@ function sandbox_status_all() {
             });
 
             // Map SIDs to Names using lookup table
-            for (var sid in INTEGRITY_LEVELS) {
+            var sids = Object.keys(INTEGRITY_LEVELS);
+            for (var i = 0; i < sids.length; i++) {
+                var sid = sids[i];
                 if (integrity.indexOf(sid) !== -1) {
                     integrity = INTEGRITY_LEVELS[sid] + " (" + sid + ")";
                     break;
@@ -3527,7 +3546,7 @@ function sandbox_status_all() {
             }
 
             // Shorten integrity string for display
-            if (integrity.length > 25) integrity = integrity.substring(0, 22) + "...";
+            if (integrity.length > MAX_INTEGRITY_DISPLAY_LENGTH) integrity = integrity.substring(0, MAX_INTEGRITY_DISPLAY_LENGTH - 3) + "...";
 
             Logger.info(
                 "  " + sysId.toString().padEnd(6) +
@@ -3630,7 +3649,7 @@ function _readFrameMapPointer(lazyInstanceAddr) {
         var lazyAddrVal = BigInt("0x" + lazyInstanceAddr);
         var ptrValue = host.memory.readMemoryValues(host.parseInt64(lazyAddrVal.toString(16), 16), 1, 8)[0];
         var mapAddr = ptrValue.toString(16);
-        if (mapAddr && mapAddr !== "0000000000000000" && mapAddr !== "00000000") {
+        if (isValidPointer(mapAddr)) {
             return mapAddr;
         }
     } catch (e) { }
@@ -3664,7 +3683,8 @@ function _parseFrameMapEntries(ctl, mapAddr) {
 
 /// Helper: Extract URL from a frame using various methods
 function _extractFrameUrl(ctl, f) {
-    var webFrameHex = f.webFrame.startsWith("0x") ? f.webFrame : "0x" + f.webFrame;
+    var webFrameHex = normalizeAddress(f.webFrame);
+    if (!webFrameHex) return "";
     var localFrameAddr = null;
     var frameCompressed = getCompressedMember(webFrameHex, "(blink::WebLocalFrameImpl*)", "frame_");
     if (frameCompressed !== null) {
@@ -3674,14 +3694,14 @@ function _extractFrameUrl(ctl, f) {
     if (!localFrameAddr) return "";
 
     // Try via FrameLoader -> DocumentLoader
-    var loaderCompressed = getCompressedMember("0x" + localFrameAddr, "(blink::LocalFrame*)", "loader_");
+    var loaderCompressed = getCompressedMember(normalizeAddress(localFrameAddr), "(blink::LocalFrame*)", "loader_");
     if (loaderCompressed !== null) {
         var loaderAddr = MemoryUtils.decompressCppgcPtr(loaderCompressed, localFrameAddr);
-        if (loaderAddr && loaderAddr !== "0" && loaderAddr !== "00000000") {
-            var docLoaderCompressed = getCompressedMember("0x" + loaderAddr, "(blink::FrameLoader*)", "document_loader_");
+        if (isValidPointer(loaderAddr)) {
+            var docLoaderCompressed = getCompressedMember(normalizeAddress(loaderAddr), "(blink::FrameLoader*)", "document_loader_");
             if (docLoaderCompressed !== null) {
                 var docLoaderAddr = MemoryUtils.decompressCppgcPtr(docLoaderCompressed, loaderAddr);
-                if (docLoaderAddr && docLoaderAddr !== "0" && docLoaderAddr !== "00000000") {
+                if (isValidPointer(docLoaderAddr)) {
                     var url = readUrlStringFromDx(docLoaderAddr.toString(16), "(blink::DocumentLoader*)");
                     if (url) return url;
                 }
@@ -3690,14 +3710,14 @@ function _extractFrameUrl(ctl, f) {
     }
 
     // Fallback: Try via dom_window_ -> document_ -> url_
-    var windowCompressed = getCompressedMember("0x" + localFrameAddr, "(blink::LocalFrame*)", "dom_window_");
+    var windowCompressed = getCompressedMember(normalizeAddress(localFrameAddr), "(blink::LocalFrame*)", "dom_window_");
     if (windowCompressed !== null) {
         var windowAddr = MemoryUtils.decompressCppgcPtr(windowCompressed, localFrameAddr);
-        if (windowAddr && windowAddr !== "0" && windowAddr !== "00000000") {
-            var docCompressed = getCompressedMember("0x" + windowAddr, "(blink::LocalDOMWindow*)", "document_");
+        if (isValidPointer(windowAddr)) {
+            var docCompressed = getCompressedMember(normalizeAddress(windowAddr), "(blink::LocalDOMWindow*)", "document_");
             if (docCompressed !== null) {
                 var docAddr = MemoryUtils.decompressCppgcPtr(docCompressed, windowAddr);
-                if (docAddr && docAddr !== "0" && docAddr !== "00000000") {
+                if (isValidPointer(docAddr)) {
                     return readUrlStringFromDx(docAddr, "(blink::Document*)") || "";
                 }
             }
