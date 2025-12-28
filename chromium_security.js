@@ -104,6 +104,19 @@ class GlobalCache {
         map.set(key, value);
     }
 
+    // Helper: Ensure a PID cache exists in the given map, creating if needed
+    static _ensurePidCache(cacheMap, pid) {
+        if (!cacheMap.has(pid)) {
+            // Enforce PID cache limit before adding new entry
+            if (cacheMap.size >= MAX_PID_CACHE_SIZE) {
+                const oldest = cacheMap.keys().next().value;
+                cacheMap.delete(oldest);
+            }
+            cacheMap.set(pid, new Map());
+        }
+        return cacheMap.get(pid);
+    }
+
     static getSymbol(symbolName) {
         var pid = this._getPid();
         if (!pid) return undefined;
@@ -115,10 +128,7 @@ class GlobalCache {
         var pid = this._getPid();
         if (!pid) return;
 
-        var pidCache = this._symbolCache.get(pid);
-        if (!pidCache) pidCache = new Map();
-
-        this._setLru(this._symbolCache, pid, pidCache, MAX_PID_CACHE_SIZE);
+        var pidCache = this._ensurePidCache(this._symbolCache, pid);
         this._setLru(pidCache, symbolName, address, MAX_CACHE_SIZE_PER_PID);
     }
 
@@ -133,29 +143,32 @@ class GlobalCache {
         var pid = this._getPid();
         if (!pid) return;
 
-        var pidCache = this._reverseSymbolCache.get(pid);
-        if (!pidCache) pidCache = new Map();
-
-        this._setLru(this._reverseSymbolCache, pid, pidCache, MAX_PID_CACHE_SIZE);
+        var pidCache = this._ensurePidCache(this._reverseSymbolCache, pid);
         this._setLru(pidCache, address, name, MAX_CACHE_SIZE_PER_PID);
     }
 
     static getV8Cage() {
-        return this._getLru(this._v8CageBaseCache, this._getPid());
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        return this._getLru(this._v8CageBaseCache, pid);
     }
 
     static setV8Cage(address) {
         var pid = this._getPid();
-        if (pid) this._setLru(this._v8CageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+        if (!pid) return;
+        this._setLru(this._v8CageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
     }
 
     static getCppgcCage() {
-        return this._getLru(this._cppgcCageBaseCache, this._getPid());
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        return this._getLru(this._cppgcCageBaseCache, pid);
     }
 
     static setCppgcCage(address) {
         var pid = this._getPid();
-        if (pid) this._setLru(this._cppgcCageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+        if (!pid) return;
+        this._setLru(this._cppgcCageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
     }
 
     static clearCurrent() {
