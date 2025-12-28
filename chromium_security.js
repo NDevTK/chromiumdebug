@@ -28,6 +28,8 @@ const CMDLINE_DISPLAY_LENGTH = 200; // Truncation length for command line displa
 const ELEMENT_DATA_UNIQUE_FLAG = 0x1; // Bit 0 indicates UniqueElementData vs ShareableElementData
 const ELEMENT_DATA_ARRAY_SIZE_MASK = 0xFFFFFFF; // Bits 1-28 contain array size
 const MIN_VALID_VTABLE_ADDR = 0x10000; // Minimum valid address for vtable pointer validation
+const MAX_CACHE_SIZE_PER_PID = 1000; // Maximum number of symbols to cache per PID to prevent leaks
+const MAX_PID_CACHE_SIZE = 10; // Maximum number of PIDs to track to prevent memory leaks
 
 /// Helper: Check if string is empty or null
 function isEmpty(str) {
@@ -56,6 +58,123 @@ function _registerRendererSxeHandler(commandString, displayLabel) {
     } catch (e) {
         Logger.warn("Note: Auto-setup failed. Manually use sxe command.");
         Logger.empty();
+    }
+}
+
+/// =============================================================================
+/// GLOBAL CACHE
+/// =============================================================================
+
+class GlobalCache {
+    // Map<PID, Map<Key, Value>>
+    static _symbolCache = new Map();
+    static _reverseSymbolCache = new Map();
+    static _v8CageBaseCache = new Map(); // Map<PID, AddressString>
+    static _cppgcCageBaseCache = new Map(); // Map<PID, AddressString>
+
+    static _getPid() {
+        try {
+            var pid = parseInt(host.currentProcess.Id);
+            // Safety: Avoid caching for PID 0 (System) or invalid PIDs
+            if (pid === 0 || isNaN(pid)) return null;
+            return pid;
+        } catch (e) { return null; }
+    }
+
+    // Generic LRU Get: returns value or undefined, moves to end if found
+    static _getLru(map, key) {
+        if (map && map.has(key)) {
+            const val = map.get(key);
+            map.delete(key);
+            map.set(key, val);
+            return val;
+        }
+        return undefined;
+    }
+
+    // Generic LRU Set: sets value, moves to end, enforces size limit
+    static _setLru(map, key, value, maxSize) {
+        if (!map) return;
+        if (map.has(key)) {
+            map.delete(key);
+        } else if (map.size >= maxSize) {
+            const oldest = map.keys().next().value;
+            map.delete(oldest);
+        }
+        map.set(key, value);
+    }
+
+    static getSymbol(symbolName) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this._getLru(this._symbolCache, pid);
+        return pidCache ? this._getLru(pidCache, symbolName) : undefined;
+    }
+
+    static setSymbol(symbolName, address) {
+        var pid = this._getPid();
+        if (!pid) return;
+
+        var pidCache = this._symbolCache.get(pid);
+        if (!pidCache) pidCache = new Map();
+
+        this._setLru(this._symbolCache, pid, pidCache, MAX_PID_CACHE_SIZE);
+        this._setLru(pidCache, symbolName, address, MAX_CACHE_SIZE_PER_PID);
+    }
+
+    static getSymbolName(address) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this._getLru(this._reverseSymbolCache, pid);
+        return pidCache ? this._getLru(pidCache, address) : undefined;
+    }
+
+    static setSymbolName(address, name) {
+        var pid = this._getPid();
+        if (!pid) return;
+
+        var pidCache = this._reverseSymbolCache.get(pid);
+        if (!pidCache) pidCache = new Map();
+
+        this._setLru(this._reverseSymbolCache, pid, pidCache, MAX_PID_CACHE_SIZE);
+        this._setLru(pidCache, address, name, MAX_CACHE_SIZE_PER_PID);
+    }
+
+    static getV8Cage() {
+        return this._getLru(this._v8CageBaseCache, this._getPid());
+    }
+
+    static setV8Cage(address) {
+        var pid = this._getPid();
+        if (pid) this._setLru(this._v8CageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+    }
+
+    static getCppgcCage() {
+        return this._getLru(this._cppgcCageBaseCache, this._getPid());
+    }
+
+    static setCppgcCage(address) {
+        var pid = this._getPid();
+        if (pid) this._setLru(this._cppgcCageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+    }
+
+    static clearCurrent() {
+        var pid = this._getPid();
+        if (pid) this.clearPid(pid);
+    }
+
+    static clearPid(pid) {
+        this._symbolCache.delete(pid);
+        this._reverseSymbolCache.delete(pid);
+        this._v8CageBaseCache.delete(pid);
+        this._cppgcCageBaseCache.delete(pid);
+    }
+
+    static clearAll() {
+        this._symbolCache.clear();
+        this._reverseSymbolCache.clear();
+        this._v8CageBaseCache.clear();
+        this._cppgcCageBaseCache.clear();
     }
 }
 
@@ -133,11 +252,22 @@ class SymbolUtils {
     }
 
     static findSymbolAddress(pattern) {
+        // Only cache exact symbol matches, not patterns with wildcards
+        var isExact = pattern.indexOf("*") === -1 && pattern.indexOf("?") === -1;
+
+        if (isExact) {
+            var cached = GlobalCache.getSymbol(pattern);
+            if (cached) return cached;
+        }
+
         try {
             var output = this.getControl().ExecuteCommand("x " + pattern);
             for (var line of output) {
                 var addr = this.extractAddress(line);
-                if (addr) return addr;
+                if (addr) {
+                    if (isExact) GlobalCache.setSymbol(pattern, addr);
+                    return addr;
+                }
             }
         } catch (e) { Logger.debug("findSymbolAddress failed: " + e.message); }
         return null;
@@ -166,9 +296,15 @@ class SymbolUtils {
 
     /// Get symbol name for a given address (using ln)
     static getSymbolName(subsysAddr, debug) {
+        var hexAddr = normalizeAddress(subsysAddr);
+        if (!hexAddr) return null;
+
+        var cached = GlobalCache.getSymbolName(hexAddr);
+        if (cached) return cached;
+
         try {
             // Use ln (list nearest) to get symbol
-            var cmd = "ln 0x" + subsysAddr;
+            var cmd = "ln " + hexAddr;
             if (debug) Logger.info("  [Debug] Running: " + cmd);
 
             var output = this.getControl().ExecuteCommand(cmd);
@@ -182,6 +318,7 @@ class SymbolUtils {
                 var match = lineStr.match(/\)\s+([a-zA-Z0-9_!:.?@$]+)/);
                 if (match) {
                     if (debug) Logger.info("  [Debug] Matched symbol: " + match[1]);
+                    GlobalCache.setSymbolName(hexAddr, match[1]);
                     return match[1];
                 }
             }
@@ -194,13 +331,17 @@ class SymbolUtils {
 
 class MemoryUtils {
     // Cache for cage bases
-    static _v8CageBase = null;
-    static _cppgcCageBase = null;
+    // Now handled by GlobalCache
 
     /// Invalidate cached cage bases (call when switching processes)
+    /// NOTE: With GlobalCache, we don't strictly *need* to invalidate on switch,
+    /// but we might want to if memory layout changes dynamically (unlikely for cage bases).
+    /// For now, we'll keep the method but make it a no-op or clear current PID only if requested.
     static invalidateCaches() {
-        this._v8CageBase = null;
-        this._cppgcCageBase = null;
+        // GlobalCache handles PER-PID caching, so we don't need to wipe everything on context switch.
+        // If we really want to force refresh for current process:
+        // GlobalCache.clearCurrent(); 
+        // But usually we don't want to lose the cache just because we listed processes.
     }
 
     /// Try to find cage bases (V8 and CppGC)
@@ -235,15 +376,21 @@ class MemoryUtils {
     }
 
     static getV8CageBase() {
-        if (this._v8CageBase !== null) return this._v8CageBase;
-        this._v8CageBase = this.readGlobalPointer("chrome!v8::internal::MainCage::base_");
-        return this._v8CageBase;
+        var cached = GlobalCache.getV8Cage();
+        if (cached) return cached;
+
+        var val = this.readGlobalPointer("chrome!v8::internal::MainCage::base_");
+        if (val) GlobalCache.setV8Cage(val);
+        return val;
     }
 
     static getCppgcCageBase() {
-        if (this._cppgcCageBase !== null) return this._cppgcCageBase;
-        this._cppgcCageBase = this.readGlobalPointer("chrome!cppgc::internal::CageBaseGlobal::g_base_");
-        return this._cppgcCageBase;
+        var cached = GlobalCache.getCppgcCage();
+        if (cached) return cached;
+
+        var val = this.readGlobalPointer("chrome!cppgc::internal::CageBaseGlobal::g_base_");
+        if (val) GlobalCache.setCppgcCage(val);
+        return val;
     }
 
     static decompressV8Ptr(compressedPtr) {
@@ -2275,7 +2422,10 @@ function initializeScript() {
         new host.functionAlias(frame_elements, "frame_elem"),
         new host.functionAlias(frame_getattr, "frame_getattr"),
         new host.functionAlias(frame_setattr, "frame_setattr"),
-        new host.functionAlias(frame_attrs, "frame_attrs")
+        new host.functionAlias(frame_attrs, "frame_attrs"),
+
+        // Cache Management
+        new host.functionAlias(cache_clear, "cache_clear")
     ];
 }
 
@@ -2287,7 +2437,7 @@ function uninitializeScript() {
     g_exitHandlerRegistered = false;
 
     // Invalidate cached memory addresses
-    MemoryUtils.invalidateCaches();
+    GlobalCache.clearAll();
 }
 
 /// Initialize the Chrome debugging environment
@@ -2392,6 +2542,12 @@ function help() {
     Logger.info("  - Use '||' to list all debugged processes");
     Logger.info("  - Use '~*k' to get stacks from all threads");
     Logger.empty();
+    return "";
+}
+
+function cache_clear() {
+    GlobalCache.clearAll();
+    Logger.info("Global security script cache cleared.");
     return "";
 }
 
@@ -3179,6 +3335,10 @@ function on_process_exit() {
             g_spoofMap.delete(id);
             Logger.info("\n  [Cleanup] Spoof state cleaned up for PID " + currentPid + " (Url: " + spoof.currentUrl + ")");
         }
+
+        // Cache Cleanup: Remove broken/stale cache entries for this PID to prevent PID reuse issues
+        GlobalCache.clearPid(currentPid);
+
     } catch (e) {
         // Suppress errors in exit handler to avoid spam
     }
