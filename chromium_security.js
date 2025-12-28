@@ -182,6 +182,12 @@ class MemoryUtils {
         this._cppgcCageBase = null;
     }
 
+    /// Try to find cage bases (V8 and CppGC)
+    static findCageBases() {
+        this.getV8CageBase();
+        this.getCppgcCageBase();
+    }
+
     static readGlobalPointer(symbolName) {
         try {
             var addr = SymbolUtils.findSymbolAddress(symbolName);
@@ -242,26 +248,31 @@ class MemoryUtils {
         var compressed = this.parseBigInt(compressedPtr);
         if (compressed === 0n) return null;
 
-        // Sign-extend if necessary (assuming 32-bit signed compressed value mostly positive)
-        // If compressed is treated as unsigned 32-bit:
+        // Sign-extend if necessary
         if (compressed < 0n) compressed = compressed & 0xFFFFFFFFn;
 
         // Shift
         var offset = compressed << kPointerCompressionShift;
 
         // Combine with Cage Base
+        var base = 0n;
         if (contextAddr) {
-            var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
-            var base = context & kCageBaseMask;
-            var fullPtr = base | offset;
-            return fullPtr.toString(16);
-        } else {
+            try {
+                var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
+                base = context & kCageBaseMask;
+            } catch (e) { }
+        }
+
+        if (base === 0n) {
             // Fallback to global cage base if available
             var cage = this.getCppgcCageBase();
             if (cage) {
-                var base = BigInt("0x" + cage);
-                return (base | offset).toString(16);
+                base = BigInt("0x" + cage);
             }
+        }
+
+        if (base !== 0n) {
+            return (base | offset).toString(16);
         }
 
         return null;
@@ -882,49 +893,97 @@ class BlinkUnwrap {
 
 
     /// Detect the type of a Blink object using its vtable
-    static detectType(objectAddr, debug) {
+    /// Supports backward scanning to detect embedded struct types.
+    static detectType(objectAddr, debug, noScan) {
         var objHex = normalizeAddress(objectAddr);
         if (!objHex) return null;
 
         try {
-            // Read the first pointer (vtable pointer)
+            // 1. Direct VTable Check
             var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
-            if (debug) Logger.info("  [Debug] VTable Ptr: " + vtablePtr.toString(16));
+            if (debug) Logger.info("  [Debug] VTable Ptr at " + objHex + ": 0x" + vtablePtr.toString(16));
 
-            if (vtablePtr.compareTo(0) === 0) return null;
-
-            // Resolve symbol for vtable
-            var symName = SymbolUtils.getSymbolName(vtablePtr.toString(16), debug);
-            if (symName) {
-                // Case 1: Standard symbol "chrome!blink::LocalFrame::vftable"
-                var matchStandard = symName.match(/!([a-zA-Z0-9_:]+)::vftable/);
-                if (matchStandard) {
-                    var className = matchStandard[1];
-                    if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
-                    return "(" + className + "*)";
-                }
-
-                // Case 2: MSVC/Weak symbol "chrome!weak.??_7HTMLIFrameElementblink"
-                // Matches ??_7 followed by ClassName
-                var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
-                if (matchMangled) {
-                    var rawName = matchMangled[1];
-                    // Name often ends with "blink" in these symbols, strip it if present
-                    if (rawName.endsWith("blink") && rawName.length > 5) {
-                        rawName = rawName.substring(0, rawName.length - 5);
+            if (vtablePtr.compareTo(0) !== 0) {
+                var symName = SymbolUtils.getSymbolName(vtablePtr.toString(16), debug);
+                if (symName) {
+                    // Standard vtable symbol
+                    var matchStandard = symName.match(/!([a-zA-Z0-9_:]+)::vftable/);
+                    if (matchStandard) {
+                        var className = matchStandard[1];
+                        if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
+                        return "(" + className + "*)";
                     }
-                    // Most types are in blink namespace
-                    if (debug) Logger.info("  [Debug] Detected Type (Mangled): blink::" + rawName);
-                    return "(blink::" + rawName + "*)";
-                }
 
-                if (debug) {
-                    Logger.info("  [Debug] Symbol did not match vtable regex: " + symName);
+                    // MSVC mangled vtable symbol (??_7...)
+                    var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
+                    if (matchMangled) {
+                        var rawName = matchMangled[1];
+                        if (rawName.endsWith("blink") && rawName.length > 5) {
+                            rawName = rawName.substring(0, rawName.length - 5);
+                        }
+                        var fullType = (rawName.indexOf("::") === -1) ? "blink::" + rawName : rawName;
+                        if (debug) Logger.info("  [Debug] Detected Type (Mangled): " + fullType);
+                        return "(" + fullType + "*)";
+                    }
                 }
             }
         } catch (e) {
-            if (debug) Logger.info("  [Debug] detectType failed: " + e.message);
+            if (debug) Logger.info("  [Debug] detectType direct check failed: " + e.message);
         }
+
+        // 2. Backward Scan Strategy
+        // If we didn't find a direct vtable, we might be an embedded struct.
+        if (noScan === true) return null;
+
+        try {
+            if (debug) Logger.info("  [Debug] Trying Backwards Scan for Parent VTable...");
+            var targetAddrInt = BigInt(objHex);
+
+            // Scan backwards up to 1.5KB (Blink objects can be large)
+            for (var offset = 8; offset < 1536; offset += 8) {
+                var candidateAddrBase = targetAddrInt - BigInt(offset);
+                var candidateHex = "0x" + candidateAddrBase.toString(16);
+
+                var val = 0n;
+                try {
+                    val = host.memory.readMemoryValues(host.parseInt64(candidateHex, 16), 1, 8)[0];
+                } catch (re) { continue; }
+
+                // Check if this value is a symbol ending in ::vftable or ??_7
+                if (val.compareTo(0x10000) < 0) continue;
+                var sym = SymbolUtils.getSymbolName(val.toString(16));
+
+                if (sym && (sym.indexOf("::vftable") !== -1 || sym.indexOf("??_7") !== -1)) {
+                    if (debug) Logger.info("  [Debug] Found vtable candidate at -0x" + offset.toString(16) + " (0x" + candidateAddrBase.toString(16) + ")");
+
+                    // Identify the type AT the candidate (calling detectType with noScan=true)
+                    var parentTypePtr = this.detectType(candidateHex, debug, true);
+                    if (parentTypePtr) {
+                        // Enumerate members to see if any match our target address
+                        var parentMembers = this.getCppMembers(candidateHex, parentTypePtr);
+                        if (debug) Logger.info("  [Debug]   Candidate " + parentTypePtr + " has " + parentMembers.length + " members. Checking offsets...");
+
+                        for (var m of parentMembers) {
+                            try {
+                                var mAddr = this.getMemberPointer(candidateHex, parentTypePtr, m.name);
+                                if (mAddr) {
+                                    var mAddrInt = BigInt(normalizeAddress(mAddr));
+                                    if (mAddrInt === targetAddrInt) {
+                                        if (debug) Logger.info("  [Debug]   MATCH: Parent '" + parentTypePtr + "' member '" + m.name + "' is at our address.");
+                                        return "(" + m.type + "*)";
+                                    }
+                                }
+                            } catch (me) { }
+                        }
+                    }
+                    // If we found a vtable but no member match, DO NOT break. 
+                    // It might be a secondary vtable (multiple inheritance). Keep scanning for the primary vtable.
+                }
+            }
+        } catch (e) {
+            if (debug) Logger.info("  [Debug] Backward scan failed: " + e.message);
+        }
+
         return null;
     }
 
@@ -1022,15 +1081,9 @@ class BlinkUnwrap {
             }
         }
 
-        // 2. Fallback to list
-        for (var typeCast of this.BLINK_TYPE_CASTS) {
-            if (typeCast === detectedType) continue;
-
-            var members = this.getCppMembers(objectAddr, typeCast);
-            if (members.length > 0) {
-                return { members: members, typeCast: typeCast };
-            }
-        }
+        // 2. Previously we fell back to a hardcoded list (LocalFrame, Document, etc.)
+        // But this causes false positives (e.g. Member<T> structs being identified as LocalFrame).
+        // With vtable detection working, it is safer to return empty than to guess wrong.
         return { members: [], typeCast: null };
     }
 
@@ -1803,7 +1856,36 @@ function frame_attrs(objectAddr, debug) {
     var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug);
 
     if (result.members.length === 0) {
-        Logger.info("  (unable to enumerate)");
+        Logger.info("  (unable to enumerate members)");
+
+        // Check if this might be a compressed pointer / Member<T>
+        try {
+            var val32 = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 4)[0];
+
+            // To be robust, let's just use the cached or find cage.
+            if (!MemoryUtils._cppgcCageBase) MemoryUtils.findCageBases();
+
+            var ptrVal = 0n;
+            if (MemoryUtils._cppgcCageBase) {
+                ptrVal = MemoryUtils.decompressCppgcPtr(val32);
+            }
+
+            if (val32 === 0) {
+                Logger.info("  [Analysis] Member/Pointer is NULL (0x0).");
+            } else if (ptrVal && ptrVal > 0n) {
+                var targetHex = "0x" + ptrVal.toString(16);
+                Logger.info("  [Analysis] Address contains a generic pointer or Member<T>.");
+                Logger.info("  Value: " + targetHex);
+                Logger.info("  !frame_attrs " + targetHex);
+
+                // Try to detect type of the TARGET
+                var targetType = BlinkUnwrap.detectType(targetHex, enableDebug);
+                if (targetType) {
+                    Logger.info("  Target Type: " + targetType);
+                }
+            }
+        } catch (e) { }
+
         Logger.info("  Try: dx ((blink::LocalFrame*)" + objHex + ")");
         Logger.info("       dx ((blink::Document*)" + objHex + ")");
     } else {
