@@ -91,6 +91,16 @@ class Logger {
         }
     }
 
+    /// Output DML link that executes a command when clicked
+    static dmlCmd(text, command) {
+        return '<link cmd="' + command + '">' + text + '</link>';
+    }
+
+    /// Output a line with DML content
+    static dmlLine(content, indent = 2) {
+        host.diagnostics.debugLog(" ".repeat(indent) + content + "\n");
+    }
+
     /// Display filtered command line switches
     static displaySwitches(switches, filterList) {
         for (var i = 0; i < switches.length; i++) {
@@ -245,6 +255,29 @@ class MemoryUtils {
         var ctl = SymbolUtils.getControl();
         var hexBytes = bytes.map(b => b.toString(16).padStart(2, '0')).join(" ");
         var cmd = "eb 0x" + addr + " " + hexBytes;
+        ctl.ExecuteCommand(cmd);
+    }
+
+    /// Write a single byte (U8)
+    static writeU8(addr, value) {
+        this.writeMemory(addr, [value & 0xFF]);
+    }
+
+    /// Write a 32-bit integer (U32)
+    static writeU32(addr, value) {
+        var ctl = SymbolUtils.getControl();
+        var hexVal = value.toString(16);
+        var cmd = "ed 0x" + addr + " 0x" + hexVal;
+        ctl.ExecuteCommand(cmd);
+    }
+
+    /// Write a 64-bit integer (U64)
+    static writeU64(addr, value) {
+        var ctl = SymbolUtils.getControl();
+        var valStr = value.toString(16);
+        // Handle BigInt if passed
+        if (typeof value === 'bigint') valStr = value.toString(16);
+        var cmd = "eq 0x" + addr + " 0x" + valStr;
         ctl.ExecuteCommand(cmd);
     }
 
@@ -655,6 +688,257 @@ class BlinkUnwrap {
         return null;
     }
 
+    /// Get a C++ member value from an object
+    /// @param objectAddr - Address of the object
+    /// @param typeCast - Type cast string, e.g. "(blink::Element*)"
+    /// @param memberPath - Member name or path (e.g., "node_flags_" or "element_data_.ptr_")
+    /// @returns Object with {value, type, raw} or null if failed
+    static getCppMember(objectAddr, typeCast, memberPath) {
+        var objHex = normalizeAddress(objectAddr);
+        if (!objHex) return null;
+
+        var ctl = SymbolUtils.getControl();
+        try {
+            var cmd = "dx -r0 (" + typeCast + objHex + ")->" + memberPath;
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                var lineStr = line.toString();
+
+                // Check for error messages
+                if (lineStr.indexOf("Unable to bind") !== -1) return null;
+                if (lineStr.indexOf("Error:") !== -1) return null;
+                if (lineStr.indexOf("Couldn't resolve") !== -1) return null;
+                if (lineStr.indexOf("No type information") !== -1) return null;
+
+                // Parse value from "member : value [Type: ...]" format
+                // Fix: Require space after colon to avoid matching "blink::Type"
+                var match = lineStr.match(/:\s+(.+?)\s*(?:\[Type:|$)/);
+                if (match) {
+                    var rawValue = match[1].trim();
+                    // Skip if value looks like an error
+                    if (rawValue.indexOf("Unable to") !== -1) return null;
+                    // Extract type if present
+                    var typeMatch = lineStr.match(/\[Type:\s*([^\]]+)\]/);
+                    var typeStr = typeMatch ? typeMatch[1] : "unknown";
+                    return { value: rawValue, type: typeStr, raw: lineStr };
+                }
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    /// Set a C++ member value on an object (integers/pointers only)
+    /// @param objectAddr - Address of the object
+    /// @param typeCast - Type cast string, e.g. "(blink::Element*)"
+    /// @param memberPath - Member name
+    /// @param value - Value to write (number or hex string)
+    /// @returns true if successful
+    static setCppMember(objectAddr, typeCast, memberPath, value) {
+        var objHex = normalizeAddress(objectAddr);
+        if (!objHex) return false;
+
+        var ctl = SymbolUtils.getControl();
+        try {
+            // First get the address of the member
+            var addrCmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
+            var addrOutput = ctl.ExecuteCommand(addrCmd);
+            var memberAddr = null;
+            var memberAddr = null;
+            for (var line of addrOutput) {
+                // Fix: Require space after colon
+                var m = line.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                if (m) {
+                    memberAddr = m[1].replace(/`/g, "");
+                    break;
+                }
+            }
+            if (!memberAddr) return false;
+
+            // Determine value format
+            var writeValue = value;
+            var writeValue = value;
+            if (typeof value === "string") {
+                if (value.toLowerCase() === "true") writeValue = "1";
+                else if (value.toLowerCase() === "false") writeValue = "0";
+            } else if (typeof value === "boolean") {
+                writeValue = value ? "1" : "0";
+            } else if (typeof value === "number") {
+                writeValue = "0x" + value.toString(16);
+            }
+
+            // Write using ed (4 bytes) - most common case for flags/ints
+            // Write using MemoryUtils
+            // We need to handle the value conversion here or in writeU32?
+            // writeU32 expects a number or string that converts to number locally?
+            // Let's pass the raw number to writeU32 if possible, or parsing it.
+
+            // The 'writeValue' logic above produced strings "1", "0", "0x..."
+            // Let's convert back to number for the new API, or just handle string in writeU32?
+            // Actually, writeU32 implementation below:
+            // var hexVal = value.toString(16);
+            // It expects a number.
+
+            var numericValue = 0;
+            if (writeValue.toString().startsWith("0x")) {
+                numericValue = parseInt(writeValue, 16);
+            } else {
+                numericValue = parseInt(writeValue);
+            }
+
+            MemoryUtils.writeU32(memberAddr, numericValue);
+            return true;
+        } catch (e) {
+            Logger.error("setCppMember failed: " + e.message);
+            Logger.info("Command was: " + (typeof addrCmd !== 'undefined' ? addrCmd : "addrCmd not set"));
+            Logger.info("Write cmd: " + (typeof writeCmd !== 'undefined' ? writeCmd : "writeCmd not set"));
+        }
+        return false;
+    }
+
+    /// Enumerate C++ members of an object
+    /// @param objectAddr - Address of the object
+    /// @param typeCast - Type cast string, e.g. "(blink::Element*)"
+    /// @returns Array of {name, value, type} objects
+    static getCppMembers(objectAddr, typeCast) {
+        var objHex = normalizeAddress(objectAddr);
+        if (!objHex) return [];
+
+        var ctl = SymbolUtils.getControl();
+        var members = [];
+        try {
+            var cmd = "dx -r1 (" + typeCast + objHex + ")";
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                var lineStr = line.toString();
+
+                // Skip empty lines and header
+                if (lineStr.trim().length === 0) continue;
+                if (lineStr.indexOf("(" + typeCast) !== -1) continue; // Header line
+
+                // Parse format: "    [+0x048] tag_name_        : value [Type: ...]"
+                // or: "    [+0x058] element_data_    [Type: ...]" (no colon before type)
+                var offsetMatch = lineStr.match(/\[\+0x[0-9a-fA-F]+\]\s+(.+)$/);
+                if (!offsetMatch) continue;
+
+                var afterOffset = offsetMatch[1];
+
+                // Skip base class entries like "blink::ContainerNode [Type: ...]"
+                if (afterOffset.match(/^[a-zA-Z_][a-zA-Z0-9_]*::[a-zA-Z_]/)) continue;
+
+                // Try to parse "member_ : value [Type: ...]" format
+                var colonMatch = afterOffset.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$/);
+                if (colonMatch) {
+                    var name = colonMatch[1];
+                    var rest = colonMatch[2].trim();
+                    var typeMatch = rest.match(/\[Type:\s*([^\]]+)\]\s*$/);
+                    var type = typeMatch ? typeMatch[1] : "unknown";
+                    var value = typeMatch ? rest.replace(/\s*\[Type:[^\]]+\]\s*$/, "").trim() : rest;
+                    if (value.length === 0) value = "{...}";
+                    members.push({ name: name, value: value, type: type });
+                    continue;
+                }
+
+                // Try to parse "member_ [Type: ...]" format (no colon)
+                var noColonMatch = afterOffset.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+\[Type:\s*([^\]]+)\]/);
+                if (noColonMatch) {
+                    members.push({ name: noColonMatch[1], value: "{...}", type: noColonMatch[2] });
+                }
+            }
+        } catch (e) { }
+        return members;
+    }
+
+    /// Common Blink type casts to try when type is unknown
+    static get BLINK_TYPE_CASTS() {
+        return [
+            "(blink::LocalFrame*)",
+            "(blink::Document*)",
+            "(blink::LocalDOMWindow*)",
+            "(blink::Element*)",
+            "(blink::Node*)",
+            "(blink::SecurityOrigin*)",
+            "(blink::HTMLIFrameElement*)",
+            "(blink::HTMLElement*)"
+        ];
+    }
+
+    /// Get C++ member with fallback across multiple Blink types
+    /// @param objectAddr - Address of the object
+    /// @param memberPath - Member name
+    /// @returns Object with {value, type, raw, typeCast} or null
+    static getCppMemberWithFallback(objectAddr, memberPath) {
+        for (var typeCast of this.BLINK_TYPE_CASTS) {
+            var result = this.getCppMember(objectAddr, typeCast, memberPath);
+            if (result) {
+                result.typeCast = typeCast;
+                return result;
+            }
+        }
+        return null;
+    }
+
+    /// Get the pointer address of a member (with decompression if needed)
+    /// @param objectAddr - Address of the object
+    /// @param typeCast - Type cast string
+    /// @param memberPath - Member name
+    /// @returns Decompressed pointer address string or null
+    static getMemberPointer(objectAddr, typeCast, memberPath) {
+        var objHex = normalizeAddress(objectAddr);
+        if (!objHex) return null;
+
+        var ctl = SymbolUtils.getControl();
+        try {
+            // Try to get the address of the member
+            var cmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                var lineStr = line.toString();
+                // Look for address like "0x12345678" or "0x12345678`abcdefab"
+                // Fix: Ensure we match the value after the colon (space required)
+                var match = lineStr.match(/:\s+(0x[0-9a-fA-F`]+)/);
+                if (match) {
+                    var addr = match[1].replace(/`/g, "");
+
+                    // Check if this is a compressed pointer (high bits are 0)
+                    if (addr.length <= 10) { // Compressed (32-bit)
+                        // Try to decompress
+                        var decompressed = MemoryUtils.decompressCppgcPtr(addr, objHex);
+                        if (decompressed) return "0x" + decompressed;
+                    }
+                    return addr;
+                }
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    /// Set C++ member with fallback across multiple Blink types
+    /// @param objectAddr - Address of the object
+    /// @param memberPath - Member name
+    /// @param value - Value to write
+    /// @returns true if successful
+    static setCppMemberWithFallback(objectAddr, memberPath, value) {
+        for (var typeCast of this.BLINK_TYPE_CASTS) {
+            if (this.setCppMember(objectAddr, typeCast, memberPath, value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get C++ members with fallback across multiple Blink types
+    /// @param objectAddr - Address of the object
+    /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
+    static getCppMembersWithFallback(objectAddr) {
+        for (var typeCast of this.BLINK_TYPE_CASTS) {
+            var members = this.getCppMembers(objectAddr, typeCast);
+            if (members.length > 0) {
+                return { members: members, typeCast: typeCast };
+            }
+        }
+        return { members: [], typeCast: null };
+    }
+
     /// Get Document URL
     static getDocumentUrl(documentAddr) {
         var docHex = documentAddr.toString().replace(/^0x/, "");
@@ -1016,44 +1300,65 @@ function _getFrameByIndex(idx) {
     return frames[idx];
 }
 
-/// Set an attribute value on an element (Direct Memory Modification)
-function frame_setattr(elementAddr, attrName, attrValue) {
-    if (isEmpty(elementAddr) || isEmpty(attrName)) {
-        Logger.showUsage("Set Element Attribute", "!frame_setattr <element_addr> <attr_name> <attr_value>", [
-            "!frame_setattr 0x12345678 \"id\" \"newId\"",
-            "!frame_setattr 0x12345678 \"src\" \"https://example.com\""
+/// Set a C++ member value on any Blink object (or DOM attribute on Element)
+function frame_setattr(objectAddr, memberName, value) {
+    if (isEmpty(objectAddr) || isEmpty(memberName)) {
+        Logger.showUsage("Set Object Member", "!frame_setattr <addr> <member> <value>", [
+            "!frame_setattr 0x1234 \"sandbox_flags_\" \"0x0\"  - LocalFrame member",
+            "!frame_setattr 0x1234 \"id\" \"newId\"            - Element DOM attr",
+            "!frame_setattr 0x1234 \"node_flags_\" \"0x10\"    - Node member"
         ]);
-        Logger.info("Get element address from !frame_elem command first.");
+        Logger.info("Works with: LocalFrame, Document, LocalDOMWindow, Element, Node, etc.");
         Logger.empty();
         return "";
     }
 
-    var elemHex = normalizeAddress(elementAddr);
-    var attr = attrName.replace(/"/g, "");
-    var value = attrValue ? attrValue.replace(/"/g, "") : "";
+    var objHex = normalizeAddress(objectAddr);
+    var member = memberName.replace(/"/g, "");
+    var newValue = value ? value.replace(/"/g, "") : "";
 
-    Logger.section("Set Attribute (Direct Memory): " + attr);
-    Logger.info("Element: " + elemHex);
-    Logger.info("Target Value: \"" + value + "\"");
+    Logger.section("Set Member: " + member);
+    Logger.info("Object: " + objHex);
+    Logger.info("Target Value: \"" + newValue + "\"");
     Logger.empty();
 
-    var implAddr = BlinkUnwrap.findAttributeStringImplAddress(elemHex, attr);
-    if (!implAddr || implAddr === "0") {
-        Logger.error("Attribute '" + attr + "' not found on element.");
-        Logger.info("This command modifies EXISTING attributes in memory.");
-        Logger.info("To add a new attribute, the browser must allocate memory first.");
+    // 1. First try DOM attribute (only works for Elements)
+    try {
+        var implAddr = BlinkUnwrap.findAttributeStringImplAddress(objHex, member);
+        if (implAddr && implAddr !== "0") {
+            Logger.info("[DOM] Found StringImpl at: " + implAddr);
+            MemoryUtils.writeStringImpl(implAddr, newValue);
+            Logger.info("[DOM] Attribute value overwritten in memory.");
+            Logger.info("Verify with !frame_getattr " + objHex + " \"" + member + "\"");
+            Logger.empty();
+            return "";
+        }
+    } catch (e) { /* Not an element */ }
+
+    // 2. Try as C++ member with multi-type fallback
+    Logger.info("Trying as C++ member...");
+
+    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member);
+    if (cppResult) {
+        Logger.info("[C++] Current value: " + cppResult.value);
+        Logger.info("[C++] Type: " + cppResult.type);
+        Logger.info("[C++] Via:  " + cppResult.typeCast);
+
+        var success = BlinkUnwrap.setCppMemberWithFallback(objHex, member, newValue);
+        if (success) {
+            Logger.info("[C++] Member value written.");
+            Logger.info("Verify with !frame_getattr " + objHex + " \"" + member + "\"");
+        } else {
+            Logger.error("[C++] Failed to write member value.");
+            Logger.info("Manual: dx &(" + cppResult.typeCast + objHex + ")->" + member);
+            Logger.info("Then use: ed <addr> <value>");
+        }
+        Logger.empty();
         return "";
     }
 
-    Logger.info("Found StringImpl at: " + implAddr);
-
-    // Check if new string fits (hacky safety check done in writeStringImpl)
-    // If it's too long, it will be truncated.
-    MemoryUtils.writeStringImpl(implAddr, value);
-
-    Logger.info("Attribute value overwritten directly in memory.");
-    Logger.info("Verify with !frame_getattr " + elemHex + " \"" + attr + "\"");
-
+    Logger.error("'" + member + "' not found.");
+    Logger.info("Use !frame_attrs to list available members.");
     Logger.empty();
     return "";
 }
@@ -1319,94 +1624,129 @@ function frame_elements(idx, tagName) {
     return "";
 }
 
-/// Get an attribute value from an element
-function frame_getattr(elementAddr, attrName) {
-    if (isEmpty(elementAddr) || isEmpty(attrName)) {
-        Logger.showUsage("Get Element Attribute", "!frame_getattr <element_addr> <attr_name>", [
-            "!frame_getattr 0x12345678 \"id\"",
-            "!frame_getattr 0x12345678 \"src\""
+/// Get a C++ member value from any Blink object (or DOM attribute from Element)
+function frame_getattr(objectAddr, memberName) {
+    if (isEmpty(objectAddr) || isEmpty(memberName)) {
+        Logger.showUsage("Get Object Member", "!frame_getattr <addr> <member>", [
+            "!frame_getattr 0x1234 \"sandbox_flags_\"  - LocalFrame member",
+            "!frame_getattr 0x1234 \"lifecycle_state_\" - Document member",
+            "!frame_getattr 0x1234 \"id\"              - Element DOM attr",
+            "!frame_getattr 0x1234 \"node_flags_\"     - Node member"
         ]);
-        Logger.info("Get element address from !frame_elem command first.");
+        Logger.info("Works with: LocalFrame, Document, LocalDOMWindow, Element, Node, etc.");
         Logger.empty();
         return "";
     }
 
-    var elemHex = normalizeAddress(elementAddr);
-    var attr = attrName.replace(/"/g, "");
+    var objHex = normalizeAddress(objectAddr);
+    var member = memberName.replace(/"/g, "");
 
-    Logger.section("Get Attribute: " + attr);
-    Logger.info("Element: " + elemHex);
+    Logger.section("Get Member: " + member);
+    Logger.info("Object: " + objHex);
     Logger.empty();
 
-    var val = BlinkUnwrap.getAttribute(elemHex, attr);
-    if (val !== null) {
-        Logger.info("Value: \"" + val + "\"");
-        return val;
+    // 1. First try DOM attribute (only works for Elements)
+    try {
+        var val = BlinkUnwrap.getAttribute(objHex, member);
+        if (val !== null) {
+            Logger.info("[DOM] " + member + "=\"" + val + "\"");
+            return val;
+        }
+    } catch (e) { /* Not an element */ }
+
+    // 2. Try C++ member with multi-type fallback
+    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member);
+    if (cppResult) {
+        Logger.info("[C++] " + member + " = " + cppResult.value);
+        Logger.info("       Type: " + cppResult.type);
+        Logger.info("       Via:  " + cppResult.typeCast);
+        return cppResult.value;
     }
 
-    Logger.info("Attribute not found or empty.");
+    Logger.info("Member not found.");
+    Logger.info("Use !frame_attrs to list available members.");
     Logger.empty();
     return "";
 }
 
-/// List all attributes of an element
-function frame_attrs(elementAddr, debug) {
-    if (isEmpty(elementAddr)) {
-        Logger.showUsage("Frame Attributes", "!frame_attrs <element_addr>", [
-            "!frame_attrs 0x12345678",
-            "!frame_attrs(0x12345678, true)  - Enable debug output"
+/// List all attributes of an object (DOM attributes and C++ members)
+/// Works with Element, LocalFrame, Document, LocalDOMWindow, etc.
+function frame_attrs(objectAddr, debug) {
+    if (isEmpty(objectAddr)) {
+        Logger.showUsage("Object Attributes & Members", "!frame_attrs <addr>", [
+            "!frame_attrs 0x12345678              - Any Blink object",
+            "!frame_attrs(0x12345678, true)       - Enable debug output"
         ]);
+        Logger.info("Works with: LocalFrame, Document, LocalDOMWindow, Element, Node, etc.");
         return "";
     }
 
-    var elemHex = normalizeAddress(elementAddr);
+    var objHex = normalizeAddress(objectAddr);
     var enableDebug = debug === true || debug === "true";
 
-    Logger.section("Element Attributes: " + elemHex);
+    Logger.section("Object Attributes & Members: " + objHex);
 
-    if (enableDebug) {
-        Logger.info("Debug mode enabled:");
-        Logger.empty();
-    }
-
+    // 1. Try DOM attributes (only works for Elements)
     var attrs = [];
+    try {
+        BlinkUnwrap._traverseAttributes(objHex, (name, base) => {
+            var valStr = BlinkUnwrap._extractAttributeValue(base);
+            attrs.push({ name: name, value: valStr || "" });
+        }, enableDebug);
+    } catch (e) { /* Not an element, skip DOM attrs */ }
 
-    BlinkUnwrap._traverseAttributes(elemHex, (name, base) => {
-        var valStr = BlinkUnwrap._extractAttributeValue(base);
-        attrs.push({ name: name, value: valStr || "" });
-    }, enableDebug);
-
-    if (attrs.length === 0) {
-        Logger.info("(No explicit attributes found)");
-        Logger.empty();
-        Logger.info("Try with debug: !frame_attrs(" + elemHex + ", true)");
-        Logger.info("Or inspect directly: dx ((blink::Element*)" + elemHex + ")");
-    } else {
+    if (attrs.length > 0) {
+        Logger.info("[DOM Attributes]");
         for (var a of attrs) {
             Logger.info("  " + a.name + "=\"" + a.value + "\"");
         }
+        Logger.empty();
     }
 
+    // 2. List C++ members with multi-type fallback
+    Logger.info("[C++ Members]");
+    var result = BlinkUnwrap.getCppMembersWithFallback(objHex);
+
+    if (result.members.length === 0) {
+        Logger.info("  (unable to enumerate)");
+        Logger.info("  Try: dx ((blink::LocalFrame*)" + objHex + ")");
+        Logger.info("       dx ((blink::Document*)" + objHex + ")");
+    } else {
+        Logger.info("  Detected type: " + result.typeCast);
+        Logger.empty();
+
+        // Output members with pointer addresses for nested objects
+        for (var m of result.members) {
+            var displayVal = m.value;
+
+            // If value is {...} or a complex object, try to get its address
+            if (displayVal === "{...}" || displayVal.indexOf("{...}") !== -1) {
+                // Get the member's pointer address
+                // Get the member's pointer address
+                var memberAddr = BlinkUnwrap.getMemberPointer(objHex, result.typeCast, m.name);
+                if (memberAddr) {
+                    // It's a pointer/object -> Show !frame_attrs ONLY
+                    Logger.info("  " + m.name + " -> " + memberAddr +
+                        "  !frame_attrs " + memberAddr);
+                } else {
+                    Logger.info("  " + m.name + " = " + displayVal +
+                        "  !frame_getattr(" + objHex + ", \"" + m.name + "\")");
+                }
+            } else {
+                if (displayVal.length > 50) {
+                    displayVal = displayVal.substring(0, 47) + "...";
+                }
+                Logger.info("  " + m.name + " = " + displayVal +
+                    "  !frame_getattr(" + objHex + ", \"" + m.name + "\")");
+            }
+        }
+    }
+
+    // Removed global hint since we now have per-line hints
     Logger.empty();
     return "";
 }
 
-/// Inspect a Blink Node/Object (Debugging helper)
-function blink_unwrap(addrStr) {
-    if (isEmpty(addrStr)) {
-        Logger.showUsage("Blink Unwrap", "!blink_unwrap <address>", ["!blink_unwrap 0x12ac004e2340"]);
-        return "";
-    }
-
-    try {
-        BlinkUnwrap.inspectNode(addrStr);
-    } catch (e) {
-        Logger.error("Error in blink_unwrap: " + e.message);
-    }
-
-    Logger.empty();
-    return "";
-}
 
 class ProcessUtils {
     static getCurrentSysId() {
@@ -1651,7 +1991,6 @@ function initializeScript() {
         new host.functionAlias(bp_jit, "bp_jit"),
         // V8 Pointer Compression
         new host.functionAlias(v8_cage_info, "v8_cage"),
-        new host.functionAlias(blink_unwrap, "blink_unwrap"),
         new host.functionAlias(decompress, "decompress"),
         new host.functionAlias(decompress_gc, "decompress_gc"),
         // Site Isolation
@@ -1726,21 +2065,20 @@ function help() {
 
     Logger.info("BLINK DOM HOOKS:");
     Logger.info("  !blink_help           - Show full Blink DOM help");
-    Logger.info("  !blink_unwrap(addr)   - Inspect Blink Node/Object");
     Logger.info("  !bp_element           - Break on DOM element creation");
     Logger.info("  !bp_nav               - Break on navigation");
     Logger.info("  !bp_pm                - Break on postMessage");
     Logger.info("  !bp_fetch             - Break on Fetch/XHR");
     Logger.empty();
 
-    Logger.info("PER-FRAME DOM INSPECTION:");
+    Logger.info("PER-FRAME DOM INSPECTION (DOM attrs + C++ members):");
     Logger.info("  !frame_doc(idx)       - Get Document for frame at index");
     Logger.info("  !frame_win(idx)       - Get LocalDOMWindow for frame at index");
     Logger.info("  !frame_origin(idx)    - Get SecurityOrigin for frame at index");
     Logger.info("  !frame_elem(idx,tag)  - List elements by tag name in frame");
-    Logger.info("  !frame_getattr(el,a)  - Get attribute value from element");
-    Logger.info("  !frame_setattr(el,a,v)- Set attribute value on element");
-    Logger.info("  !frame_attrs(el)      - List all attributes of element");
+    Logger.info("  !frame_getattr(el,a)  - Get DOM attribute OR C++ member (auto-detect)");
+    Logger.info("  !frame_setattr(el,a,v)- Set DOM attribute OR C++ member (auto-detect)");
+    Logger.info("  !frame_attrs(el)      - List all DOM attributes AND C++ members");
     Logger.empty();
 
     Logger.info("V8 EXPLOITATION HOOKS:");
@@ -2343,6 +2681,8 @@ function patch_function(funcName, returnValue) {
     var retVal = 0;
     if (isEmpty(returnValue)) {
         retVal = 0;
+    } else if (typeof returnValue === "boolean") {
+        retVal = returnValue ? 1 : 0;
     } else if (returnValue === "true" || returnValue === "TRUE" || returnValue === "True") {
         retVal = 1;
     } else if (returnValue === "false" || returnValue === "FALSE" || returnValue === "False") {
@@ -2432,21 +2772,17 @@ function patch_function(funcName, returnValue) {
                 // mov eax, VALUE (B8 + 4 bytes little-endian) then ret (C3)
                 if (retVal === 0) {
                     // xor eax, eax; ret = 31 C0 C3
-                    ctl.ExecuteCommand("eb 0x" + funcAddr + " 31 C0 C3");
+                    MemoryUtils.writeMemory(funcAddr, [0x31, 0xC0, 0xC3]);
                 } else if (retVal === 1) {
                     // mov eax, 1; ret = B8 01 00 00 00 C3
-                    ctl.ExecuteCommand("eb 0x" + funcAddr + " B8 01 00 00 00 C3");
+                    MemoryUtils.writeMemory(funcAddr, [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
                 } else {
                     // mov eax, VALUE; ret
                     var b0 = retVal & 0xFF;
                     var b1 = (retVal >> 8) & 0xFF;
                     var b2 = (retVal >> 16) & 0xFF;
                     var b3 = (retVal >> 24) & 0xFF;
-                    ctl.ExecuteCommand("eb 0x" + funcAddr + " B8 " +
-                        b0.toString(16).padStart(2, '0') + " " +
-                        b1.toString(16).padStart(2, '0') + " " +
-                        b2.toString(16).padStart(2, '0') + " " +
-                        b3.toString(16).padStart(2, '0') + " C3");
+                    MemoryUtils.writeMemory(funcAddr, [0xB8, b0, b1, b2, b3, 0xC3]);
                 }
 
                 Logger.info("  [PATCHED] " + sym.name + " @ 0x" + funcAddr);
@@ -2694,8 +3030,7 @@ function spoof_origin(targetUrl) {
                             if (ptrVal === searchStr.length && ptrVal < MAX_URL_STRING_LENGTH) {
                                 // Update length to replaceStr.length
                                 var newLen = replaceStr.length;
-                                var writeCmd = "ed 0x" + lenAddr.toString(16) + " 0x" + newLen.toString(16);
-                                ctl.ExecuteCommand(writeCmd);
+                                MemoryUtils.writeU32(lenAddr, newLen);
                                 lengthUpdated = true;
                             }
                         } catch (e) {
@@ -2704,24 +3039,26 @@ function spoof_origin(targetUrl) {
                     }
 
                     // Write the replacement string data
-                    var byteStr = "";
+                    // Write the replacement string data
+                    var bytes = [];
                     for (var i = 0; i < replaceStr.length; i++) {
                         var code = replaceStr.charCodeAt(i);
                         if (isUnicode) {
-                            byteStr += " " + (code & 0xFF).toString(16).padStart(2, '0');
-                            byteStr += " " + ((code >> 8) & 0xFF).toString(16).padStart(2, '0');
+                            bytes.push(code & 0xFF);
+                            bytes.push((code >> 8) & 0xFF);
                         } else {
-                            byteStr += " " + code.toString(16).padStart(2, '0');
+                            bytes.push(code & 0xFF);
                         }
                     }
 
                     // Pad remainder with nulls to overwrite old longer string
                     var charLen = isUnicode ? 2 : 1;
                     for (var k = replaceStr.length; k < searchStr.length; k++) {
-                        byteStr += (isUnicode ? " 00 00" : " 00");
+                        if (isUnicode) { bytes.push(0); bytes.push(0); }
+                        else bytes.push(0);
                     }
 
-                    ctl.ExecuteCommand('eb 0x' + addr + byteStr);
+                    MemoryUtils.writeMemory(addr, bytes);
                     patched++;
                 } catch (e) { }
             }
@@ -3212,6 +3549,12 @@ function _displayFrameInfo(ctl, f, index) {
     var rfId = _getFrameLabelId(ctl, f.renderFrame);
     Logger.info("  [Index: " + index + "] RenderFrameImpl:  " + f.renderFrame);
     Logger.info("       WebFrame:         " + f.webFrame);
+
+    // Get LocalFrame address (what frame commands work with)
+    var localFrame = BlinkUnwrap.getLocalFrame(f.webFrame);
+    if (localFrame && localFrame !== "0") {
+        Logger.info("       LocalFrame:       0x" + localFrame);
+    }
 
     var urlStr = _extractFrameUrl(ctl, f);
     if (urlStr) {

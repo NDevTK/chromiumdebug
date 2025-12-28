@@ -20,7 +20,7 @@ Then in WinDbg: `!chelp`
 | `!procs` | List all Chrome processes with types & sites |
 | `!proc` | Show current process type (+ site if renderer) |
 | `!cmdline` | Show command line switches |
-| `!frames` | List all frames (Local/Remote) with **URLs**, IDs, and addresses |
+| `!frames` | List all frames (Local/Remote) with URLs, IDs, and addresses for LocalFrame |
 
 ### Sandbox & Security
 | Command | Description |
@@ -52,18 +52,17 @@ Then in WinDbg: `!chelp`
 | `!bp_nav` | Break on navigation/location changes |
 | `!bp_pm` | Break on postMessage (cross-origin comms) |
 | `!bp_fetch` | Break on fetch/XHR requests |
-| `!blink_unwrap(addr)` | Inspect Blink Node/Object |
 
-### Per-Frame DOM Inspection
+### Per-Frame Inspection
 | Command | Description |
 |---------|-------------|
 | `!frame_doc(idx)` | Get Document object for frame at index |
 | `!frame_win(idx)` | Get LocalDOMWindow for frame at index |
 | `!frame_origin(idx)` | Get SecurityOrigin for frame at index |
 | `!frame_elem(idx,"tag")` | List elements by tag name in frame |
-| `!frame_getattr(el,"attr")` | Get attribute value from element |
-| `!frame_setattr(el,"attr","val")` | Set attribute value on element |
-| `!frame_attrs(el)` | List all attributes of element |
+| `!frame_getattr(el,"attr")` | Get attribute value from element and internal C++ variables |
+| `!frame_setattr(el,"attr","val")` | Set attribute value on element and internal C++ variables |
+| `!frame_attrs(el)` | List all attributes of element and internal C++ variables |
 
 ### V8 Exploitation Hooks
 | Command | Description |
