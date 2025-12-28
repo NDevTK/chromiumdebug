@@ -142,6 +142,33 @@ class SymbolUtils {
         } catch (e) { }
         return null;
     }
+
+    /// Get symbol name for a given address (using ln)
+    static getSymbolName(subsysAddr, debug) {
+        try {
+            // Use ln (list nearest) to get symbol
+            var cmd = "ln 0x" + subsysAddr;
+            if (debug) Logger.info("  [Debug] Running: " + cmd);
+
+            var output = this.getControl().ExecuteCommand(cmd);
+            for (var line of output) {
+                var lineStr = line.toString();
+                if (debug) Logger.info("  [Debug] ln output: " + lineStr);
+
+                // Format: (00007ffc`12345678)   module!SymbolName   |  (0000...) ...
+                // or:     (00007ffc`12345678)   module!SymbolName
+                // Match the symbol name part, allowing . ? @ $ which appear in mangled names
+                var match = lineStr.match(/\)\s+([a-zA-Z0-9_!:.?@$]+)/);
+                if (match) {
+                    if (debug) Logger.info("  [Debug] Matched symbol: " + match[1]);
+                    return match[1];
+                }
+            }
+        } catch (e) {
+            if (debug) Logger.info("  [Debug] ln failed: " + e.message);
+        }
+        return null;
+    }
 }
 
 class MemoryUtils {
@@ -852,12 +879,75 @@ class BlinkUnwrap {
         ];
     }
 
+
+
+    /// Detect the type of a Blink object using its vtable
+    static detectType(objectAddr, debug) {
+        var objHex = normalizeAddress(objectAddr);
+        if (!objHex) return null;
+
+        try {
+            // Read the first pointer (vtable pointer)
+            var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
+            if (debug) Logger.info("  [Debug] VTable Ptr: " + vtablePtr.toString(16));
+
+            if (vtablePtr.compareTo(0) === 0) return null;
+
+            // Resolve symbol for vtable
+            var symName = SymbolUtils.getSymbolName(vtablePtr.toString(16), debug);
+            if (symName) {
+                // Case 1: Standard symbol "chrome!blink::LocalFrame::vftable"
+                var matchStandard = symName.match(/!([a-zA-Z0-9_:]+)::vftable/);
+                if (matchStandard) {
+                    var className = matchStandard[1];
+                    if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
+                    return "(" + className + "*)";
+                }
+
+                // Case 2: MSVC/Weak symbol "chrome!weak.??_7HTMLIFrameElementblink"
+                // Matches ??_7 followed by ClassName
+                var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
+                if (matchMangled) {
+                    var rawName = matchMangled[1];
+                    // Name often ends with "blink" in these symbols, strip it if present
+                    if (rawName.endsWith("blink") && rawName.length > 5) {
+                        rawName = rawName.substring(0, rawName.length - 5);
+                    }
+                    // Most types are in blink namespace
+                    if (debug) Logger.info("  [Debug] Detected Type (Mangled): blink::" + rawName);
+                    return "(blink::" + rawName + "*)";
+                }
+
+                if (debug) {
+                    Logger.info("  [Debug] Symbol did not match vtable regex: " + symName);
+                }
+            }
+        } catch (e) {
+            if (debug) Logger.info("  [Debug] detectType failed: " + e.message);
+        }
+        return null;
+    }
+
     /// Get C++ member with fallback across multiple Blink types
     /// @param objectAddr - Address of the object
     /// @param memberPath - Member name
     /// @returns Object with {value, type, raw, typeCast} or null
     static getCppMemberWithFallback(objectAddr, memberPath) {
+        // 1. Try detected type first
+        var detectedType = this.detectType(objectAddr);
+        if (detectedType) {
+            var result = this.getCppMember(objectAddr, detectedType, memberPath);
+            if (result) {
+                result.typeCast = detectedType;
+                return result;
+            }
+        }
+
+        // 2. Fallback to list
         for (var typeCast of this.BLINK_TYPE_CASTS) {
+            // Skip if identical to detected (already tried)
+            if (typeCast === detectedType) continue;
+
             var result = this.getCppMember(objectAddr, typeCast, memberPath);
             if (result) {
                 result.typeCast = typeCast;
@@ -919,8 +1009,23 @@ class BlinkUnwrap {
     /// Get C++ members with fallback across multiple Blink types
     /// @param objectAddr - Address of the object
     /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
-    static getCppMembersWithFallback(objectAddr) {
+    /// Get C++ members with fallback across multiple Blink types
+    /// @param objectAddr - Address of the object
+    /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
+    static getCppMembersWithFallback(objectAddr, debug) {
+        // 1. Try detected type first
+        var detectedType = this.detectType(objectAddr, debug);
+        if (detectedType) {
+            var members = this.getCppMembers(objectAddr, detectedType);
+            if (members.length > 0) {
+                return { members: members, typeCast: detectedType };
+            }
+        }
+
+        // 2. Fallback to list
         for (var typeCast of this.BLINK_TYPE_CASTS) {
+            if (typeCast === detectedType) continue;
+
             var members = this.getCppMembers(objectAddr, typeCast);
             if (members.length > 0) {
                 return { members: members, typeCast: typeCast };
@@ -1695,7 +1800,7 @@ function frame_attrs(objectAddr, debug) {
 
     // 2. List C++ members with multi-type fallback
     Logger.info("[C++ Members]");
-    var result = BlinkUnwrap.getCppMembersWithFallback(objHex);
+    var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug);
 
     if (result.members.length === 0) {
         Logger.info("  (unable to enumerate)");
