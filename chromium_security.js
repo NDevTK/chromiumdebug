@@ -91,16 +91,6 @@ class Logger {
         }
     }
 
-    /// Output DML link that executes a command when clicked
-    static dmlCmd(text, command) {
-        return '<link cmd="' + command + '">' + text + '</link>';
-    }
-
-    /// Output a line with DML content
-    static dmlLine(content, indent = 2) {
-        host.diagnostics.debugLog(" ".repeat(indent) + content + "\n");
-    }
-
     /// Display filtered command line switches
     static displaySwitches(switches, filterList) {
         for (var i = 0; i < switches.length; i++) {
