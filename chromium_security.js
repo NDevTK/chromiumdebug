@@ -369,9 +369,22 @@ class MemoryUtils {
             var ptrStr = input.replace(/`/g, "");
             return BigInt(ptrStr.startsWith("0x") ? ptrStr : "0x" + ptrStr);
         } else if (typeof input === "number") {
+            // Handle JavaScript numbers - convert to unsigned hex
+            if (input < 0) {
+                // Negative number - convert to unsigned 32-bit
+                input = input >>> 0;
+            }
             return BigInt("0x" + input.toString(16));
         } else {
-            return BigInt(input);
+            // WinDbg host objects - convert to string first, then to hex
+            // This handles host.Int64 and similar types
+            try {
+                var str = input.toString(16);
+                return BigInt("0x" + str.replace(/`/g, ""));
+            } catch (e) {
+                // Fallback: try direct BigInt conversion
+                return BigInt(input);
+            }
         }
     }
 
@@ -411,18 +424,18 @@ class MemoryUtils {
 
     static decompressCppgcPtr(compressedPtr, contextAddr) {
         const kPointerCompressionShift = 3n;
-        const kCageBaseMask = BigInt("0xFFFFFFFC00000000"); // 16GB alignment?
+        const kCageBaseMask = BigInt("0xFFFFFFFC00000000");
 
         var compressed = this.parseBigInt(compressedPtr);
         if (compressed === 0n) return null;
 
         // Mask to 32-bit unsigned value
-        compressed = compressed & 0xFFFFFFFFn;  // Use BigInt literal for consistency
+        compressed = compressed & 0xFFFFFFFFn;
 
-        // Shift
+        // Shift left
         var offset = compressed << kPointerCompressionShift;
 
-        // Combine with Cage Base
+        // Get cage base from context address
         var base = 0n;
         if (contextAddr) {
             try {
@@ -432,7 +445,7 @@ class MemoryUtils {
         }
 
         if (base === 0n) {
-            // Fallback to global cage base if available
+            // Fallback to global cage base
             var cage = this.getCppgcCageBase();
             if (cage) {
                 base = BigInt("0x" + cage);
@@ -1529,60 +1542,109 @@ class BlinkUnwrap {
 
         if (!isValidPointer(dataAddr)) return;
 
-        // Bitfield
+        // Try to determine ElementData type via bit_field_ first
+        // ElementData::bit_field_ contains is_unique flag in bit 0
         var bitField = 0;
+        var isUnique = null; // null = unknown, true/false = detected
+
         try {
             var cmd = "dx -r0 ((blink::ElementData*)0x" + dataAddr + ")->bit_field_.bits_";
             var output = ctl.ExecuteCommand(cmd);
             for (var line of output) {
-                var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
+                var lineStr = line.toString();
+                if (lineStr.indexOf("Unable to") !== -1 || lineStr.indexOf("Error") !== -1) continue;
+                var m = lineStr.match(/:\s*(0x[0-9a-fA-F]+|\d+)/);
                 if (m) {
                     bitField = parseIntAuto(m[1]);
+                    // bit 0 = is_unique flag
+                    isUnique = (bitField & ELEMENT_DATA_UNIQUE_FLAG) !== 0;
+                    if (debug) {
+                        Logger.info("  [Debug] bitField: 0x" + bitField.toString(16) + " isUnique: " + isUnique);
+                    }
                     break;
                 }
             }
-        } catch (e) { }
-
-        var isUnique = bitField & ELEMENT_DATA_UNIQUE_FLAG;
-        var arraySize = (bitField >> 1) & ELEMENT_DATA_ARRAY_SIZE_MASK;
-        var count = isUnique ? 0 : arraySize;
-
-        if (debug) {
-            Logger.info("  [Debug] bitField: 0x" + bitField.toString(16) + " isUnique: " + isUnique + " arraySize: " + arraySize);
+        } catch (e) {
+            if (debug) Logger.info("  [Debug] bit_field_ read failed: " + e.message);
         }
 
-        if (isUnique) {
+        var count = 0;
+
+        // If bitfield detection failed, try probing both types
+        if (isUnique === null) {
+            if (debug) Logger.info("  [Debug] bitField detection failed, probing types...");
+
+            // Try UniqueElementData first (more common for elements with attributes)
             try {
-                var sizeCmd = "dx -r0 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_.size_";
-                var sizeOut = ctl.ExecuteCommand(sizeCmd);
-                for (var line of sizeOut) {
-                    if (debug) Logger.info("  [Debug] attribute_vector_.size_ output: " + line.toString());
-                    // Match both hex (0x1) and decimal (1) values
-                    var m = line.toString().match(/:[ ]*(0x[0-9a-fA-F]+|\d+)/);
-                    if (m) {
-                        count = parseIntAuto(m[1]);
+                var probeCmd = "dx -r0 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_[0]";
+                var probeOut = ctl.ExecuteCommand(probeCmd);
+                for (var line of probeOut) {
+                    var lineStr = line.toString();
+                    if (lineStr.indexOf("[Type:") !== -1 && lineStr.indexOf("Unable to") === -1) {
+                        isUnique = true;
+                        if (debug) Logger.info("  [Debug] Detected UniqueElementData via probe");
                         break;
                     }
                 }
-            } catch (e) {
-                if (debug) Logger.info("  [Debug] attribute_vector_.size_ failed: " + e.message);
-            }
+            } catch (e) { }
 
-            // Fallback: Try to enumerate via dx -r2 on attribute_vector_ directly
-            if (count === 0 && debug) {
+            if (isUnique === null) {
+                // Try ShareableElementData
                 try {
-                    var enumCmd = "dx -r2 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_";
-                    var enumOut = ctl.ExecuteCommand(enumCmd);
-                    for (var line of enumOut) {
-                        Logger.info("  [Debug] attribute_vector_ enum: " + line.toString());
+                    var probeCmd2 = "dx -r0 ((blink::ShareableElementData*)0x" + dataAddr + ")->attribute_array_[0]";
+                    var probeOut2 = ctl.ExecuteCommand(probeCmd2);
+                    for (var line of probeOut2) {
+                        var lineStr = line.toString();
+                        if (lineStr.indexOf("[Type:") !== -1 && lineStr.indexOf("Unable to") === -1) {
+                            isUnique = false;
+                            if (debug) Logger.info("  [Debug] Detected ShareableElementData via probe");
+                            break;
+                        }
                     }
-                } catch (e) {
-                    Logger.info("  [Debug] attribute_vector_ enum failed: " + e.message);
-                }
+                } catch (e) { }
             }
-
-            if (debug) Logger.info("  [Debug] Final count: " + count);
         }
+
+        // If still unknown, give up
+        if (isUnique === null) {
+            if (debug) Logger.info("  [Debug] Could not determine ElementData type - skipping");
+            return;
+        }
+
+        if (isUnique) {
+            // UniqueElementData: probe to find count since size_ may be unreliable
+            for (var probe = 0; probe < 100; probe++) {
+                try {
+                    var probeCmd = "dx -r0 ((blink::UniqueElementData*)0x" + dataAddr + ")->attribute_vector_[" + probe + "]";
+                    var probeOut = ctl.ExecuteCommand(probeCmd);
+                    var valid = false;
+                    for (var line of probeOut) {
+                        var lineStr = line.toString();
+                        if (lineStr.indexOf("out of bounds") !== -1 ||
+                            lineStr.indexOf("Unable to") !== -1 ||
+                            lineStr.indexOf("invalid") !== -1 ||
+                            lineStr.indexOf("Error:") !== -1) {
+                            break;
+                        }
+                        if (lineStr.indexOf("[Type:") !== -1) {
+                            valid = true;
+                        }
+                    }
+                    if (!valid) break;
+                    count = probe + 1;
+                } catch (e) { break; }
+            }
+            if (debug) Logger.info("  [Debug] UniqueElementData count via probe: " + count);
+        } else {
+            // ShareableElementData: use arraySize from bitfield
+            var arraySize = (bitField >> 1) & ELEMENT_DATA_ARRAY_SIZE_MASK;
+            if (arraySize >= 0 && arraySize <= 1000) {
+                count = arraySize;
+            }
+            if (debug) Logger.info("  [Debug] ShareableElementData count from bitfield: " + count);
+        }
+
+        if (debug) Logger.info("  [Debug] Final count: " + count);
 
         for (var i = 0; i < count; i++) {
             try {
@@ -2103,32 +2165,45 @@ function frame_attrs(objectAddr, debug) {
         Logger.info("  (unable to enumerate members)");
 
         // Check if this might be a compressed pointer / Member<T>
+        // Read the 4 bytes at this address as a potential compressed pointer
         try {
             var val32 = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 4)[0];
 
-            // To be robust, let's just use the cached or find cage.
-            if (!MemoryUtils._cppgcCageBase) MemoryUtils.findCageBases();
-
-            var ptrVal = null;
-            if (MemoryUtils._cppgcCageBase) {
-                ptrVal = MemoryUtils.decompressCppgcPtr(val32);
+            if (enableDebug) {
+                Logger.info("  [Debug] Raw value at address: 0x" + val32.toString(16));
             }
 
-            if (val32 === 0) {
-                Logger.info("  [Analysis] Member/Pointer is NULL (0x0).");
-            } else if (ptrVal && ptrVal !== "0") {
-                var targetHex = "0x" + ptrVal;
-                Logger.info("  [Analysis] Address contains a generic pointer or Member<T>.");
-                Logger.info("  Value: " + targetHex);
-                Logger.info("  !frame_attrs " + targetHex);
+            // Check if value looks like a compressed pointer (non-zero)
+            var val32Int = parseInt(val32.toString(16), 16);
 
-                // Try to detect type of the TARGET
-                var targetType = BlinkUnwrap.detectType(targetHex, enableDebug);
-                if (targetType) {
-                    Logger.info("  Target Type: " + targetType);
+            if (val32Int === 0) {
+                Logger.info("  [Analysis] Member/Pointer is NULL (0x0).");
+            } else {
+                // Try to decompress as cppgc pointer
+                var ptrVal = MemoryUtils.decompressCppgcPtr(val32, objHex);
+
+                if (ptrVal && ptrVal !== "0") {
+                    var targetHex = "0x" + ptrVal;
+                    Logger.info("  [Analysis] This address contains a compressed Member<T> pointer.");
+                    Logger.info("  Compressed: 0x" + val32.toString(16));
+                    Logger.info("  Decompressed: " + targetHex);
+                    Logger.empty();
+
+                    // Try to detect type of the TARGET
+                    var targetType = BlinkUnwrap.detectType(targetHex, enableDebug);
+                    if (targetType) {
+                        Logger.info("  Target Type: " + targetType);
+                        Logger.info("  Inspect with: !frame_attrs " + targetHex);
+                    } else {
+                        Logger.info("  !frame_attrs " + targetHex);
+                    }
+                } else {
+                    Logger.info("  [Analysis] Value 0x" + val32.toString(16) + " could not be decompressed.");
                 }
             }
-        } catch (e) { }
+        } catch (e) {
+            if (enableDebug) Logger.info("  [Debug] Member<T> analysis failed: " + e.message);
+        }
 
         Logger.info("  Try: dx ((blink::LocalFrame*)" + objHex + ")");
         Logger.info("       dx ((blink::Document*)" + objHex + ")");
