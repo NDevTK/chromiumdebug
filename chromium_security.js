@@ -43,6 +43,14 @@ function parseIntAuto(str) {
     return s.startsWith("0x") || s.startsWith("0X") ? parseInt(s, 16) : parseInt(s, 10);
 }
 
+/// Helper: Check if a BigInt value is a valid user-mode pointer
+/// @param val - BigInt value to check
+/// @returns true if val is within valid user-mode address range (0x10000 < val < 0x7fffffffffff)
+function isValidUserModePointer(val) {
+    if (typeof val !== "bigint") return false;
+    return val > BigInt(MIN_VALID_VTABLE_ADDR) && val < BigInt(USER_MODE_ADDR_LIMIT);
+}
+
 /// Helper: Register sxe cpr handler for renderer attach
 function _registerRendererSxeHandler(commandString, displayLabel) {
     try {
@@ -808,6 +816,46 @@ function isValidPointer(ptr) {
     return true;
 }
 
+/// Helper: Extract pointee type from smart pointer types
+/// Examples:
+///   "scoped_refptr<blink::SecurityOrigin>" -> "(blink::SecurityOrigin*)"
+///   "scoped_refptr<const blink::SecurityOrigin>" -> "(const blink::SecurityOrigin*)"
+///   "Member<blink::Document>" -> "(blink::Document*)"
+///   "cppgc::internal::BasicMember<blink::ElementData,..." -> "(blink::ElementData*)"
+///   "blink::SecurityOrigin *" -> "(blink::SecurityOrigin*)"
+/// @param typeStr - Type string from dx output
+/// @returns Type cast string like "(blink::SecurityOrigin*)" or null
+function extractPointeeType(typeStr) {
+    if (!typeStr) return null;
+
+    // Pattern 1: scoped_refptr<T>, unique_ptr<T>, Member<T>, DataRef<T>, RefPtr<T>, etc.
+    var match = typeStr.match(/(?:scoped_refptr|unique_ptr|Member|WeakMember|Persistent|CrossThreadPersistent|DataRef|RefPtr|base::RefCountedData)\s*<\s*([^<>,]+)/);
+    if (match) {
+        return "(" + match[1].trim() + "*)";
+    }
+
+    // Pattern 2: cppgc::internal::BasicMember<T, ...>
+    match = typeStr.match(/BasicMember\s*<\s*([^,<>]+)/);
+    if (match) {
+        return "(" + match[1].trim() + "*)";
+    }
+
+    // Pattern 3: Already a pointer type "T *" or "T*"
+    match = typeStr.match(/^([a-zA-Z_][a-zA-Z0-9_:]*(?:\s+const)?)\s*\*\s*$/);
+    if (match) {
+        return "(" + match[1].trim() + "*)";
+    }
+
+    // Pattern 4: Any template with single type arg - extract inner type as best guess
+    // e.g., "SomeWrapper<blink::StyleFoo>" -> "(blink::StyleFoo*)"
+    match = typeStr.match(/^[a-zA-Z_][a-zA-Z0-9_:]*\s*<\s*([a-zA-Z_][a-zA-Z0-9_:]+)\s*>$/);
+    if (match) {
+        return "(" + match[1].trim() + "*)";
+    }
+
+    return null;
+}
+
 /// Helper: Get a compressed member pointer value using symbols
 /// @param baseAddr - Base address (with or without 0x prefix)
 /// @param typeCast - Type cast string, e.g. "(blink::WebLocalFrameImpl*)"
@@ -1028,6 +1076,41 @@ class BlinkUnwrap {
                 if (lineStr.indexOf("Couldn't resolve") !== -1) return null;
                 if (lineStr.indexOf("No type information") !== -1) return null;
 
+                // Extract type first
+                var typeMatch = lineStr.match(/\[Type:\s*([^\]]+)\]/);
+                var typeStr = typeMatch ? typeMatch[1] : "unknown";
+
+                // Check if this is a BasicMember/Member pointer type that needs decompression
+                if (typeStr.indexOf("BasicMember") !== -1 || typeStr.indexOf("Member<") !== -1 ||
+                    typeStr.indexOf("scoped_refptr") !== -1 || typeStr.indexOf("WeakMember") !== -1) {
+                    // For pointer types, get the raw compressed value and decompress it
+                    try {
+                        var rawCmd = "dx &((" + typeCast + objHex + ")->" + memberPath + ".raw_)";
+                        var rawOutput = ctl.ExecuteCommand(rawCmd);
+                        var rawAddr = null;
+                        for (var rawLine of rawOutput) {
+                            var rawMatch = rawLine.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                            if (rawMatch) {
+                                rawAddr = rawMatch[1].replace(/`/g, "");
+                                break;
+                            }
+                        }
+                        if (rawAddr) {
+                            var compressedVal = host.memory.readMemoryValues(host.parseInt64(rawAddr, 16), 1, 4)[0];
+                            if (compressedVal === 0) {
+                                return { value: "null", type: typeStr, raw: lineStr };
+                            }
+                            var decompressed = MemoryUtils.decompressCppgcPtr(compressedVal, objHex);
+                            if (decompressed && decompressed !== "0") {
+                                var pointeeType = extractPointeeType(typeStr);
+                                return { value: "0x" + decompressed + (pointeeType ? " " + pointeeType : ""), type: typeStr, raw: lineStr };
+                            }
+                        }
+                    } catch (ptrErr) { }
+                    // Fallback: return the type description
+                    return { value: "(pointer type - use frame_attrs)", type: typeStr, raw: lineStr };
+                }
+
                 // Parse value from "member : value [Type: ...]" format
                 // Fix: Require space after colon to avoid matching "blink::Type"
                 var match = lineStr.match(/:\s+(.+?)\s*(?:\[Type:|$)/);
@@ -1035,9 +1118,6 @@ class BlinkUnwrap {
                     var rawValue = match[1].trim();
                     // Skip if value looks like an error
                     if (rawValue.indexOf("Unable to") !== -1) return null;
-                    // Extract type if present
-                    var typeMatch = lineStr.match(/\[Type:\s*([^\]]+)\]/);
-                    var typeStr = typeMatch ? typeMatch[1] : "unknown";
                     return { value: rawValue, type: typeStr, raw: lineStr };
                 }
             }
@@ -1056,57 +1136,98 @@ class BlinkUnwrap {
         if (!objHex) return false;
 
         var ctl = SymbolUtils.getControl();
-        var addrCmd = ""; // Declared outside try for error reporting
         try {
-            // First get the address of the member
-            addrCmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
-            var addrOutput = ctl.ExecuteCommand(addrCmd);
+            // First, get member info (address and type)
+            var memberCmd = "dx &(" + typeCast + objHex + ")->" + memberPath;
+            var memberOutput = ctl.ExecuteCommand(memberCmd);
             var memberAddr = null;
-            for (var line of addrOutput) {
-                // Fix: Require space after colon
+            for (var line of memberOutput) {
                 var m = line.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
                 if (m) {
                     memberAddr = m[1].replace(/`/g, "");
                     break;
                 }
             }
-            if (!memberAddr) return false;
-
-            // Determine value format
-            var writeValue = value;
-            if (typeof value === "string") {
-                if (value.toLowerCase() === "true") writeValue = "1";
-                else if (value.toLowerCase() === "false") writeValue = "0";
-            } else if (typeof value === "boolean") {
-                writeValue = value ? "1" : "0";
-            } else if (typeof value === "number") {
-                writeValue = "0x" + value.toString(16);
+            if (!memberAddr) {
+                Logger.error("Could not get member address");
+                return false;
             }
 
-            // Write using ed (4 bytes) - most common case for flags/ints
-            // Write using MemoryUtils
-            // We need to handle the value conversion here or in writeU32?
-            // writeU32 expects a number or string that converts to number locally?
-            // Let's pass the raw number to writeU32 if possible, or parsing it.
-
-            // The 'writeValue' logic above produced strings "1", "0", "0x..."
-            // Let's convert back to number for the new API, or just handle string in writeU32?
-            // Actually, writeU32 implementation below:
-            // var hexVal = value.toString(16);
-            // It expects a number.
-
-            var numericValue = 0;
-            if (writeValue.toString().startsWith("0x")) {
-                numericValue = parseInt(writeValue, 16);
-            } else {
-                numericValue = parseInt(writeValue);
+            // Get member type from dx
+            var typeCmd = "dx (" + typeCast + objHex + ")->" + memberPath;
+            var typeOutput = ctl.ExecuteCommand(typeCmd);
+            var memberType = "";
+            for (var line of typeOutput) {
+                var typeMatch = line.toString().match(/\[Type:\s*([^\]]+)\]/);
+                if (typeMatch) {
+                    memberType = typeMatch[1].trim();
+                    break;
+                }
             }
 
-            MemoryUtils.writeU32(memberAddr, numericValue);
-            return true;
+            // Handle different types
+            if (memberType.indexOf("blink::String") !== -1 || memberType.indexOf("WTF::String") !== -1) {
+                // String type - find StringImpl and write characters
+                var implCmd = "dx &((" + typeCast + objHex + ")->" + memberPath + ".impl_.ptr_)";
+                var implOutput = ctl.ExecuteCommand(implCmd);
+                var implPtrAddr = null;
+                for (var line of implOutput) {
+                    var m = line.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                    if (m) {
+                        implPtrAddr = m[1].replace(/`/g, "");
+                        break;
+                    }
+                }
+
+                if (implPtrAddr) {
+                    // Read the StringImpl* from the impl_.ptr_ field
+                    var implPtr = host.memory.readMemoryValues(host.parseInt64(implPtrAddr, 16), 1, 8)[0];
+                    var implAddrBig = MemoryUtils.parseBigInt(implPtr);
+                    if (implAddrBig !== 0n) {
+                        var implAddr = "0x" + implAddrBig.toString(16);
+                        MemoryUtils.writeStringImpl(implAddr, value);
+                        Logger.info("[C++] String written via StringImpl at " + implAddr);
+                        return true;
+                    }
+                }
+                Logger.error("Could not find StringImpl for String member");
+                return false;
+            }
+            else if (memberType === "bool") {
+                // Boolean - write 1 byte
+                var boolVal = (value === "true" || value === "1" || value === true) ? 1 : 0;
+                var writeCmd = "eb " + memberAddr + " " + boolVal;
+                ctl.ExecuteCommand(writeCmd);
+                return true;
+            }
+            else if (memberType.indexOf("unsigned int") !== -1 || memberType.indexOf("uint32_t") !== -1 ||
+                memberType.indexOf("int") !== -1 || memberType.indexOf("uint16_t") !== -1 ||
+                memberType.indexOf("short") !== -1) {
+                // 32-bit or smaller integer
+                MemoryUtils.writeU32(memberAddr, parseIntAuto(value));
+                return true;
+            }
+            else if (memberType.indexOf("uint64_t") !== -1 || memberType.indexOf("size_t") !== -1 ||
+                memberType.indexOf("uintptr_t") !== -1 || memberType.indexOf("*") !== -1) {
+                // 64-bit value or pointer
+                var numericValue = BigInt(parseIntAuto(value));
+                var writeCmd = "eq " + memberAddr + " " + numericValue.toString(16);
+                ctl.ExecuteCommand(writeCmd);
+                return true;
+            }
+            else {
+                // Default: try 32-bit write
+                Logger.info("[C++] Unknown type '" + memberType + "', trying 32-bit write...");
+                var numericValue = parseIntAuto(value);
+                if (isNaN(numericValue)) {
+                    Logger.error("Cannot convert value '" + value + "' to numeric");
+                    return false;
+                }
+                MemoryUtils.writeU32(memberAddr, numericValue);
+                return true;
+            }
         } catch (e) {
             Logger.error("setCppMember failed: " + e.message);
-            Logger.info("Command was: " + (typeof addrCmd !== 'undefined' ? addrCmd : "addrCmd not set"));
         }
         return false;
     }
@@ -1182,15 +1303,16 @@ class BlinkUnwrap {
             if (vtablePtr.compareTo(0) !== 0) {
                 var symName = SymbolUtils.getSymbolName(vtablePtr.toString(16), debug);
                 if (symName) {
-                    // Standard vtable symbol
-                    var matchStandard = symName.match(/!([a-zA-Z0-9_:]+)::vftable/);
-                    if (matchStandard) {
-                        var className = matchStandard[1];
+                    // Pattern 1: Standard vtable symbol (chrome!blink::ClassName::`vftable' or ::vftable)
+                    // Handle both ::vftable and ::`vftable' formats
+                    var matchVftable = symName.match(/!([a-zA-Z0-9_:]+)::(?:`vftable'|vftable)/);
+                    if (matchVftable) {
+                        var className = matchVftable[1];
                         if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
                         return "(" + className + "*)";
                     }
 
-                    // MSVC mangled vtable symbol (??_7...)
+                    // Pattern 2: MSVC mangled vtable symbol (??_7...)
                     var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
                     if (matchMangled) {
                         var rawName = matchMangled[1];
@@ -1202,65 +1324,23 @@ class BlinkUnwrap {
                         if (debug) Logger.info("  [Debug] Detected Type (Mangled): " + fullType);
                         return "(" + fullType + "*)";
                     }
+
+                    // Pattern 3: Fallback - any symbol with module!namespace::ClassName:: pattern
+                    var matchFallback = symName.match(/!([a-zA-Z_][a-zA-Z0-9_:]*)::/);
+                    if (matchFallback) {
+                        var className = matchFallback[1];
+                        if (debug) Logger.info("  [Debug] Detected Type (Fallback): " + className);
+                        return "(" + className + "*)";
+                    }
                 }
             }
         } catch (e) {
             if (debug) Logger.info("  [Debug] detectType direct check failed: " + e.message);
         }
 
-        // 2. Backward Scan Strategy
-        // If we didn't find a direct vtable, we might be an embedded struct.
-        if (noScan === true) return null;
-
-        try {
-            if (debug) Logger.info("  [Debug] Trying Backwards Scan for Parent VTable...");
-            var targetAddrInt = BigInt(objHex);
-
-            // Scan backwards up to 1.5KB (Blink objects can be large)
-            // Increment by 8 bytes (pointer size on 64-bit) to check each potential vtable location
-            for (var offset = 8; offset < MAX_BACKWARD_SCAN_BYTES; offset += 8) {
-                var candidateAddrBase = targetAddrInt - BigInt(offset);
-                var candidateHex = "0x" + candidateAddrBase.toString(16);
-
-                var val = 0n;
-                try {
-                    val = host.memory.readMemoryValues(host.parseInt64(candidateHex, 16), 1, 8)[0];
-                } catch (re) { continue; }
-
-                // Check if this value is a symbol ending in ::vftable or ??_7
-                if (val.compareTo(MIN_VALID_VTABLE_ADDR) < 0) continue;
-                var sym = SymbolUtils.getSymbolName(val.toString(16));
-
-                if (sym && (sym.indexOf("::vftable") !== -1 || sym.indexOf("??_7") !== -1)) {
-                    if (debug) Logger.info("  [Debug] Found vtable candidate at -0x" + offset.toString(16) + " (0x" + candidateAddrBase.toString(16) + ")");
-
-                    // Identify the type AT the candidate (calling detectType with noScan=true)
-                    var parentTypePtr = this.detectType(candidateHex, debug, true);
-                    if (parentTypePtr) {
-                        // Enumerate members to see if any match our target address
-                        var parentMembers = this.getCppMembers(candidateHex, parentTypePtr);
-                        if (debug) Logger.info("  [Debug]   Candidate " + parentTypePtr + " has " + parentMembers.length + " members. Checking offsets...");
-
-                        for (var m of parentMembers) {
-                            try {
-                                var mAddr = this.getMemberPointer(candidateHex, parentTypePtr, m.name);
-                                if (mAddr) {
-                                    var mAddrInt = BigInt(normalizeAddress(mAddr));
-                                    if (mAddrInt === targetAddrInt) {
-                                        if (debug) Logger.info("  [Debug]   MATCH: Parent '" + parentTypePtr + "' member '" + m.name + "' is at our address.");
-                                        return "(" + m.type + "*)";
-                                    }
-                                }
-                            } catch (me) { }
-                        }
-                    }
-                    // If we found a vtable but no member match, DO NOT break. 
-                    // It might be a secondary vtable (multiple inheritance). Keep scanning for the primary vtable.
-                }
-            }
-        } catch (e) {
-            if (debug) Logger.info("  [Debug] Backward scan failed: " + e.message);
-        }
+        // NOTE: Backward scan disabled - it was slow and produced false matches.
+        // Types without vtables (like SecurityOrigin) cannot be auto-detected.
+        // The pointer-following logic will still work; users can cast manually with dx.
 
         return null;
     }
@@ -1268,9 +1348,10 @@ class BlinkUnwrap {
     /// Get C++ member using detected type
     /// @param objectAddr - Address of the object
     /// @param memberPath - Member name
+    /// @param typeHint - Optional type hint for non-vtable types
     /// @returns Object with {value, type, raw, typeCast} or null
-    static getCppMemberWithFallback(objectAddr, memberPath) {
-        // Try detected type
+    static getCppMemberWithFallback(objectAddr, memberPath, typeHint) {
+        // Try detected type first
         var detectedType = this.detectType(objectAddr);
         if (detectedType) {
             var result = this.getCppMember(objectAddr, detectedType, memberPath);
@@ -1279,6 +1360,16 @@ class BlinkUnwrap {
                 return result;
             }
         }
+
+        // If typeHint provided, try that
+        if (typeHint) {
+            var result = this.getCppMember(objectAddr, typeHint, memberPath);
+            if (result) {
+                result.typeCast = typeHint;
+                return result;
+            }
+        }
+
         return null;
     }
 
@@ -1321,22 +1412,34 @@ class BlinkUnwrap {
     /// @param objectAddr - Address of the object
     /// @param memberPath - Member name
     /// @param value - Value to write
+    /// @param typeHint - Optional type hint for non-vtable types
     /// @returns true if successful
-    static setCppMemberWithFallback(objectAddr, memberPath, value) {
+    static setCppMemberWithFallback(objectAddr, memberPath, value, typeHint) {
+        // Try detected type first
         var detectedType = this.detectType(objectAddr);
         if (detectedType) {
             if (this.setCppMember(objectAddr, detectedType, memberPath, value)) {
                 return true;
             }
         }
+
+        // If typeHint provided, try that
+        if (typeHint) {
+            if (this.setCppMember(objectAddr, typeHint, memberPath, value)) {
+                return true;
+            }
+        }
+
         return false;
     }
 
     /// Get C++ members with fallback across multiple Blink types
     /// @param objectAddr - Address of the object
+    /// @param debug - Enable debug logging
+    /// @param typeHint - Optional type hint (e.g., "(blink::SecurityOrigin*)") to try if vtable detection fails
     /// @returns Object with {members: Array, typeCast: string} or {members: [], typeCast: null}
-    static getCppMembersWithFallback(objectAddr, debug) {
-        // 1. Try detected type first
+    static getCppMembersWithFallback(objectAddr, debug, typeHint) {
+        // 1. Try detected type first (vtable-based)
         var detectedType = this.detectType(objectAddr, debug);
         if (detectedType) {
             var members = this.getCppMembers(objectAddr, detectedType);
@@ -1345,9 +1448,15 @@ class BlinkUnwrap {
             }
         }
 
-        // 2. Previously we fell back to a hardcoded list (LocalFrame, Document, etc.)
-        // But this causes false positives (e.g. Member<T> structs being identified as LocalFrame).
-        // With vtable detection working, it is safer to return empty than to guess wrong.
+        // 2. If typeHint provided, try that
+        if (typeHint) {
+            var members = this.getCppMembers(objectAddr, typeHint);
+            if (members.length > 0) {
+                return { members: members, typeCast: typeHint };
+            }
+        }
+
+        // 3. No type detected or hinted - return empty
         return { members: [], typeCast: null };
     }
 
@@ -1766,12 +1875,16 @@ function _getFrameByIndex(idx) {
 }
 
 /// Set a C++ member value on any Blink object (or DOM attribute on Element)
-function frame_setattr(objectAddr, memberName, value) {
+/// @param objectAddr - Address of the object
+/// @param memberName - Member name
+/// @param value - New value
+/// @param typeHint - Optional type hint for non-vtable types
+function frame_setattr(objectAddr, memberName, value, typeHint) {
     if (isEmpty(objectAddr) || isEmpty(memberName)) {
         Logger.showUsage("Set Object Member", "!frame_setattr <addr> <member> <value>", [
             "!frame_setattr 0x1234 \"sandbox_flags_\" \"0x0\"  - LocalFrame member",
             "!frame_setattr 0x1234 \"id\" \"newId\"            - Element DOM attr",
-            "!frame_setattr 0x1234 \"node_flags_\" \"0x10\"    - Node member"
+            "!frame_setattr(0x1234, \"host_\", \"evil.com\", \"(blink::SecurityOrigin*)\") - With type hint"
         ]);
         Logger.info("Works with: LocalFrame, Document, LocalDOMWindow, Element, Node, etc.");
         Logger.empty();
@@ -1781,6 +1894,7 @@ function frame_setattr(objectAddr, memberName, value) {
     var objHex = normalizeAddress(objectAddr);
     var member = memberName.replace(/"/g, "");
     var newValue = value ? value.replace(/"/g, "") : "";
+    var typeHintStr = typeHint || null;
 
     Logger.section("Set Member: " + member);
     Logger.info("Object: " + objHex);
@@ -1800,16 +1914,16 @@ function frame_setattr(objectAddr, memberName, value) {
         }
     } catch (e) { /* Not an element */ }
 
-    // 2. Try as C++ member with multi-type fallback
+    // 2. Try as C++ member with multi-type fallback (and optional type hint)
     Logger.info("Trying as C++ member...");
 
-    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member);
+    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member, typeHintStr);
     if (cppResult) {
         Logger.info("[C++] Current value: " + cppResult.value);
         Logger.info("[C++] Type: " + cppResult.type);
         Logger.info("[C++] Via:  " + cppResult.typeCast);
 
-        var success = BlinkUnwrap.setCppMemberWithFallback(objHex, member, newValue);
+        var success = BlinkUnwrap.setCppMemberWithFallback(objHex, member, newValue, typeHintStr);
         if (success) {
             Logger.info("[C++] Member value written.");
             Logger.info("Verify with !frame_getattr " + objHex + " \"" + member + "\"");
@@ -2092,13 +2206,16 @@ function frame_elements(idx, tagName) {
 }
 
 /// Get a C++ member value from any Blink object (or DOM attribute from Element)
-function frame_getattr(objectAddr, memberName) {
+/// @param objectAddr - Address of the object
+/// @param memberName - Member name
+/// @param typeHint - Optional type hint for non-vtable types (e.g., "(blink::SecurityOrigin*)")
+function frame_getattr(objectAddr, memberName, typeHint) {
     if (isEmpty(objectAddr) || isEmpty(memberName)) {
         Logger.showUsage("Get Object Member", "!frame_getattr <addr> <member>", [
             "!frame_getattr 0x1234 \"sandbox_flags_\"  - LocalFrame member",
             "!frame_getattr 0x1234 \"lifecycle_state_\" - Document member",
             "!frame_getattr 0x1234 \"id\"              - Element DOM attr",
-            "!frame_getattr 0x1234 \"node_flags_\"     - Node member"
+            "!frame_getattr(0x1234, \"host_\", \"(blink::SecurityOrigin*)\") - With type hint"
         ]);
         Logger.info("Works with: LocalFrame, Document, LocalDOMWindow, Element, Node, etc.");
         Logger.empty();
@@ -2107,6 +2224,7 @@ function frame_getattr(objectAddr, memberName) {
 
     var objHex = normalizeAddress(objectAddr);
     var member = memberName.replace(/"/g, "");
+    var typeHintStr = typeHint || null;
 
     Logger.section("Get Member: " + member);
     Logger.info("Object: " + objHex);
@@ -2121,8 +2239,8 @@ function frame_getattr(objectAddr, memberName) {
         }
     } catch (e) { /* Not an element */ }
 
-    // 2. Try C++ member with multi-type fallback
-    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member);
+    // 2. Try C++ member with multi-type fallback (and optional type hint)
+    var cppResult = BlinkUnwrap.getCppMemberWithFallback(objHex, member, typeHintStr);
     if (cppResult) {
         Logger.info("[C++] " + member + " = " + cppResult.value);
         Logger.info("       Type: " + cppResult.type);
@@ -2138,7 +2256,10 @@ function frame_getattr(objectAddr, memberName) {
 
 /// List all attributes of an object (DOM attributes and C++ members)
 /// Works with Element, LocalFrame, Document, LocalDOMWindow, etc.
-function frame_attrs(objectAddr, debug) {
+/// @param objectAddr - Address of the object
+/// @param debug - Enable debug output
+/// @param typeHint - Optional type hint (e.g., "(blink::SecurityOrigin*)") for non-vtable types
+function frame_attrs(objectAddr, debug, typeHint) {
     if (isEmpty(objectAddr)) {
         Logger.showUsage("Object Attributes & Members", "!frame_attrs <addr>", [
             "!frame_attrs 0x12345678              - Any Blink object",
@@ -2150,6 +2271,7 @@ function frame_attrs(objectAddr, debug) {
 
     var objHex = normalizeAddress(objectAddr);
     var enableDebug = debug === true || debug === "true";
+    var typeHintStr = typeHint || null;
 
     Logger.section("Object Attributes & Members: " + objHex);
 
@@ -2172,80 +2294,188 @@ function frame_attrs(objectAddr, debug) {
 
     // 2. List C++ members with multi-type fallback
     Logger.info("[C++ Members]");
-    var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug);
+    var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug, typeHintStr);
 
     if (result.members.length === 0) {
-        Logger.info("  (unable to enumerate members)");
-
-        // Check if this might be a compressed pointer / Member<T>
-        // Read the 4 bytes at this address as a potential compressed pointer
+        // Pointer analysis: Try to determine if this address contains a pointer value.
+        // Use existing decompression functions for V8/CppGC compressed pointers.
+        // If we find a valid pointer, AUTOMATICALLY follow it (recursive call).
         try {
-            var val32 = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 4)[0];
+            var val64 = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
+            var val64Big = MemoryUtils.parseBigInt(val64);
+            var highBits = val64Big >> 32n;
+            var val32 = val64Big & 0xFFFFFFFFn;
 
             if (enableDebug) {
-                Logger.info("  [Debug] Raw value at address: 0x" + val32.toString(16));
+                Logger.info("  [Debug] Raw 64-bit value: 0x" + val64Big.toString(16));
+                Logger.info("  [Debug] High 32 bits: 0x" + highBits.toString(16) + ", Low 32 bits: 0x" + val32.toString(16));
             }
 
-            // Check if value looks like a compressed pointer (non-zero)
-            var val32Int = parseInt(val32.toString(16), 16);
+            var targetAddr = null;
+            var ptrType = null;
 
-            if (val32Int === 0) {
-                Logger.info("  [Analysis] Member/Pointer is NULL (0x0).");
-            } else {
-                // Try to decompress as cppgc pointer
-                var ptrVal = MemoryUtils.decompressCppgcPtr(val32, objHex);
+            // Case 1: High bits are non-zero - could be a raw 64-bit pointer
+            if (highBits !== 0n) {
+                var ptrHex = "0x" + val64Big.toString(16);
 
-                if (ptrVal && ptrVal !== "0") {
-                    var targetHex = "0x" + ptrVal;
-                    Logger.info("  [Analysis] This address contains a compressed Member<T> pointer.");
-                    Logger.info("  Compressed: 0x" + val32.toString(16));
-                    Logger.info("  Decompressed: " + targetHex);
-                    Logger.empty();
-
-                    // Try to detect type of the TARGET
-                    var targetType = BlinkUnwrap.detectType(targetHex, enableDebug);
-                    if (targetType) {
-                        Logger.info("  Target Type: " + targetType);
-                        Logger.info("  Inspect with: !frame_attrs " + targetHex);
+                // Check if value is in user-mode address range
+                if (isValidUserModePointer(val64Big)) {
+                    // IMPORTANT: Check if target is a symbol (vtable) - don't follow those
+                    // Vtables are in module space, data is in heap space
+                    var targetSym = SymbolUtils.getSymbolName(val64Big.toString(16));
+                    if (targetSym && (targetSym.indexOf("vftable") !== -1 || targetSym.indexOf("??_7") !== -1)) {
+                        if (enableDebug) Logger.info("  [Debug] Target " + ptrHex + " is a vtable symbol, not following.");
+                        // This IS an object (first qword is vtable), but we couldn't enumerate members
+                        // Don't treat it as a pointer to follow
                     } else {
-                        Logger.info("  !frame_attrs " + targetHex);
+                        // Verify target is readable
+                        try {
+                            host.memory.readMemoryValues(host.parseInt64(ptrHex, 16), 1, 8)[0];
+                            targetAddr = ptrHex;
+                            ptrType = "Raw 64-bit pointer";
+                        } catch (readErr) {
+                            if (enableDebug) Logger.info("  [Debug] Target " + ptrHex + " not readable.");
+                        }
+                    }
+                }
+            }
+
+            // Case 2: High bits are zero - could be compressed pointer
+            if (targetAddr === null && highBits === 0n && val32 !== 0n) {
+                // Try CppGC decompression first (most common in Blink)
+                var cppgcPtr = MemoryUtils.decompressCppgcPtr(val32, objHex);
+
+                if (cppgcPtr && cppgcPtr !== "0") {
+                    var testHex = "0x" + cppgcPtr;
+                    try {
+                        host.memory.readMemoryValues(host.parseInt64(testHex, 16), 1, 8)[0];
+                        targetAddr = testHex;
+                        ptrType = "Compressed CppGC pointer (Member<T>)";
+                    } catch (readErr) {
+                        if (enableDebug) Logger.info("  [Debug] CppGC target " + testHex + " not readable.");
+                    }
+                }
+
+                // Try V8 decompression if CppGC didn't work
+                if (targetAddr === null) {
+                    var v8Ptr = MemoryUtils.decompressV8Ptr(val32);
+
+                    if (v8Ptr && v8Ptr !== "0") {
+                        var testHex = "0x" + v8Ptr;
+                        try {
+                            host.memory.readMemoryValues(host.parseInt64(testHex, 16), 1, 8)[0];
+                            targetAddr = testHex;
+                            ptrType = "Compressed V8 pointer";
+                        } catch (readErr) {
+                            if (enableDebug) Logger.info("  [Debug] V8 target " + testHex + " not readable.");
+                        }
+                    }
+                }
+            }
+
+            // If we found a valid pointer target, AUTOMATICALLY follow it
+            if (targetAddr !== null) {
+                Logger.info("  [" + ptrType + " -> " + targetAddr + "]");
+                Logger.empty();
+                // Recursive call to inspect the target
+                return frame_attrs(targetAddr, debug, typeHintStr);
+            }
+
+            // Case 3: NULL pointer
+            if (val64Big === 0n) {
+                Logger.info("  [NULL pointer]");
+            } else {
+                // Not a pointer - if we have a typeHint from parent, use it
+                if (typeHintStr) {
+                    var members = BlinkUnwrap.getCppMembers(objHex, typeHintStr);
+                    if (members.length > 0) {
+                        Logger.info("  Detected type: " + typeHintStr);
+                        Logger.empty();
+                        for (var m of members) {
+                            var displayVal = m.value;
+                            if (displayVal.length > 50) {
+                                displayVal = displayVal.substring(0, 47) + "...";
+                            }
+                            var memberAddr = BlinkUnwrap.getMemberPointer(objHex, typeHintStr, m.name);
+                            if (memberAddr && (displayVal === "{...}" || displayVal.indexOf("{...}") !== -1)) {
+                                var memberTypeHint = extractPointeeType(m.type);
+                                Logger.info("  " + m.name + " -> " + memberAddr + "  !frame_attrs " + memberAddr);
+                            } else {
+                                Logger.info("  " + m.name + " = " + displayVal + "  !frame_getattr(" + objHex + ", \"" + m.name + "\")");
+                            }
+                        }
+                    } else {
+                        Logger.info("  (Type hint " + typeHintStr + " did not match)");
                     }
                 } else {
-                    Logger.info("  [Analysis] Value 0x" + val32.toString(16) + " could not be decompressed.");
+                    // No type hint - cannot determine type
+                    Logger.info("  (Type unknown - no vtable, no type hint)");
+                    Logger.info("  Provide type: !frame_attrs(" + objHex + ", false, \"(blink::TypeName*)\")");
                 }
             }
         } catch (e) {
-            if (enableDebug) Logger.info("  [Debug] Member<T> analysis failed: " + e.message);
+            Logger.info("  (unable to enumerate members)");
+            if (enableDebug) Logger.info("  [Debug] Pointer analysis failed: " + e.message);
         }
-
-        Logger.info("  Try: dx ((blink::LocalFrame*)" + objHex + ")");
-        Logger.info("       dx ((blink::Document*)" + objHex + ")");
     } else {
         Logger.info("  Detected type: " + result.typeCast);
         Logger.empty();
 
         // Output members with pointer addresses for nested objects
+        // Include current type hint in all commands for copy-paste convenience
+        var currentTypeHint = result.typeCast;
+
         for (var m of result.members) {
             var displayVal = m.value;
 
             // If value is {...} or a complex object, try to get its address
             if (displayVal === "{...}" || displayVal.indexOf("{...}") !== -1) {
-                // Get the member's pointer address
+                // Get the member's field address
                 var memberAddr = BlinkUnwrap.getMemberPointer(objHex, result.typeCast, m.name);
                 if (memberAddr) {
-                    // It's a pointer/object -> Show !frame_attrs ONLY
-                    Logger.info("  " + m.name + " -> " + memberAddr +
-                        "  !frame_attrs " + memberAddr);
+                    // Check if this is a pointer type (scoped_refptr<T>, Member<T>, etc.)
+                    var memberTypeHint = extractPointeeType(m.type);
+
+                    if (memberTypeHint) {
+                        // This is a pointer member - need to dereference to get actual target
+                        // Read the 8-byte value at the field address
+                        try {
+                            var ptrVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 8)[0];
+                            var ptrValBig = MemoryUtils.parseBigInt(ptrVal);
+
+                            if (ptrValBig !== 0n && isValidUserModePointer(ptrValBig)) {
+                                var targetAddr = "0x" + ptrValBig.toString(16);
+                                Logger.info("  " + m.name + " -> " + targetAddr +
+                                    "  !frame_attrs(" + targetAddr + ", false, \"" + memberTypeHint + "\")");
+                            } else if (ptrValBig === 0n) {
+                                Logger.info("  " + m.name + " = null  !frame_getattr(" + objHex + ", \"" + m.name + "\", \"" + currentTypeHint + "\")");
+                            } else {
+                                // Might be compressed pointer, show field address with type hint
+                                Logger.info("  " + m.name + " -> " + memberAddr +
+                                    "  !frame_attrs(" + memberAddr + ", false, \"" + memberTypeHint + "\")");
+                            }
+                        } catch (e) {
+                            // Fallback to field address
+                            Logger.info("  " + m.name + " -> " + memberAddr +
+                                "  !frame_attrs(" + memberAddr + ", false, \"" + memberTypeHint + "\")");
+                        }
+                    } else {
+                        // Embedded struct - memberAddr IS the object address
+                        // Use the member's type directly as the type hint
+                        var structType = "(" + m.type + "*)";
+                        Logger.info("  " + m.name + " -> " + memberAddr +
+                            "  !frame_attrs(" + memberAddr + ", false, \"" + structType + "\")");
+                    }
                 } else {
                     Logger.info("  " + m.name + " = " + displayVal +
-                        "  !frame_getattr(" + objHex + ", \"" + m.name + "\")");
+                        "  !frame_getattr(" + objHex + ", \"" + m.name + "\", \"" + currentTypeHint + "\")");
                 }
             } else {
                 if (displayVal.length > 50) {
                     displayVal = displayVal.substring(0, 47) + "...";
                 }
                 Logger.info("  " + m.name + " = " + displayVal +
-                    "  !frame_getattr(" + objHex + ", \"" + m.name + "\")");
+                    "  !frame_getattr(" + objHex + ", \"" + m.name + "\", \"" + currentTypeHint + "\")");
             }
         }
     }
