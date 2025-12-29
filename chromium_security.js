@@ -2697,13 +2697,414 @@ class ProcessUtils {
     }
 }
 
+
 /// =============================================================================
-/// INITIALIZATION
+/// EXECUTION ENGINE (!exec)
 /// =============================================================================
+
+class Exec {
+    /// Convert value to array of 8 bytes (64-bit Little Endian)
+    static _to64BitLE(val) {
+        var big = BigInt(val);
+        if (big < 0n) big = big + 0x10000000000000000n; // Handle negative
+        var bytes = [];
+        for (var i = 0; i < 8; i++) {
+            bytes.push(Number(big & 0xFFn));
+            big >>= 8n;
+        }
+        return bytes;
+    }
+
+    static exec(cmdString) {
+        Logger.section("Exec Command");
+        if (isEmpty(cmdString)) {
+            Logger.showUsage("!exec", '!exec "Target(Args)"', [
+                '!exec "chrome!blink::Document::IsSecureContext(0x12345678)"',
+                '!exec "0x12345678->MyMethod(10, true)"',
+                '!exec "chrome!SomeGlobal(0x123, \\"string arg\\")"'
+            ]);
+            return;
+        }
+
+        // Basic parsing
+        var entry = cmdString.trim();
+        var parenStart = entry.indexOf('(');
+        var parenEnd = entry.lastIndexOf(')');
+
+        if (parenStart === -1 || parenEnd === -1 || parenEnd < parenStart) {
+            Logger.error("Invalid format. Expected: Name(Args) or Ptr->Name(Args)");
+            return;
+        }
+
+        var namePart = entry.substring(0, parenStart).trim();
+        var argsPart = entry.substring(parenStart + 1, parenEnd);
+
+        var targetSymbol = namePart;
+        var thisPtr = null;
+
+        // Handle 0xAddr->Method(...) syntax
+        if (namePart.indexOf("->") !== -1) {
+            var parts = namePart.split("->");
+            if (parts.length === 2) {
+                var ptrPart = parts[0].trim();
+                var methodPart = parts[1].trim();
+
+                if (methodPart.indexOf("!") === -1) {
+                    // Try to auto-detect type
+                    var detectedType = BlinkUnwrap.detectType(ptrPart);
+                    if (detectedType) {
+                        // detectedType format: (chrome!Class*)
+                        var className = detectedType.replace(/[()*]/g, "");
+                        targetSymbol = className + "::" + methodPart;
+                        Logger.info("  [Auto-Detect] Resolved method: " + targetSymbol);
+                    } else {
+                        Logger.error("Cannot resolve method '" + methodPart + "' without type information/symbol.");
+                        Logger.info("  Provide fully qualified name, e.g., !exec \"0x...->chrome!Class::Method(...)\"");
+                        return;
+                    }
+                } else {
+                    targetSymbol = methodPart;
+                }
+                thisPtr = ptrPart;
+            }
+        }
+
+        // Resolve Target
+        var targetAddr = SymbolUtils.findSymbolAddress(targetSymbol);
+        if (!targetAddr) {
+            // Try strict address
+            if (targetSymbol.startsWith("0x")) targetAddr = targetSymbol;
+            else {
+                Logger.error("Symbol not found: " + targetSymbol);
+                return;
+            }
+        }
+
+        // Parse Args
+        var args = this._parseArgs(argsPart);
+
+        // Prepend 'this' if present
+        if (thisPtr) {
+            // Treat 'this' as a pointer argument
+            args.unshift(this._processArg(thisPtr));
+        }
+
+        Logger.info("  Target: " + targetSymbol + " @ " + targetAddr);
+        Logger.info("  Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
+
+        // Generate and Run
+        this._runX64(targetAddr, args);
+    }
+
+    static _parseArgs(argsStr) {
+        if (!argsStr || argsStr.trim() === "") return [];
+        var args = [];
+        var current = "";
+        var inQuote = false;
+
+        for (var i = 0; i < argsStr.length; i++) {
+            var c = argsStr[i];
+            if (c === '"') inQuote = !inQuote;
+            else if (c === ',' && !inQuote) {
+                args.push(this._processArg(current.trim()));
+                current = "";
+                continue;
+            }
+            current += c;
+        }
+        if (current.trim()) args.push(this._processArg(current.trim()));
+        return args;
+    }
+
+    static _processArg(arg) {
+        // String literal
+        if (arg.startsWith('"') && arg.endsWith('"')) {
+            return { type: 'string', value: arg.slice(1, -1) };
+        }
+        // Boolean
+        if (arg === 'true') return { type: 'int', value: 1 };
+        if (arg === 'false') return { type: 'int', value: 0 };
+        // Hex / Number
+        if (/^(0x)?[0-9a-fA-F]+$/.test(arg)) {
+            return { type: 'int', value: arg };
+        }
+        // Symbol?
+        if (arg.indexOf('!') !== -1) {
+            var addr = SymbolUtils.findSymbolAddress(arg);
+            if (addr) return { type: 'int', value: addr };
+        }
+
+        // Helper: check for 'compressed' syntax? 
+        // Assuming simple ints/pointers for now as per plan
+        return { type: 'int', value: arg };
+    }
+
+    static _runX64(targetAddr, args) {
+        // 1. Allocate scratch Memory
+        // Need space for: Shellcode + String Data + Result
+        var allocSize = 0x1000;
+        var baseAddrHex = MemoryUtils.alloc(allocSize);
+        if (!baseAddrHex) return;
+
+        var baseAddr = BigInt("0x" + baseAddrHex);
+
+        // Layout:
+        // +0x000: Result (8 bytes)
+        // +0x010: String Data Start...
+        // +0x800: Code Start (Arbitrary safe offset)
+
+        var resultOffset = 0x0n;
+        var dataOffset = 0x10n;
+        var codeOffset = 0x800n;
+
+        var currentDataOffset = dataOffset;
+
+        // Write String Args
+        for (var i = 0; i < args.length; i++) {
+            if (args[i].type === 'string') {
+                // Convert string to bytes
+                var str = args[i].value;
+                var bytes = [];
+                for (var j = 0; j < str.length; j++) bytes.push(str.charCodeAt(j));
+                bytes.push(0); // Null term
+
+                // Write to memory
+                var strAddr = baseAddr + currentDataOffset;
+                MemoryUtils.writeMemory(strAddr.toString(16), bytes);
+
+                // Update arg value to be the pointer
+                args[i].realValue = strAddr;
+                currentDataOffset += BigInt(bytes.length);
+                // 8-byte align
+                if (currentDataOffset % 8n !== 0n) currentDataOffset += (8n - (currentDataOffset % 8n));
+            } else {
+                // Integer/Pointer
+                args[i].realValue = MemoryUtils.parseBigInt(args[i].value);
+            }
+        }
+
+        // Generate Shellcode
+        var code = [];
+
+        // Prologue
+        // sub rsp, 0x28 (Shadow space 32 bytes + align) -> Actually just generic shadow space
+        // If we push args, we need to balance stack.
+        // Stack must be 16-byte aligned BEFORE the CALL instruction.
+        // 'int 3' acts as return point.
+
+        // Standard: Shadow space (32 bytes) is required.
+        // + stack args.
+
+        var stackArgsCount = (args.length > 4) ? (args.length - 4) : 0;
+        var stackSpace = stackArgsCount * 8;
+        // Always allocate 0x20 shadow space.
+        // Total alloc = 0x20 + stackSpace.
+        // Check alignment. 
+        // Initial RSP (at breakage) is aligned? Assume WinDbg context.
+        // We should align RSP to 16 bytes.
+
+        // Safety: Ensure RSP is 16-byte aligned.
+        // and rsp, -16
+        code.push(0x48, 0x83, 0xE4, 0xF0); // and rsp, -16
+
+        var totalStack = 0x20 + stackSpace;
+        if (totalStack % 16 !== 0) totalStack += 8; // align
+
+        // sub rsp, totalStack
+        if (totalStack < 128) {
+            code.push(0x48, 0x83, 0xEC, totalStack);
+        } else {
+            // sub rsp, imm32
+            code.push(0x48, 0x81, 0xEC);
+            code = code.concat([totalStack & 0xFF, (totalStack >> 8) & 0xFF, 0, 0]);
+        }
+
+        // Load Register Args (RCX, RDX, R8, R9)
+        var registers = [
+            [0x48, 0xB9], // mov rcx, imm64
+            [0x48, 0xBA], // mov rdx, imm64
+            [0x49, 0xB8], // mov r8, imm64
+            [0x49, 0xB9]  // mov r9, imm64
+        ];
+
+        for (var i = 0; i < Math.min(args.length, 4); i++) {
+            code = code.concat(registers[i]);
+            code = code.concat(this._to64BitLE(args[i].realValue));
+        }
+
+        // Push Stack Args
+        // Args 5+ go to [rsp + 0x20], [rsp + 0x28]...
+        // Warning: The space is already allocated (sub rsp). We should MOV them.
+        // Because if we PUSH, we mess up offsets relative to shadow space.
+        // Correct: mov [rsp + 0x28], arg5
+
+        for (var i = 4; i < args.length; i++) {
+            // mov rax, argVal
+            code.push(0x48, 0xB8);
+            code = code.concat(this._to64BitLE(args[i].realValue));
+
+            // mov [rsp + offset], rax
+            var offset = 0x20 + (i - 4) * 8;
+            code.push(0x48, 0x89, 0x44, 0x24, offset & 0xFF); // Valid for offset < 128 (approx)
+            // Simple encoding limited to byte offset. If offset >= 128 need different opcode?
+            // 0x44 is ModR/M byte?
+            // 48 89 84 24 [32-bit offset] for larger offsets.
+            if (offset >= 0x80) {
+                // Fallback to larger offset instruction
+                // Replace previous push
+                code.pop(); code.pop(); code.pop(); code.pop(); // Undo
+                // mov [rsp + disp32], rax
+                code.push(0x48, 0x89, 0x84, 0x24);
+                code = code.concat([offset & 0xFF, (offset >> 8) & 0xFF, 0, 0]);
+            }
+        }
+
+        // Call Target
+        // mov rax, targetAddr
+        code.push(0x48, 0xB8);
+        code = code.concat(this._to64BitLE(MemoryUtils.parseBigInt(targetAddr)));
+        // call rax
+        code.push(0xFF, 0xD0);
+
+        // Save Result
+        // mov rbx, resultAddr (pointer to baseAddr)
+        code.push(0x48, 0xBB);
+        code = code.concat(this._to64BitLE(baseAddr));
+        // mov [rbx], rax
+        code.push(0x48, 0x89, 0x03);
+
+        // Clean Stack (epilogue)
+        if (totalStack < 128) {
+            code.push(0x48, 0x83, 0xC4, totalStack);
+        } else {
+            code.push(0x48, 0x81, 0xC4);
+            code = code.concat([totalStack & 0xFF, (totalStack >> 8) & 0xFF, 0, 0]);
+        }
+
+        // Break
+        code.push(0xCC);
+
+        // Write Code
+        var codeAddr = baseAddr + codeOffset;
+        MemoryUtils.writeMemory(codeAddr.toString(16), code);
+
+        Logger.info("  Code injected at: 0x" + codeAddr.toString(16));
+        Logger.info("  Executing...");
+
+        // Execute via RIP hijacking
+        var ctl = SymbolUtils.getControl();
+
+        // Save current registers
+        // Using 'r' command to save to psuedo-registers
+        ctl.ExecuteCommand("r @$t0 = @rip");
+        ctl.ExecuteCommand("r @$t1 = @rsp");
+        ctl.ExecuteCommand("r @$t2 = @rcx");
+        ctl.ExecuteCommand("r @$t3 = @rdx");
+        ctl.ExecuteCommand("r @$t4 = @r8");
+        ctl.ExecuteCommand("r @$t5 = @r9");
+        ctl.ExecuteCommand("r @$t6 = @rax");
+
+        // Set RIP and Go
+        ctl.ExecuteCommand("r @rip = 0x" + codeAddr.toString(16));
+
+        // Run!
+        try {
+            ctl.ExecuteCommand("g");
+        } catch (e) {
+            Logger.warn("Execution finished (or break hit).");
+        }
+
+        // Read Result
+        var resultVals = host.memory.readMemoryValues(host.parseInt64(baseAddr.toString(16), 16), 1, 8);
+        var result = resultVals[0];
+
+        // Analyze Result
+        this._analyzeResult(result);
+
+        // Restore Registers
+        ctl.ExecuteCommand("r @rip = @$t0");
+        ctl.ExecuteCommand("r @rsp = @$t1");
+        ctl.ExecuteCommand("r @rcx = @$t2");
+        ctl.ExecuteCommand("r @rdx = @$t3");
+        ctl.ExecuteCommand("r @r8 = @$t4");
+        ctl.ExecuteCommand("r @r9 = @$t5");
+        ctl.ExecuteCommand("r @rax = @$t6");
+
+        Logger.info("  State restored.");
+    }
+
+    static _analyzeResult(result) {
+        // Result is BigInt or Host Object
+        var val = BigInt(result);
+        var hex = val.toString(16);
+
+        Logger.info("  Result (RAX): 0x" + hex);
+
+        // 1. Decimal Values
+        Logger.info("    Decimal (Unsigned): " + val.toString(10));
+
+        // Signed interpretation is trickier in JS BigInt without knowing bit-width, assume 64-bit for RAX
+        var signed = val;
+        if (signed >= 0x8000000000000000n) {
+            signed = signed - 0x10000000000000000n;
+        }
+        Logger.info("    Decimal (Signed):   " + signed.toString(10));
+
+        // 2. String Heuristics (Pointer?)
+        // Valid user-mode pointer approx range (0x10000 - 0x7FFFFFFFFFF)
+        if (val > 0x10000n && val < 0x7FFFFFFFFFFn) {
+            var ptrStr = "0x" + hex;
+
+            // Try reading as ASCII C-String
+            try {
+                // Read first 50 chars to check for printability
+                var ctl = SymbolUtils.getControl();
+                var cmd = "da " + ptrStr + " L50";
+                var output = ctl.ExecuteCommand(cmd);
+                for (var line of output) {
+                    // Windbg 'da' output: 00007ff6`...  "Hello World"
+                    var m = line.toString().match(/"(.*)"/);
+                    if (m) {
+                        Logger.info("    String (ASCII):     \"" + m[1] + "\"");
+                        // If long, might be truncated, but good enough for typical use
+                        break;
+                    }
+                }
+            } catch (e) { }
+
+            // Try reading as UTF-16 Wide-String works similarly with 'du'
+            try {
+                var cmd = "du " + ptrStr + " L50";
+                var output = ctl.ExecuteCommand(cmd);
+                for (var line of output) {
+                    var m = line.toString().match(/"(.*)"/);
+                    if (m) {
+                        Logger.info("    String (UTF-16):    \"" + m[1] + "\"");
+                        break;
+                    }
+                }
+            } catch (e) { }
+
+            // Check if it looks like a vtable (Symbol check)
+            var sym = SymbolUtils.getSymbolName(ptrStr);
+            if (sym) {
+                Logger.info("    Symbol:             " + sym);
+            }
+        }
+    }
+}
+
+/// =============================================================================
+
+function exec_command(cmd) {
+    return Exec.exec(cmd);
+}
 
 function initializeScript() {
     return [
         new host.apiVersionSupport(1, 7),
+        // Exec
+        new host.functionAlias(exec_command, "exec"),
         // Process info
         new host.functionAlias(chrome_process_type, "proc"),
         new host.functionAlias(chrome_cmdline, "cmdline"),

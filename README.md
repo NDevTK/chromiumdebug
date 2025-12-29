@@ -102,6 +102,17 @@ Then in WinDbg: `!chelp`
 | `!on_attach("cmd")` | Auto-run command when renderers attach |
 | `!script_attach("path")` | Auto-load script when renderers attach |
 
+### C++ Execution / REPL
+| Command | Description |
+|---------|-------------|
+| `!exec("Func")` | Execute a C++ function in the target process (via shellcode injection) |
+
+**Example:**
+```text
+!exec "chrome!v8::base::OS::GetCurrentProcessId()"
+```
+*Returns the process ID in the `Result (RAX)` line.*
+
 ## Files
 
 ```
