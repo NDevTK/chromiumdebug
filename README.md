@@ -39,6 +39,7 @@ Then in WinDbg: `!chelp`
 | `!bp_mojo` | Break on Mojo interface binding |
 | `!bp_ipc` | Break on IPC message dispatch |
 | `!trace_ipc` | Enable IPC message logging |
+| `!mojo_interfaces` | **List mojo interfaces exposed to current renderer** |
 
 ### Site Isolation Analysis
 | Command | Description |

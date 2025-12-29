@@ -2733,6 +2733,8 @@ function initializeScript() {
         new host.functionAlias(decompress_gc, "decompress_gc"),
         // Site Isolation
         new host.functionAlias(site_isolation_status, "site_iso"),
+        // Mojo Interface Introspection
+        new host.functionAlias(mojo_interfaces, "mojo_interfaces"),
         // Per-Frame DOM Inspection
         new host.functionAlias(frame_document, "frame_doc"),
         new host.functionAlias(frame_window, "frame_win"),
@@ -2803,6 +2805,7 @@ function help() {
     Logger.info("  !bp_bad               - Break on mojo::ReportBadMessage (security violations!)");
     Logger.info("  !bp_security          - Break on ChildProcessSecurityPolicy checks");
     Logger.info("  !trace_ipc            - Enable IPC message logging (noisy)");
+    Logger.info("  !mojo_interfaces      - List mojo interfaces exposed to current renderer");
     Logger.empty();
 
     Logger.info("VULNERABILITY HUNTING:");
@@ -3383,6 +3386,240 @@ function renderer_site() {
     Logger.empty();
 
     return site;
+}
+
+/// =============================================================================
+/// MOJO INTERFACE INTROSPECTION
+/// =============================================================================
+
+/// List mojo interfaces exposed to the current renderer process
+/// Requires running from a renderer, switches to browser to read BinderMap
+function mojo_interfaces() {
+    Logger.section("Mojo Interfaces Exposed to Renderer");
+
+    var ctl = SymbolUtils.getControl();
+
+    // 1. Verify we're in a renderer
+    var cmdLine = getCommandLine();
+    var info = ProcessUtils.parseInfoWithFallback(cmdLine);
+
+    if (info.type !== "renderer") {
+        Logger.warn("This command must be run from a renderer process.");
+        Logger.info("Current process type: " + info.type);
+        Logger.empty();
+        Logger.info("Use !procs to list processes, then |<id>s to switch to a renderer.");
+        Logger.empty();
+        return "";
+    }
+
+    // 2. Get renderer client ID
+    var clientId = null;
+    if (cmdLine) {
+        var clientMatch = cmdLine.match(/--renderer-client-id=(\d+)/);
+        if (clientMatch) clientId = clientMatch[1];
+    }
+
+    if (!clientId) {
+        Logger.warn("Could not determine renderer client ID.");
+        Logger.empty();
+        return "";
+    }
+
+    Logger.info("Renderer Client ID: " + clientId);
+    Logger.empty();
+
+    // 3. Remember current process to restore later  
+    var originalId = ProcessUtils.getCurrentSysId();
+
+    // Save renderer PID BEFORE switching context
+    var rendererPid = host.currentProcess.Id;
+
+    // 4. Find browser process
+    var browserSysId = get_browser_sysid();
+    if (browserSysId === null) {
+        Logger.warn("Could not find browser process.");
+        Logger.empty();
+        return "";
+    }
+
+    var interfaces = [];
+
+    try {
+        // 5. Switch to browser process
+        SymbolUtils.execute("|" + browserSysId + "s");
+
+        Logger.info("Querying interface binders from browser process...");
+        Logger.info("Filtering for renderer client ID: " + clientId + " (PID: " + rendererPid + ")");
+        Logger.empty();
+
+        // 6. Find RenderFrameHostImpl for this renderer and read its binder maps
+        // Structure: g_routing_id_frame_map -> flat_hash_map<GlobalRenderFrameHostId, RenderFrameHostImpl*>
+        // GlobalRenderFrameHostId contains child_id (ChildProcessId) which maps to renderer-client-id
+        // RenderFrameHostImpl -> broker_holder_ -> broker_ -> binder_map_ -> binders_
+
+        // Use SymbolUtils for cached symbol lookup
+        var frameMapAddr = SymbolUtils.findSymbolAddress("chrome!*g_routing_id_frame_map*");
+
+        if (!frameMapAddr) {
+            Logger.warn("Could not find g_routing_id_frame_map symbol.");
+            Logger.info("Try: .reload /f chrome.dll");
+            Logger.empty();
+            return "";
+        }
+
+        Logger.info("g_routing_id_frame_map (LazyInstance) at: 0x" + frameMapAddr);
+
+        // Read the LazyInstance::private_instance_ pointer to get actual map address
+        var mapPtr = null;
+        try {
+            var lazyAddrVal = BigInt("0x" + frameMapAddr);
+            var ptrValue = host.memory.readMemoryValues(host.parseInt64(lazyAddrVal.toString(16), 16), 1, 8)[0];
+            mapPtr = ptrValue.toString(16);
+        } catch (e) {
+            Logger.warn("Failed to read LazyInstance pointer: " + e.message);
+        }
+
+        if (!mapPtr || mapPtr === "0") {
+            Logger.warn("LazyInstance not initialized or map pointer is null.");
+            Logger.empty();
+            return "";
+        }
+
+        Logger.info("RoutingIDFrameMap at: 0x" + mapPtr);
+        Logger.empty();
+
+        // Enumerate the flat_hash_map to find RenderFrameHostImpl pointers
+        // Filter to only those matching our renderer's client ID
+        var rfhAddresses = [];
+        try {
+            // Cast the actual map pointer (not the LazyInstance wrapper)
+            var dxCmd = "dx -r5 (*((content::`anonymous namespace'::RoutingIDFrameMap*)0x" + mapPtr + "))";
+            var dxOutput = ctl.ExecuteCommand(dxCmd);
+
+            var currentProcessId = null;
+            for (var line of dxOutput) {
+                var lineStr = line.toString();
+
+                // Look for child_id in the GlobalRenderFrameHostId key
+                // Format varies - try multiple patterns
+                var processIdMatch = lineStr.match(/child_id_.*?id_\s*[=:]\s*(\d+)/i) ||
+                    lineStr.match(/child_id\s*[=:]\s*(\d+)/i) ||
+                    lineStr.match(/process_id.*?[=:]\s*(\d+)/i);
+                if (processIdMatch) {
+                    currentProcessId = processIdMatch[1];
+                }
+
+                // Look for RenderFrameHostImpl* values 
+                var rfhMatch = lineStr.match(/second\s*[=:]\s*(0x[0-9a-fA-F`]+)/i) ||
+                    lineStr.match(/RenderFrameHostImpl\s*\*?\s*[=:]\s*(0x[0-9a-fA-F`]+)/i);
+                if (rfhMatch) {
+                    var rfhAddr = rfhMatch[1].replace(/`/g, "");
+
+                    // Filter: only include RFHIs from our renderer (matching client ID)
+                    if (rfhAddr !== "0x0" && rfhAddr !== "0" && currentProcessId === clientId) {
+                        rfhAddresses.push(rfhAddr);
+                    }
+                    currentProcessId = null; // Reset for next entry
+                }
+            }
+        } catch (e) {
+            // Map enumeration failed
+        }
+
+        Logger.info("Found " + rfhAddresses.length + " RenderFrameHostImpl(s) for this renderer");
+        Logger.empty();
+
+        // For each RFH, read the broker's binder maps
+        var foundInterfaces = new Map();
+
+        for (var rfhAddr of rfhAddresses) {
+            try {
+                // Read broker binder map interfaces
+                // Path: rfh->broker_holder_->broker_->binder_map_->binders_
+
+                // Use deep recursion to find all interface names in the broker structure
+                var binderCmd = "dx -r6 ((content::RenderFrameHostImpl*)" + rfhAddr + ")->broker_holder_";
+                var binderOutput = ctl.ExecuteCommand(binderCmd);
+
+                for (var bLine of binderOutput) {
+                    var bStr = bLine.toString();
+
+                    // Capture ANY quoted string containing ".mojom." - don't be restrictive
+                    // This ensures we don't miss interfaces with unusual naming patterns
+                    var matches = bStr.match(/"([^"]*\.mojom\.[^"]+)"/g);
+                    if (matches) {
+                        for (var m of matches) {
+                            var ifaceName = m.replace(/"/g, "");
+                            foundInterfaces.set(ifaceName, true);
+                        }
+                    }
+                }
+
+            } catch (rfhErr) {
+                // May fail for some RFHIs, continue
+            }
+        }
+
+        // Convert Map keys to array
+        interfaces = Array.from(foundInterfaces.keys()).sort();
+
+    } finally {
+        // 7. Always restore original process context
+        try {
+            if (originalId !== null && originalId !== 0) {
+                SymbolUtils.execute("|" + originalId + "s");
+            }
+        } catch (e) { }
+    }
+
+    // 8. Display results
+    if (interfaces.length === 0) {
+        Logger.info("No interfaces found.");
+        Logger.empty();
+        return "";
+    }
+
+    Logger.info("Found " + interfaces.length + " mojo interface(s) exposed to renderer:");
+    Logger.info("-".repeat(70));
+    Logger.empty();
+
+    // Group by namespace
+    var byNamespace = new Map();
+    for (var iface of interfaces) {
+        var dotIdx = iface.lastIndexOf(".");
+        var ns = dotIdx > 0 ? iface.substring(0, dotIdx) : "(unknown)";
+        if (!byNamespace.has(ns)) {
+            byNamespace.set(ns, []);
+        }
+        byNamespace.get(ns).push(iface);
+    }
+
+    // Display grouped
+    for (var entry of byNamespace) {
+        var namespace = entry[0];
+        var ifaces = entry[1];
+
+        Logger.info("  " + namespace + " (" + ifaces.length + " interfaces):");
+
+        for (var iface of ifaces) {
+            var className = iface.substring(iface.lastIndexOf(".") + 1);
+            Logger.info("    - " + className);
+        }
+        Logger.empty();
+    }
+
+    Logger.info("Total: " + interfaces.length + " interfaces");
+    Logger.empty();
+
+    Logger.info("Chromium Source Reference:");
+    Logger.info("  https://source.chromium.org/chromium/chromium/src/+/main:content/browser/browser_interface_binders.cc");
+    Logger.empty();
+
+    Logger.info("To find .mojom file for an interface:");
+    Logger.info("  https://source.chromium.org/search?q=<interface_name>.mojom");
+    Logger.empty();
+
+    return "";
 }
 
 /// =============================================================================
