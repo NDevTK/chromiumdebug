@@ -90,7 +90,7 @@ Then in WinDbg: `!chelp`
 | Command | Description |
 |---------|-------------|
 | `!spoof("url")` | Spoof renderer origin (memory patch). Supports subdomains/paths. |
-| `!patch("FullscreenIsSupported","false")` | Patch function to return value (supports true/false/hex, auto-inlining detection) |
+| `!patch("Func","val")` | Patch function return value. Supports booleans, hex, numbers, AND strings (allocates memory). |
 
 ### Cross-Process Execution
 | Command | Description |

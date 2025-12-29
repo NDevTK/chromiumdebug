@@ -631,6 +631,28 @@ class MemoryUtils {
 
         Logger.info("Overwrote string in memory at 0x" + dataAddr + ".");
     }
+
+    /// Allocate memory in the target process (wrapper for .dvalloc)
+    static alloc(size) {
+        if (!size || size <= 0) return null;
+        var ctl = SymbolUtils.getControl();
+        try {
+            // Allocate memory (PAGE_EXECUTE_READWRITE for flexibility)
+            // .dvalloc [Options] size
+            var cmd = ".dvalloc " + size;
+            var output = ctl.ExecuteCommand(cmd);
+            for (var line of output) {
+                // Output format: Allocating 100 bytes starting at 0000021c`3d250000
+                var match = line.toString().match(/starting at ([0-9a-fA-F`]+)/);
+                if (match) {
+                    return match[1].replace(/`/g, "");
+                }
+            }
+        } catch (e) {
+            Logger.error("Memory allocation failed: " + e.message);
+        }
+        return null;
+    }
 }
 
 class CommandLineUtils {
@@ -3687,7 +3709,40 @@ function patch_function(funcName, returnValue) {
         retVal = parseInt(returnValue) || 0;
     }
 
-    Logger.info("  Return value: " + retVal + (retVal === 0 ? " (false)" : retVal === 1 ? " (true)" : ""));
+    // String Support: If returnValue is a string that wasn't parsed as hex/bool
+    // or if the user explicitly provided a quoted string that resulted in 0/NaN
+    if (typeof returnValue === "string" && !returnValue.toString().startsWith("0x") &&
+        returnValue !== "true" && returnValue !== "false" && isNaN(parseInt(returnValue))) {
+
+        Logger.info("  Detected string input: \"" + returnValue + "\"");
+        var strLen = returnValue.length;
+        // Allocate memory for the string (plus null terminator)
+        // If 64-bit, we might want to align, but dvalloc usually page-aligns or 16-byte aligns.
+        // We'll treat it as a raw C-string (const char*).
+        var allocAddr = MemoryUtils.alloc(strLen + 1);
+
+        if (allocAddr) {
+            Logger.info("  Allocated memory for string at: 0x" + allocAddr);
+
+            // Write string bytes
+            var bytes = [];
+            for (var i = 0; i < strLen; i++) {
+                bytes.push(returnValue.charCodeAt(i) & 0xFF);
+            }
+            bytes.push(0); // Null terminator
+
+            MemoryUtils.writeMemory(allocAddr, bytes);
+
+            // Set return value to the address of the string
+            retVal = BigInt("0x" + allocAddr);
+            Logger.info("  Patching function to return pointer: 0x" + allocAddr);
+        } else {
+            Logger.error("  Failed to allocate memory for string. Aborting patch.");
+            return "";
+        }
+    }
+
+    Logger.info("  Return value: " + retVal.toString(16) + (retVal === 0 ? " (false)" : retVal === 1 ? " (true)" : ""));
     Logger.empty();
 
     try {
@@ -3770,6 +3825,14 @@ function patch_function(funcName, returnValue) {
                 } else if (retVal === 1) {
                     // mov eax, 1; ret = B8 01 00 00 00 C3
                     MemoryUtils.writeMemory(funcAddr, [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+                } else if (typeof retVal === "bigint") {
+                    // mov rax, IMM64; ret = 48 B8 ... C3
+                    var bytes = [0x48, 0xB8];
+                    for (var i = 0n; i < 64n; i += 8n) {
+                        bytes.push(Number((retVal >> i) & 0xFFn));
+                    }
+                    bytes.push(0xC3);
+                    MemoryUtils.writeMemory(funcAddr, bytes);
                 } else {
                     // mov eax, VALUE; ret
                     // Use unsigned right shift (>>>) to handle large positive values correctly
