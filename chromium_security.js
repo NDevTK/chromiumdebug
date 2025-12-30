@@ -2932,6 +2932,8 @@ class ProcessUtils {
 /// =============================================================================
 
 class Exec {
+    static _forcedContext = null;
+
     /// Convert value to array of 8 bytes (64-bit Little Endian)
     static _to64BitLE(val) {
         var big = BigInt(val);
@@ -3037,9 +3039,10 @@ class Exec {
             // Use result as 'this' for next call
             // Result is already "0x..." string
             currentThis = result;
+            this._forcedContext = currentThis; // Memory: Pin this address as the forced context
             this.currentThis = currentThis; // Store statically for _analyzeResult context
 
-            Logger.info("  [Trace] Next 'this': " + currentThis);
+            Logger.info("  [Trace] Next 'this' & forcedContext: " + this._forcedContext);
         }
         // Return final result for chaining (already a hex string, safe to return)
         return result;
@@ -3051,6 +3054,21 @@ class Exec {
     /// @param className - Fully qualified class name (e.g., "blink::Document")
     /// @param frameIndex - Optional frame index (default: 0)
     static _resolveAutoThis(className, frameIndex = 0) {
+        // If we have a forced context pinned, try to use it
+        if (this._forcedContext) {
+            Logger.info("    [Auto-This] Attempting resolution from pinned context: " + this._forcedContext);
+            // We can't easily resolve from a raw address without a type normally, 
+            // but for common classes we can try to cast the forced context itself.
+            var detected = BlinkUnwrap.detectType(this._forcedContext);
+            if (detected) {
+                var detectedName = detected.replace(/[()*]/g, "");
+                if (detectedName === className) {
+                    Logger.info("    [Auto-This] Pinned context matches " + className + ": " + this._forcedContext);
+                    return this._forcedContext;
+                }
+            }
+        }
+
         // Lookup table: className -> resolver function (takes localFrame, returns instance)
         var resolvers = {
             "blink::LocalFrame": function (lf) { return lf; },
@@ -3099,6 +3117,18 @@ class Exec {
             argsPart = entry.substring(parenStart + 1, parenEnd);
         }
 
+        // Support raw hex address as a segment: !exec "0x1234->Func()"
+        var trimEntry = entry.trim();
+        if (trimEntry.startsWith("0x") && trimEntry.indexOf("->") === -1 && trimEntry.indexOf("(") === -1) {
+            // Regex to verify it's just a hex address (allowing backticks)
+            if (/^0x[0-9a-fA-F`]+$/.test(trimEntry)) {
+                var addr = trimEntry.replace(/`/g, "");
+                Logger.info("    [Segment] Detected raw address. Pining context: " + addr);
+                this._forcedContext = addr;
+                return addr;
+            }
+        }
+
         var targetSymbol = namePart;
         var thisPtr = thisOverride;
 
@@ -3126,6 +3156,7 @@ class Exec {
                     targetSymbol = methodPart;
                 }
                 thisPtr = ptrPart;
+                this._forcedContext = thisPtr; // Pin context from explicit pointer
             }
         }
 
