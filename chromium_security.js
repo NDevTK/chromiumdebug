@@ -3273,16 +3273,6 @@ class Exec {
             if (bestCandidate) {
                 Logger.info("    [Chain] Selected best inlined candidate @ " + bestCandidate.address + " (Offset: 0x" + bestOffset.toString(16) + ")");
 
-                // Cache the successful inline candidate
-                GlobalCache.setResolvedCall(targetSymbol, {
-                    type: 'inline',
-                    addr: bestCandidate.address,
-                    size: bestCandidate.size,
-                    inputReg: bestRegs.inputReg,
-                    outputReg: bestRegs.outputReg,
-                    returnTypeHint: this.currentReturnTypeHint
-                });
-
                 return this._executeInlinedCode(bestCandidate.address, bestCandidate.size, args, bestRegs.inputReg, bestRegs.outputReg);
             } else {
                 Logger.error("    [Chain] Could not find a suitable inlined candidate.");
@@ -3333,16 +3323,6 @@ class Exec {
         Logger.info("    Target: " + targetSymbol + " @ " + targetAddr);
         Logger.info("    Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
 
-        // Generate and Run
-        // Generate and Run
-        if (targetAddr && !targetSymbol.startsWith("0x")) {
-            // Cache direct function call
-            GlobalCache.setResolvedCall(targetSymbol, {
-                type: 'func',
-                addr: targetAddr,
-                returnTypeHint: this.currentReturnTypeHint
-            });
-        }
         return this._runX64(targetAddr, args);
     }
 
