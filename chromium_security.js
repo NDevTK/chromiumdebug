@@ -3028,9 +3028,11 @@ class Exec {
                 return null;
             }
 
-            // check for null result or "0x0"
-            if (result === null || result === "0x0") {
-                Logger.error("  Chain terminated: call returned null/0.");
+            // check for null result or "0x0" - but only for INTERMEDIATE calls
+            // The final call can return 0x0 as a valid boolean (false)
+            var isLastCall = (i === calls.length - 1);
+            if (result === null || (result === "0x0" && !isLastCall)) {
+                Logger.error("  Chain terminated: intermediate call returned null/0.");
                 return null;
             }
 
@@ -3217,6 +3219,24 @@ class Exec {
             symInfo = SymbolUtils.getSymbolInfo(targetSymbol);
         }
 
+        // Infer return type hint for analysis
+        this.currentReturnTypeHint = null;
+        var methodOnly = targetSymbol;
+        var classOnly = null;
+        if (targetSymbol.includes("::")) {
+            var lastCC = targetSymbol.lastIndexOf("::");
+            methodOnly = targetSymbol.substring(lastCC + 2);
+            classOnly = targetSymbol.substring(0, lastCC);
+            // clean chrome! prefix
+            if (classOnly.includes("!")) classOnly = classOnly.split("!")[1];
+        }
+
+        var inferredType = Exec._inferReturnType(methodOnly, classOnly);
+        if (inferredType) {
+            Logger.info("    [Type Inference] Inferred return type: " + inferredType);
+            this.currentReturnTypeHint = inferredType;
+        }
+
         // Parse Args (before execution paths branch)
         var args = this._parseArgs(argsPart);
         if (thisPtr) {
@@ -3252,6 +3272,17 @@ class Exec {
 
             if (bestCandidate) {
                 Logger.info("    [Chain] Selected best inlined candidate @ " + bestCandidate.address + " (Offset: 0x" + bestOffset.toString(16) + ")");
+
+                // Cache the successful inline candidate
+                GlobalCache.setResolvedCall(targetSymbol, {
+                    type: 'inline',
+                    addr: bestCandidate.address,
+                    size: bestCandidate.size,
+                    inputReg: bestRegs.inputReg,
+                    outputReg: bestRegs.outputReg,
+                    returnTypeHint: this.currentReturnTypeHint
+                });
+
                 return this._executeInlinedCode(bestCandidate.address, bestCandidate.size, args, bestRegs.inputReg, bestRegs.outputReg);
             } else {
                 Logger.error("    [Chain] Could not find a suitable inlined candidate.");
@@ -3303,6 +3334,15 @@ class Exec {
         Logger.info("    Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
 
         // Generate and Run
+        // Generate and Run
+        if (targetAddr && !targetSymbol.startsWith("0x")) {
+            // Cache direct function call
+            GlobalCache.setResolvedCall(targetSymbol, {
+                type: 'func',
+                addr: targetAddr,
+                returnTypeHint: this.currentReturnTypeHint
+            });
+        }
         return this._runX64(targetAddr, args);
     }
 
@@ -3439,19 +3479,27 @@ class Exec {
         }
 
         // Use x /v to find function info from PDB
-        // STRICT MODE: Only search for explicit class::method
+        // NOTE: WinDbg's x command doesn't return 'prv inline' entries with exact names
+        // Wildcards are REQUIRED to find inline function instances
+        // We try multiple patterns:
+        //   1. Targeted wildcard for exact class (primary)
+        //   2. Exact match fallback
+        //   3. Method-only wildcard to find on base classes (fallback for inheritance)
         var patterns = [
-            "chrome!" + className + "::" + methodName
+            "chrome!*" + className + "::" + methodName + "*",  // Wildcard for inlines (primary)
+            "chrome!" + className + "::" + methodName,         // Exact match
+            "chrome!*::" + methodName                          // Method-only search (finds base class methods)
         ];
 
         var funcAddr = null;
         var inlineAddr = null;
         var inlineSize = 0;
         var exactFuncAddr = null;
+        var inlineCandidates = [];  // Collect all inline candidates
 
         for (var i = 0; i < patterns.length; i++) {
             var pattern = patterns[i];
-            var isExactMatch = true;
+            var isExactMatch = pattern.indexOf("*") === -1;  // Only exact if no wildcards
 
             try {
                 Logger.info("    [PDB] x /v " + pattern);
@@ -3469,47 +3517,253 @@ class Exec {
                         }
                     }
 
-                    // Look for inlined function (prv inline) - PREFERRED
-                    // Must verify the symbol name contains our method (e.g., ::GetSecurityContext)
-                    // Format: prv inline ADDR SIZE chrome!Class::Method
-                    if (!inlineAddr && lineStr.indexOf("prv inline") !== -1 &&
+                    // Look for inlined function (prv inline) - Collect ALL candidates
+                    // Must verify the symbol name contains ::methodName
+                    // Format: prv inline ADDR SIZE chrome!Namespace::Class::Method = (inline caller) ...
+                    if (lineStr.indexOf("prv inline") !== -1 &&
                         lineStr.indexOf("::" + methodName) !== -1) {
-                        // Match: address, size, then chrome!
-                        var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+chrome!/);
+                        // Match: address, size, then chrome!FullClassName::Method
+                        // FullClassName can be "blink::Document" or "blink::WebDocument" etc.
+                        // We capture everything between "chrome!" and "::MethodName"
+                        var methodPattern = new RegExp("([0-9a-fA-F`]+)\\s+(\\d+)\\s+chrome!(.+)::" + methodName + "\\b");
+                        var match = lineStr.match(methodPattern);
                         if (match) {
-                            inlineAddr = "0x" + match[1].replace(/`/g, "");
-                            inlineSize = parseInt(match[2], 10);
-                            Logger.info("    [PDB] Found inlined at: " + inlineAddr + " (size=" + inlineSize + ")");
+                            inlineCandidates.push({
+                                addr: "0x" + match[1].replace(/`/g, ""),
+                                size: parseInt(match[2], 10),
+                                foundClass: match[3],  // Full class name e.g. "blink::Document"
+                                foundMethod: methodName
+                            });
                         }
                     }
                 }
 
-                // Prefer inlined - stop as soon as we find one
-                if (inlineAddr) break;
+                // If we found candidates in this pattern, break (prefer earlier patterns)
+                if (inlineCandidates.length > 0) break;
             } catch (e) { }
         }
 
-        // PREFER inlined - execute the REAL inlined code
-        // BUT we must disassemble first to know which registers it uses!
-        if (inlineAddr && inlineSize > 0) {
-            Logger.info("    [PDB] Disassembling inlined function @ " + inlineAddr);
+        // Select best RELOCATABLE inline candidate based on class hierarchy heuristics
+        // We try candidates in priority order, checking relocatability for each
+        if (inlineCandidates.length > 0) {
+            // Build ordered candidate list by priority
+            var orderedCandidates = [];
 
-            // Safety Check: Relocatability
-            if (!this._checkRelocatable(inlineAddr, inlineSize)) {
-                Logger.error("    [PDB] Inlined code contains control flow (call/jmp). Cannot relocate safely.");
-                // Fallback to non-inlined if we found one?
-                if (exactFuncAddr) {
-                    Logger.info("    [PDB] Falling back to non-inlined version...");
-                    return this._execViaInline_Part2(exactFuncAddr, thisPtr);
+            // Priority 1: Add exact class matches
+            for (var cand of inlineCandidates) {
+                if (cand.foundClass === className) {
+                    cand.priority = 1;
+                    orderedCandidates.push(cand);
                 }
-                return null;
             }
 
-            var regs = this._getInlinedRegs(inlineAddr);
-            Logger.info("    [PDB] Executing real inlined code from " + inlineAddr + " (" + inlineSize + " bytes)");
-            // NOTE: In _execViaInline, we might only have thisPtr. Wrap it in args array for compatibility.
-            var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
-            return this._executeInlinedCode(inlineAddr, inlineSize, inlineArgs, regs.inputReg, regs.outputReg);
+            // Priority 2: Add base class matches
+            for (var cand of inlineCandidates) {
+                if (cand.priority) continue;  // Already added
+                var shortClassName = className.split("::").pop();
+                var shortFoundClass = cand.foundClass.split("::").pop();
+                if (shortClassName.indexOf(shortFoundClass) !== -1) {
+                    cand.priority = 2;
+                    orderedCandidates.push(cand);
+                }
+            }
+
+            // Priority 3: Add remaining candidates
+            for (var cand of inlineCandidates) {
+                if (!cand.priority) {
+                    cand.priority = 3;
+                    orderedCandidates.push(cand);
+                }
+            }
+
+            // Try each candidate in order, checking relocatability
+            for (var cand of orderedCandidates) {
+                var priorityName = cand.priority === 1 ? "Exact class" :
+                    cand.priority === 2 ? "Base class" : "Other";
+                Logger.info("    [PDB] Trying " + priorityName + " match: " + cand.foundClass + "::" + cand.foundMethod);
+
+                // Check relocatability BEFORE selecting
+                if (!this._checkRelocatable(cand.addr, cand.size)) {
+                    Logger.warn("    [PDB] Skipping (contains control flow): " + cand.addr);
+                    continue;
+                }
+
+                // This candidate is relocatable - use it!
+                Logger.info("    [PDB] Selected inlined at: " + cand.addr + " (size=" + cand.size + ")");
+                var regs = this._getInlinedRegs(cand.addr);
+                Logger.info("    [PDB] Executing real inlined code from " + cand.addr + " (" + cand.size + " bytes)");
+                var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+                return this._executeInlinedCode(cand.addr, cand.size, inlineArgs, regs.inputReg, regs.outputReg);
+            }
+
+            // All inline candidates had control flow - fall back to non-inlined
+            Logger.warn("    [PDB] All " + orderedCandidates.length + " inline candidates contain control flow");
+            if (exactFuncAddr) {
+                Logger.info("    [PDB] Falling back to non-inlined version @ " + exactFuncAddr);
+                return this._execViaInline_Part2(exactFuncAddr, thisPtr);
+            }
+
+            Logger.error("    [PDB] No relocatable inline found and no non-inlined function available");
+            return null;
+        }
+
+        // No inline candidates found - try member variable fallback
+        // Convert method name to member name (CamelCase -> snake_case_)
+        var memberName = this._methodToMember(methodName);
+        if (memberName && thisPtr) {
+            Logger.info("    [Fallback] Trying member variable: " + memberName);
+            return this._readMemberDirect(thisPtr, className, memberName);
+        }
+
+        Logger.error("    [PDB] No PDB entry found for " + className + "::" + methodName);
+        return null;
+    }
+
+    /// Helper: Convert CamelCase method name to snake_case member name
+    /// e.g., "MayContainShadowRoots" -> "may_contain_shadow_roots_"
+    ///       "IsPrerendering" -> "is_prerendering_"
+    ///       "WellFormed" -> "well_formed_"
+    static _methodToMember(methodName) {
+        if (!methodName) return null;
+
+        // Remove trailing parentheses if present
+        methodName = methodName.replace(/\(\)$/, "");
+
+        // Convert CamelCase to snake_case
+        // Insert underscore before each uppercase letter and lowercase it
+        var snakeCase = methodName.replace(/([A-Z])/g, function (match, letter, offset) {
+            return (offset > 0 ? "_" : "") + letter.toLowerCase();
+        });
+
+        // Add trailing underscore for member variable
+        return snakeCase + "_";
+    }
+
+    /// Helper: Infer return type from method name
+    /// e.g., "GetSecurityOrigin" -> "blink::SecurityOrigin*"
+    ///       "GetDocument" -> "blink::Document*"
+    ///       "document" -> "blink::Document*"
+    static _inferReturnType(methodName, className) {
+        if (!methodName) return null;
+
+        // Remove trailing parentheses if present
+        methodName = methodName.replace(/\(\)$/, "");
+
+        // String Return detection (Heuristic)
+        // Methods usually returning string by value (requires Hidden Argument ABI)
+        // e.g. GetName(), ToString(), title(), href()
+        if (/^(Get)?(Name|Title|Href|Value|Id|String|Text|Message)$/i.test(methodName) ||
+            /^ToString$/i.test(methodName)) {
+            return "String";
+        }
+
+        // Extract namespace from className if available (e.g., "blink" from "blink::ExecutionContext")
+        var namespace = "";
+        var nsMatch = className ? className.match(/^([^:]+)::/) : null;
+        if (nsMatch) namespace = nsMatch[1] + "::";
+
+        // Pattern: Get<TypeName>() -> (chrome!<TypeName>*)
+        var getMatch = methodName.match(/^[Gg]et([A-Z]\w+)$/);
+        if (getMatch) {
+            return "(chrome!" + namespace + getMatch[1] + "*)";
+        }
+
+        // Pattern: <typename>() (lowercase first letter) -> (chrome!<TypeName>*)
+        // e.g., document() -> Document*, securityOrigin() -> SecurityOrigin*
+        if (methodName.length > 0 && methodName[0] === methodName[0].toLowerCase()) {
+            var typeName = methodName.charAt(0).toUpperCase() + methodName.slice(1);
+            // Avoid primitive types like 'int', 'bool' being cast as pointers
+            if (!/^(int|bool|float|double|void|size|length|count)$/.test(methodName)) {
+                return "(chrome!" + namespace + typeName + "*)";
+            }
+        }
+
+        return null;
+    }
+
+    /// Helper: Read a member variable directly using dx
+    static _readMemberDirect(thisPtr, className, memberName) {
+        // 1. Check Offset Cache for fast path
+        var cached = OffsetCache.get(className, memberName);
+        if (cached) {
+            Logger.info("    [Cache] Reading member at offset 0x" + cached.offset.toString(16));
+            return this._readMember(thisPtr, cached.offset);
+        }
+
+        var ctl = SymbolUtils.getControl();
+        var result = null;
+
+        try {
+            // Build dx expression: ((<type>*)<addr>)->member_
+            var expr = "((" + className + "*)0x" +
+                MemoryUtils.parseBigInt(thisPtr).toString(16) + ")->" + memberName;
+
+            Logger.info("    [Fallback] dx " + expr);
+            var output = ctl.ExecuteCommand("dx " + expr);
+
+            // Helper to cache offset
+            var cacheOffset = () => {
+                try {
+                    var offsetCmd = "dx &((" + className + "*)0)->" + memberName;
+                    var offsetOut = ctl.ExecuteCommand(offsetCmd);
+                    for (var line of offsetOut) {
+                        var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
+                        if (m) {
+                            OffsetCache.set(className, memberName, BigInt(m[1]), "cached");
+                            Logger.info("    [Cache] Stored offset 0x" + m[1] + " for " + memberName);
+                            break;
+                        }
+                    }
+                } catch (e) { }
+            };
+
+            for (var line of output) {
+                var lineStr = line.toString();
+
+                // Check for errors
+                if (lineStr.indexOf("Error") !== -1 || lineStr.indexOf("Unable") !== -1) {
+                    Logger.warn("    [Fallback] dx failed: " + lineStr);
+                    return null;
+                }
+
+                // Parse boolean result: "... : true [Type: bool]" or "... : false [Type: bool]"
+                var boolMatch = lineStr.match(/:\s*(true|false)\s*\[Type:\s*bool\]/i);
+                if (boolMatch) {
+                    result = boolMatch[1].toLowerCase() === "true" ? "0x1" : "0x0";
+                    Logger.info("    [Fallback] Result (bool): " + boolMatch[1] + " (" + result + ")");
+                    cacheOffset();
+                    return result;
+                }
+
+                // Parse integer result: "... : 0x123 [Type: ...]" or "... : 123 [Type: ...]"
+                var intMatch = lineStr.match(/:\s*(0x[0-9a-fA-F]+|\d+)\s*\[Type:/);
+                if (intMatch) {
+                    var val = intMatch[1];
+                    if (!val.startsWith("0x")) val = "0x" + parseInt(val, 10).toString(16);
+                    Logger.info("    [Fallback] Result (int): " + val);
+                    result = val;
+                    cacheOffset();
+                    return result;
+                }
+
+                // Parse enum result: "... : kEnumName (0x2) [Type: ...]"
+                var enumMatch = lineStr.match(/:\s*(\w+)\s*\((\d+|0x[0-9a-fA-F]+)\)\s*\[Type:/);
+                if (enumMatch) {
+                    var enumVal = enumMatch[2];
+                    if (!enumVal.startsWith("0x")) enumVal = "0x" + parseInt(enumVal, 10).toString(16);
+                    Logger.info("    [Fallback] Result (enum): " + enumMatch[1] + " (" + enumVal + ")");
+                    result = enumVal;
+                    cacheOffset();
+                    return result;
+                }
+            }
+
+            Logger.warn("    [Fallback] Could not parse dx output");
+            return null;
+
+        } catch (e) {
+            Logger.error("    [Fallback] dx failed: " + e.message);
+            return null;
         }
     }
 
@@ -3532,6 +3786,16 @@ class Exec {
                     inputReg = leaMatch[2];
                     offset = parseInt(leaMatch[3], 16);
                     Logger.info("    [PDB] Pattern: LEA " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
+                    break;
+                }
+
+                // MOVSS/MOVSD (float/double): movss xmm0, ...
+                var movssMatch = lineStr.match(/movs[sd]\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                if (movssMatch) {
+                    outputReg = movssMatch[1];
+                    inputReg = movssMatch[2];
+                    offset = parseInt(movssMatch[3], 16);
+                    Logger.info("    [PDB] Pattern: MOVSS/SD " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
                     break;
                 }
 
@@ -3717,10 +3981,11 @@ class Exec {
             }
 
             // 4. Save registers (using $t0-$t8 for WinDbg)
+            // Note: Saving XMM registers to pseudo-regs ($t0) often fails/crashes, so skips them
             ctl.ExecuteCommand("r @$t0 = @rip");
             ctl.ExecuteCommand("r @$t1 = @rsp");
             ctl.ExecuteCommand("r @$t2 = @" + inputReg);
-            ctl.ExecuteCommand("r @$t3 = @" + outputReg);
+            if (!outputReg.toLowerCase().startsWith("xmm")) ctl.ExecuteCommand("r @$t3 = @" + outputReg);
             ctl.ExecuteCommand("r @$t4 = @rdx");
             ctl.ExecuteCommand("r @$t5 = @r8");
             ctl.ExecuteCommand("r @$t6 = @r9");
@@ -3792,15 +4057,37 @@ class Exec {
             ctl.ExecuteCommand("gH");
 
 
-            // 7. Read output register
-            var outOutput = ctl.ExecuteCommand("r @" + outputReg);
-            var outMatch = null;
-            for (var line of outOutput) {
-                var m = line.toString().match(new RegExp(outputReg + "=([0-9a-fA-F`]+)", "i"));
-                if (m) {
-                    outMatch = m[1].replace(/`/g, "");
-                    break;
+            // 7. Read output register and xmm0 (for float support)
+            var resultVal = 0n;
+            var floatVal = 0n;
+
+            try {
+                // Use .printf for reliable hex output
+                var outLines = ctl.ExecuteCommand('.printf "%I64x", @' + outputReg);
+                for (var line of outLines) {
+                    var s = line.toString().trim();
+                    if (/^[0-9a-fA-F]+$/.test(s)) {
+                        resultVal = BigInt("0x" + s);
+                        break;
+                    }
                 }
+
+                // If outputReg IS xmm, use it as floatVal
+                if (outputReg.toLowerCase().startsWith("xmm")) {
+                    floatVal = resultVal;
+                } else {
+                    // Capture xmm0 for potential float returns
+                    var xmmLines = ctl.ExecuteCommand('.printf "%I64x", @xmm0');
+                    for (var line of xmmLines) {
+                        var s = line.toString().trim();
+                        if (/^[0-9a-fA-F]+$/.test(s)) {
+                            floatVal = BigInt("0x" + s);
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {
+                Logger.error("Failed to read result registers: " + e.message);
             }
 
             // 8. Clear breakpoint
@@ -3810,22 +4097,21 @@ class Exec {
             ctl.ExecuteCommand("r @rip = @$t0");
             ctl.ExecuteCommand("r @rsp = @$t1");
             ctl.ExecuteCommand("r @" + inputReg + " = @$t2");
-            ctl.ExecuteCommand("r @" + outputReg + " = @$t3");
+            if (!outputReg.toLowerCase().startsWith("xmm")) ctl.ExecuteCommand("r @" + outputReg + " = @$t3");
             ctl.ExecuteCommand("r @rdx = @$t4");
             ctl.ExecuteCommand("r @r8 = @$t5");
             ctl.ExecuteCommand("r @r9 = @$t6");
             ctl.ExecuteCommand("r @rcx = @$t7");
             ctl.ExecuteCommand("r @rax = @$t8");
 
-            if (outMatch) {
-                var result = BigInt("0x" + outMatch);
-                Logger.info("    Result (Literal): 0x" + result.toString(16));
+            if (true) { // Always process result
+                Logger.info("    Result (Literal): 0x" + resultVal.toString(16));
 
-                // Analyze & Decompress
-                result = this._analyzeResult(result);
+                // Analyze & Decompress (passing floatVal!)
+                resultVal = this._analyzeResult(resultVal, floatVal);
 
-                Logger.info("    Final Result: 0x" + result.toString(16));
-                return "0x" + result.toString(16);
+                Logger.info("    Final Result: 0x" + resultVal.toString(16));
+                return "0x" + resultVal.toString(16);
             } else {
                 Logger.error("Could not read result from " + outputReg);
                 return null;
@@ -3901,14 +4187,65 @@ class Exec {
         }
     }
 
-    static _analyzeResult(resultVal) {
-        if (resultVal === 0n) return 0n;
+    static _analyzeResult(resultVal, floatValBitcast) {
+        if (resultVal === 0n && (!floatValBitcast)) return 0n;
+
+        // Check for float/double return (if captured)
+        var isFloat = false;
+        if (floatValBitcast !== undefined && floatValBitcast !== 0n) {
+            try {
+                var buf = new ArrayBuffer(8);
+                var view = new DataView(buf);
+                if (view.setBigUint64) {
+                    view.setBigUint64(0, floatValBitcast, true);
+                    var dVal = view.getFloat64(0, true); // Little Endian
+
+                    // Check Float32 (Low 32 bits)
+                    view.setUint32(0, Number(floatValBitcast & 0xFFFFFFFFn), true);
+                    var fVal = view.getFloat32(0, true);
+
+                    // Logic to distinguish Float32 vs Double
+                    // If Double is extremely small (denormalized) and Float is normal, pick Float.
+                    // E.g. 1.5 (float) is 0x3fc00000. As Double it is ~5e-315.
+                    var isDoubleTiny = (Math.abs(dVal) > 0 && Math.abs(dVal) < 1e-300);
+                    // Minimal normal float is ~1e-38 (excluding denormals)
+                    var isFloatNormal = (Math.abs(fVal) > 1e-38 && Math.abs(fVal) < 1e38) || fVal === 0;
+
+                    if (isDoubleTiny && isFloatNormal) {
+                        Logger.info("    Result (Float): " + fVal);
+                        isFloat = true;
+                    } else {
+                        Logger.info("    Result (Double): " + dVal);
+                        // If valid double, set isFloat
+                        if (!isNaN(dVal) && isFinite(dVal)) isFloat = true;
+                    }
+                }
+            } catch (e) { }
+        }
+
+        if (resultVal === 0n && !isFloat) return 0n;
+
+        // Check for boolean return value - low byte is 0 or 1, upper bytes are garbage
+        // Garbage patterns: code addresses (0x7ff...), heap addresses (0x...0000XXXX), etc.
+        var lowByte = resultVal & 0xFFn;
+        var upperBytes = resultVal >> 8n;
+
+        if ((lowByte === 0n || lowByte === 1n) && upperBytes !== 0n && !isFloat) {
+            // Upper bytes look like garbage (leftover from previous operations)
+            // This is likely a boolean return value
+            var boolStr = lowByte === 1n ? "true" : "false";
+            Logger.info("    Result (bool): " + boolStr + " (0x" + lowByte.toString(16) + ")");
+            Logger.info("    [Note] Upper bytes ignored (garbage from AL-only return)");
+            return lowByte;  // Return just the boolean value
+        }
 
         // Decimal (clean output, no signed by default unless negative)
         Logger.info("    Decimal (Unsigned): " + resultVal.toString());
 
         // Check for Compressed Pointer
-        if (resultVal > 0x10000n && resultVal <= 0xFFFFFFFFn) {
+        // Check for Compressed Pointer
+        // Relaxed check: allow values up to ~1TB (0xFFFFFFFFFF) as some compressed pointers exceed 32 bits
+        if (!isFloat && resultVal > 0x10000n && resultVal <= 0xFFFFFFFFFFn) {
             if (this.currentThis) {
                 try {
                     var decompressed = MemoryUtils.decompressCppgcPtr(resultVal, this.currentThis);
@@ -3921,17 +4258,29 @@ class Exec {
         }
 
         // Pointer Analysis & Inspection
-        if (resultVal > 0x10000n) {
+        if (!isFloat && resultVal > 0x10000n) {
             var ptrStr = "0x" + resultVal.toString(16);
             var detectedType = null;
 
             // 1. Try to detect C++ object type
             try {
                 detectedType = BlinkUnwrap.detectType(ptrStr);
+
+                // Fallback: Use type hint if detection failed
+                if (!detectedType && this.currentReturnTypeHint) {
+                    detectedType = this.currentReturnTypeHint;
+                    if (!detectedType.startsWith("(")) {
+                        detectedType = "(" + detectedType + ")";
+                    }
+                    Logger.info("    [Type Hint] Using hinted type: " + detectedType);
+                }
+
                 if (detectedType) {
                     Logger.info("    C++ Object Detected (" + detectedType + "):");
                     try {
-                        frame_attrs(ptrStr);
+                        // Pass type name to frame_attrs (preserve formatting for dx casting)
+                        var typeName = detectedType;
+                        frame_attrs(ptrStr, false, typeName);
                     } catch (e) {
                         Logger.warn("    [Inspection Failed] " + e.message);
                     }
@@ -4147,6 +4496,11 @@ class Exec {
         // mov rbx, resultAddr (pointer to baseAddr)
         code.push(0x48, 0xBB);
         code = code.concat(this._to64BitLE(baseAddr));
+
+        // Save XMM0 (double/float) to [rbx + 8]
+        // movsd [rbx + 8], xmm0  (F2 0F 11 43 08)
+        code.push(0xF2, 0x0F, 0x11, 0x43, 0x08);
+
         // mov [rbx], rax
         code.push(0x48, 0x89, 0x03);
 
@@ -4192,12 +4546,13 @@ class Exec {
             Logger.warn("Execution finished (or break hit).");
         }
 
-        // Read Result
-        var resultVals = host.memory.readMemoryValues(host.parseInt64(baseAddr.toString(16), 16), 1, 8);
+        // Read Result (and XMM0)
+        var resultVals = host.memory.readMemoryValues(host.parseInt64(baseAddr.toString(16), 16), 2, 8);
         var result = BigInt(resultVals[0]);
+        var resultXmm = BigInt(resultVals[1]);
 
         // Analyze Result
-        result = this._analyzeResult(result);
+        result = this._analyzeResult(result, resultXmm);
 
         // Restore Registers
         ctl.ExecuteCommand("r @rip = @$t0");

@@ -108,11 +108,13 @@ Then in WinDbg: `!chelp`
 | `!exec("Func")` | Execute a C++ function chain with arguments (shellcode injection) |
 
 #### Usage & Features
-- **Argument Support**: Supports strings, integers, and booleans.
-  - `!exec "blink::Element::setAttribute(\"id\", \"test\")"`
-- **Chaining**: Use `->` to chain calls. The result of each call becomes `this`.
-- **Strict Mode**: Heuristics were removed to ensure deterministic execution. Users must provide the exact class for a method.
-- **Final Result**: Complex chains like `blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()` now work perfectly, even when methods are inlined and return compressed pointers.
+- **Argument Support**: Supports strings, integers, booleans, and inferred pointer types.
+- **Chaining**: Use `->` to chain calls. Supports complex paths even with inlined methods.
+- **Return Types**: Automatically handles integers, **floats/doubles** (e.g. `LayoutZoomFactor`), booleans, and compressed pointers (up to 1TB).
+- **Type Inference**: Automatically infers return types for getters (e.g. `GetFrame` -> `LocalFrame*`) to enable deep object inspection.
+- **Performance**: Features built-in caching for PDB lookups and member offsets, making repeated calls significantly faster.
+- **Strict Mode**: Users should provide the exact class for a method.
+- **Final Result**: Complex chains like `blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()` now work perfectly.
 
 ### Argument Support for Inlined Functions
 - **Feature**: Passing multiple arguments (ints, strings, bools) now works for BOTH standard and inlined functions.
