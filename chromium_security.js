@@ -3233,6 +3233,14 @@ class Exec {
         }
 
         if (memberOffset === null) {
+            // Before giving up, try virtual method call if this looks like a method (not a member)
+            // Heuristic: method names often start with uppercase or are verb-like
+            // But we try vtable for ALL cases since it doesn't hurt
+            var vtableResult = this._execViaVtable(className, methodName, thisPtr);
+            if (vtableResult !== null) {
+                return vtableResult;
+            }
+
             Logger.error("Cannot find backing member '" + memberName + "' for " + methodName);
             Logger.info("    Class: " + className);
             Logger.info("    Make sure to provide the EXACT member name (e.g. 'url_' not 'Url')");
@@ -3248,6 +3256,80 @@ class Exec {
         // Generate shellcode to read [RCX + offset]
         // This synthesizes: MOV RAX, [RCX + offset]; RET
         return this._runSynthesizedGetter(thisPtr, memberOffset);
+    }
+
+    /// Try to call a virtual method by looking up its entry in the vtable
+    /// @param className - The class name (e.g., "blink::Document")
+    /// @param methodName - The method name (e.g., "GetExecutionContext")
+    /// @param thisPtr - The object pointer
+    /// @returns Result of calling the virtual method, or null if not found
+    static _execViaVtable(className, methodName, thisPtr) {
+        Logger.info("    [VTable] Attempting virtual method call: " + className + "::" + methodName);
+
+        var ctl = SymbolUtils.getControl();
+        var useClass = className;
+        if (className.indexOf("!") === -1) useClass = "chrome!" + className;
+
+        try {
+            // 1. Read vtable pointer from object (usually at offset 0)
+            var vtablePtr = host.memory.readMemoryValues(host.parseInt64(thisPtr.replace("0x", ""), 16), 1, 8)[0];
+            if (vtablePtr.compareTo(0) === 0) {
+                Logger.info("    [VTable] No vtable at object (null)");
+                return null;
+            }
+            var vtableHex = "0x" + vtablePtr.toString(16);
+            Logger.info("    [VTable] VTable ptr: " + vtableHex);
+
+            // 2. Use dx to inspect the vtable type and find the method
+            // The vtable should be typed, e.g., chrome!blink::Document::`vftable'
+            // We can enumerate the vtable entries using dx
+            var dxExpr = "*(void*(**)())" + vtableHex;
+
+            // Alternative: Search for the method symbol in the vtable
+            // Pattern: chrome!blink::ClassName::MethodName (may have multiple overloads)
+            var methodSymbol = useClass + "::" + methodName;
+
+            // Try to find the method address directly
+            var methodAddr = SymbolUtils.findSymbolAddress(methodSymbol);
+            if (methodAddr) {
+                Logger.info("    [VTable] Found method symbol: " + methodSymbol + " @ " + methodAddr);
+
+                // Call the method
+                var args = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+                return this._runX64(methodAddr, args);
+            }
+
+            // If direct symbol not found, try to find in vtable by scanning
+            // dx -r1 *((void***)0x...)[0..20] to see vtable entries
+            Logger.info("    [VTable] Searching vtable for " + methodName + "...");
+
+            // Scan first 50 vtable entries
+            for (var i = 0; i < 50; i++) {
+                try {
+                    var entryAddr = vtablePtr.add(i * 8);
+                    var funcPtr = host.memory.readMemoryValues(host.parseInt64(entryAddr.toString(16), 16), 1, 8)[0];
+                    if (funcPtr.compareTo(0) === 0) continue;
+
+                    var funcHex = funcPtr.toString(16);
+                    var symName = SymbolUtils.getSymbolName(funcHex);
+                    if (symName && symName.indexOf(methodName) !== -1) {
+                        Logger.info("    [VTable] Found at index " + i + ": " + symName);
+                        Logger.info("    [VTable] Function ptr: 0x" + funcHex);
+
+                        // Call the method
+                        var args = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+                        return this._runX64("0x" + funcHex, args);
+                    }
+                } catch (e) { }
+            }
+
+            Logger.info("    [VTable] Method not found in vtable (may not be virtual)");
+
+        } catch (e) {
+            Logger.info("    [VTable] Failed: " + e.message);
+        }
+
+        return null;
     }
 
     /// Run shellcode that reads a member at offset from 'this' pointer
