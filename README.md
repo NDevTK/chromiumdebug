@@ -61,9 +61,9 @@ Then in WinDbg: `!chelp`
 | `!frame_win(idx)` | Get LocalDOMWindow for frame at index |
 | `!frame_origin(idx)` | Get SecurityOrigin for frame at index |
 | `!frame_elem(idx,"tag")` | List elements by tag name in frame |
-| `!frame_getattr(el,"attr")` | Get attribute value from element and internal C++ variables |
-| `!frame_setattr(el,"attr","val")` | Set attribute value on element and internal C++ variables |
-| `!frame_attrs(el)` | List all attributes of element and internal C++ variables |
+| `!frame_getattr(el,"attr")` | Get attribute value (decodes `WTF::String`, `KURL`) |
+| `!frame_setattr(el,"attr","val")` | Set attribute value (supports `AtomicString`, `KURL`) |
+| `!frame_attrs(el)` | List attributes, method signatures, and direct string preview |
 
 ### V8 Exploitation Hooks
 | Command | Description |
@@ -108,12 +108,14 @@ Then in WinDbg: `!chelp`
 | `!exec("Func")` | Execute a C++ function chain with arguments (shellcode injection) |
 
 #### Usage & Features
-- **Argument Support**: Supports strings, integers, booleans, and inferred pointer types.
+- **Integrated String Decoding**: `!exec` and `!frame_attrs` automatically decode `WTF::String`, `AtomicString`, and `KURL` types.
+- **Dual-Engine Type Detection**: 
+    - **Static Engine**: Queries PDBs for exact function signatures (100% accuracy for complex/inlined returns).
+    - **Dynamic Engine**: Scans memory for vtables to resolve polymorphic types (e.g. `Node*` -> `HTMLDivElement*`).
 - **Chaining**: Use `->` to chain calls. Supports complex paths even with inlined methods.
-- **Return Types**: Automatically handles integers, **floats/doubles** (e.g. `LayoutZoomFactor`), booleans, and compressed pointers (up to 1TB).
-- **Type Inference**: Automatically infers return types for getters (e.g. `GetFrame` -> `LocalFrame*`) to enable deep object inspection.
-- **Strict Mode**: Users should provide the exact class for a method.
-- **Final Result**: Complex chains like `blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()` now work perfectly.
+- **Return Types**: Automatically handles integers, **floats/doubles** (e.g. `LayoutZoomFactor`), booleans, and compressed pointers.
+- **Type Inference**: Automatically infers return types for getters to enable deep object inspection.
+- **Example Chained Call:** `!exec "frame->GetDocument()->Url()"`
 
 ### Argument Support for Inlined Functions
 - **Feature**: Passing multiple arguments (ints, strings, bools) now works for BOTH standard and inlined functions.

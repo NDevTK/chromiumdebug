@@ -442,6 +442,67 @@ class SymbolUtils {
         } catch (e) {
             if (debug) Logger.info("  [Debug] ln failed: " + e.message);
         }
+    }
+
+    /// Programmatically get the return type of a function symbol or address
+    static getReturnType(symbolOrAddr) {
+        if (!symbolOrAddr) return null;
+        var symbolName = symbolOrAddr;
+        if (symbolOrAddr.toString().startsWith("0x")) {
+            symbolName = this.getSymbolName(symbolOrAddr);
+        }
+        if (!symbolName || symbolName.startsWith("0x")) return null;
+
+        // 1. Try native host API (Using evaluateExpression which is more robust for ambiguous/inlined symbols)
+        try {
+            // Using &symbol ensures we get the function pointer type, which always has functionReturnType info
+            var symObj = host.evaluateExpression("&(" + symbolName + ")");
+            if (symObj && symObj.targetType && symObj.targetType.dereference().functionReturnType) {
+                var typeObj = symObj.targetType.dereference().functionReturnType;
+                var typeName = typeObj.Name || typeObj.name;
+                if (typeName) {
+                    Logger.info("    [Type Detection] Host API (Expression): " + typeName);
+                    return typeName;
+                }
+            }
+        } catch (e) { }
+
+        // 2. Try native host API (Modules path - Case Sensitive as per official documentation)
+        try {
+            var cleanName = symbolName.includes("!") ? symbolName.split("!")[1] : symbolName;
+            var symbolObj = host.currentProcess.Modules.byName("chrome").Contents.Symbols.GetValue(cleanName);
+
+            if (symbolObj && symbolObj.Type && symbolObj.Type.typeKind === "function") {
+                var returnTypeObj = symbolObj.Type.functionReturnType;
+                if (returnTypeObj) {
+                    var typeName = returnTypeObj.Name || returnTypeObj.name;
+                    if (typeName) {
+                        Logger.info("    [Type Detection] Host API (Symbol): " + typeName);
+                        return typeName;
+                    }
+                }
+            }
+        } catch (e) { }
+
+        // 3. Robust Fallback: dx -r0 (Best for complex templates)
+        try {
+            var ctl = SymbolUtils.getControl();
+            var output = ctl.ExecuteCommand("dx -r0 " + symbolName);
+            for (var line of output) {
+                var lineStr = line.toString();
+                // Match: [Type: blink::KURL (__cdecl*)(void)]
+                var m = lineStr.match(/\[Type:\s*([^\]]+)\]/);
+                if (m) {
+                    var sig = m[1].replace(/\s*(__cdecl|__stdcall|__fastcall|__thiscall)/g, "").trim();
+                    var retMatch = sig.match(/^([^(]+)\s*\(/);
+                    var type = retMatch ? retMatch[1].trim() : sig;
+                    type = type.replace(/^(class|struct)\s+/, "");
+                    Logger.info("    [Type Detection] PDB Signature: " + type);
+                    return type;
+                }
+            }
+        } catch (e) { }
+
         return null;
     }
 }
@@ -1240,6 +1301,25 @@ class BlinkUnwrap {
                     var rawValue = match[1].trim();
                     // Skip if value looks like an error
                     if (rawValue.indexOf("Unable to") !== -1) return null;
+
+                    // DRY: Use readString if this is a string type and value is opaque
+                    if ((typeStr.indexOf("String") !== -1 || typeStr.indexOf("KURL") !== -1) &&
+                        (rawValue === "{...}" || rawValue.startsWith("0x"))) {
+                        try {
+                            // Get address of the member to read its content
+                            var memberAddrCmd = "dx &((" + typeCast + objHex + ")->" + memberPath + ")";
+                            var memberAddrOutput = ctl.ExecuteCommand(memberAddrCmd);
+                            for (var maLine of memberAddrOutput) {
+                                var maMatch = maLine.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                                if (maMatch) {
+                                    var maAddr = maMatch[1].replace(/`/g, "");
+                                    var strVal = BlinkUnwrap.readString(maAddr);
+                                    if (strVal !== null) return { value: "\"" + strVal + "\"", type: typeStr, raw: lineStr };
+                                }
+                            }
+                        } catch (e) { }
+                    }
+
                     return { value: rawValue, type: typeStr, raw: lineStr };
                 }
             }
@@ -1288,9 +1368,22 @@ class BlinkUnwrap {
             }
 
             // Handle different types
-            if (memberType.indexOf("blink::String") !== -1 || memberType.indexOf("WTF::String") !== -1) {
+            var isStringLike = memberType.indexOf("String") !== -1 || memberType.indexOf("KURL") !== -1;
+
+            if (isStringLike) {
+                var stringPath = memberPath;
+                if (memberType.indexOf("KURL") !== -1) {
+                    stringPath += ".string_";
+                    Logger.info("[C++] Targeting KURL underlying string: " + stringPath);
+                }
+
+                if (memberType.indexOf("AtomicString") !== -1) {
+                    Logger.warn("[CAUTION] Mutating AtomicString. These are shared/unique across the process.");
+                    Logger.warn("          Changing this value may affect other objects!");
+                }
+
                 // String type - find StringImpl and write characters
-                var implCmd = "dx &((" + typeCast + objHex + ")->" + memberPath + ".impl_.ptr_)";
+                var implCmd = "dx &((" + typeCast + objHex + ")->" + stringPath + ".impl_.ptr_)";
                 var implOutput = ctl.ExecuteCommand(implCmd);
                 var implPtrAddr = null;
                 for (var line of implOutput) {
@@ -1312,7 +1405,7 @@ class BlinkUnwrap {
                         return true;
                     }
                 }
-                Logger.error("Could not find StringImpl for String member");
+                Logger.error("Could not find StringImpl for string-like member: " + memberType);
                 return false;
             }
             else if (memberType === "bool") {
@@ -1393,6 +1486,23 @@ class BlinkUnwrap {
                     var type = typeMatch ? typeMatch[1] : "unknown";
                     var value = typeMatch ? rest.replace(/\s*\[Type:[^\]]+\]\s*$/, "").trim() : rest;
                     if (value.length === 0) value = "{...}";
+
+                    // DRY: Use readString for opaque string/URL members
+                    if ((type.indexOf("String") !== -1 || type.indexOf("KURL") !== -1) &&
+                        (value === "{...}" || value.startsWith("0x"))) {
+                        try {
+                            var memberAddrCmd = "dx &((" + typeCast + objHex + ")->" + name + ")";
+                            var memberAddrOutput = ctl.ExecuteCommand(memberAddrCmd);
+                            for (var maLine of memberAddrOutput) {
+                                var maMatch = maLine.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                                if (maMatch) {
+                                    var strVal = BlinkUnwrap.readString(maMatch[1].replace(/`/g, ""));
+                                    if (strVal !== null) value = "\"" + strVal + "\"";
+                                }
+                            }
+                        } catch (e) { }
+                    }
+
                     members.push({ name: name, value: value, type: type });
                     continue;
                 }
@@ -1400,7 +1510,25 @@ class BlinkUnwrap {
                 // Try to parse "member_ [Type: ...]" format (no colon)
                 var noColonMatch = afterOffset.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+\[Type:\s*([^\]]+)\]/);
                 if (noColonMatch) {
-                    members.push({ name: noColonMatch[1], value: "{...}", type: noColonMatch[2] });
+                    var name = noColonMatch[1];
+                    var type = noColonMatch[2];
+                    var value = "{...}";
+
+                    // DRY: Use readString for opaque string/URL members
+                    if (type.indexOf("String") !== -1 || type.indexOf("KURL") !== -1) {
+                        try {
+                            var memberAddrCmd = "dx &((" + typeCast + objHex + ")->" + name + ")";
+                            var memberAddrOutput = ctl.ExecuteCommand(memberAddrCmd);
+                            for (var maLine of memberAddrOutput) {
+                                var maMatch = maLine.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
+                                if (maMatch) {
+                                    var strVal = BlinkUnwrap.readString(maMatch[1].replace(/`/g, ""));
+                                    if (strVal !== null) value = "\"" + strVal + "\"";
+                                }
+                            }
+                        } catch (e) { }
+                    }
+                    members.push({ name: name, value: value, type: type });
                 }
             }
         } catch (e) { Logger.debug("getCppMembers parse error: " + e.message); }
@@ -2084,6 +2212,50 @@ class BlinkUnwrap {
         return result;
     }
 
+    /// Robustly read a WTF::String or AtomicString from a pointer
+    static readString(addr) {
+        if (!isValidPointer(addr)) return null;
+        var hexAddr = normalizeAddress(addr);
+        var ctl = SymbolUtils.getControl();
+
+        // 1. Try dx approach first (most reliable if symbols are loaded)
+        try {
+            // WTF::String is usually just a pointer to StringImpl
+            // AtomicString is also a pointer to StringImpl (or contains one)
+            var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + hexAddr + ")");
+            var str = BlinkUnwrap._parseStringFromDxOutput(output);
+            if (str !== null) return str;
+
+            // Try casting as WTF::String in case it's the object wrapper
+            output = ctl.ExecuteCommand("dx ((WTF::String*)" + hexAddr + ")");
+            str = BlinkUnwrap._parseStringFromDxOutput(output);
+            if (str !== null) return str;
+        } catch (e) { }
+
+        // 2. Manual memory read fallback (works without full symbols)
+        try {
+            // StringImpl layout: RefCount(4), Length(4), Hash/Flags(4), Data...
+            // Read Length (offset 4) and Hash/Flags (offset 8)
+            var header = host.memory.readMemoryValues(host.parseInt64(hexAddr, 16) + 4, 2, 4);
+            var length = header[0];
+            var flags = header[1];
+
+            if (length > 0 && length < 20000) {
+                // Bit 0 of flags often indicates is_8bit
+                var is8Bit = (flags & 1) === 1;
+                var dataAddr = BigInt(hexAddr) + BigInt(STRINGIMPL_DATA_OFFSET);
+
+                if (is8Bit) {
+                    return host.memory.readString(dataAddr.toString(16), length);
+                } else {
+                    return host.memory.readWideString(dataAddr.toString(16), length);
+                }
+            }
+        } catch (e) { }
+
+        return null;
+    }
+
     /// Inspect a Blink Node using robust logic
     static inspectNode(nodeAddr) {
         var addr = normalizeAddress(nodeAddr);
@@ -2151,6 +2323,8 @@ function frame_setattr(objectAddr, memberName, value, typeHint) {
         var implAddr = BlinkUnwrap.findAttributeStringImplAddress(objHex, member);
         if (implAddr && implAddr !== "0") {
             Logger.info("[DOM] Found StringImpl at: " + implAddr);
+            Logger.warn("[CAUTION] Mutating DOM attribute. These are AtomicStrings and often interned.");
+            Logger.warn("          Changing this value may affect other elements with the same attribute value!");
             MemoryUtils.writeStringImpl(implAddr, newValue);
             Logger.info("[DOM] Attribute value overwritten in memory.");
             Logger.info("Verify with !frame_getattr " + objHex + " \"" + member + "\"");
@@ -2537,7 +2711,9 @@ function frame_attrs(objectAddr, debug, typeHint) {
         Logger.empty();
     }
 
-    // 2. List C++ members with multi-type fallback
+    // 2. Direct String/URL Preview
+
+    // 3. List C++ members with multi-type fallback
     Logger.info("[C++ Members]");
 
     // Update TypeCache if hint provided
@@ -2551,6 +2727,16 @@ function frame_attrs(objectAddr, debug, typeHint) {
     }
 
     var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug, typeHintStr);
+
+    // 4. Direct String/URL Preview (using hinted or detected type)
+    var activeType = result.typeCast || typeHintStr;
+    if (activeType && (activeType.indexOf("String") !== -1 || activeType.indexOf("KURL") !== -1)) {
+        var strVal = BlinkUnwrap.readString(objHex);
+        if (strVal !== null) {
+            Logger.info("[String Content]  \"" + strVal + "\"");
+            Logger.empty();
+        }
+    }
 
     if (result.members.length === 0) {
         // Pointer analysis: Try to determine if this address contains a pointer value.
@@ -2649,6 +2835,13 @@ function frame_attrs(objectAddr, debug, typeHint) {
                         Logger.empty();
                         for (var m of members) {
                             var displayVal = m.value;
+
+                            // Leverage SymbolUtils.getReturnType for function pointers
+                            if (m.type.indexOf("(*)") !== -1 || m.type.indexOf("__cdecl") !== -1) {
+                                var retType = SymbolUtils.getReturnType(m.value);
+                                if (retType) displayVal += " [Returns: " + retType + "]";
+                            }
+
                             if (displayVal.length > 50) {
                                 displayVal = displayVal.substring(0, 47) + "...";
                             }
@@ -2683,6 +2876,12 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
         for (var m of result.members) {
             var displayVal = m.value;
+
+            // Leverage SymbolUtils.getReturnType for function pointers
+            if (m.type.indexOf("(*)") !== -1 || m.type.indexOf("__cdecl") !== -1) {
+                var retType = SymbolUtils.getReturnType(m.value);
+                if (retType) displayVal += " [Returns: " + retType + "]";
+            }
 
             // If value is {...} or a complex object, try to get its address
             if (displayVal === "{...}" || displayVal.indexOf("{...}") !== -1) {
@@ -3016,13 +3215,15 @@ class Exec {
     static _execChain(calls) {
         var currentThis = null;
         var result = null;
+        var prevHint = null; // Store hint from previous call for next calling context
 
         for (var i = 0; i < calls.length; i++) {
             var call = calls[i];
             Logger.info("  [Chain " + (i + 1) + "/" + calls.length + "] " + call);
 
             try {
-                result = this._execSingle(call, currentThis);
+                result = this._execSingle(call, currentThis, prevHint);
+                prevHint = this.currentReturnTypeHint;
             } catch (e) {
                 Logger.error("  [Trace] _execSingle threw: " + e.message);
                 return null;
@@ -3100,7 +3301,7 @@ class Exec {
     }
 
     /// Execute a single call expression, optionally with a 'this' pointer override
-    static _execSingle(entry, thisOverride) {
+    static _execSingle(entry, thisOverride, previousHint) {
         var parenStart = entry.indexOf('(');
         var parenEnd = entry.lastIndexOf(')');
 
@@ -3193,6 +3394,13 @@ class Exec {
         if (thisOverride && namePart.indexOf("!") === -1 && namePart.indexOf("::") === -1) {
             // Try to detect type from thisOverride pointer
             var detectedType = BlinkUnwrap.detectType(thisOverride);
+
+            // Fallback: Use previous return type hint if available (for chaining)
+            if (!detectedType && previousHint) {
+                detectedType = previousHint;
+                Logger.info("    [Chain] Using type from previous call: " + detectedType);
+            }
+
             if (detectedType) {
                 var className = detectedType.replace(/[()*]/g, "");
                 targetSymbol = className + "::" + namePart;
@@ -3212,6 +3420,7 @@ class Exec {
             symInfo = SymbolUtils.getSymbolInfo("chrome!" + targetSymbol);
             if (symInfo) {
                 Logger.info("    [Auto-Module] Resolved as chrome!" + targetSymbol);
+                targetSymbol = "chrome!" + targetSymbol; // Update for getReturnType lookup
             }
         }
 
@@ -3221,20 +3430,34 @@ class Exec {
 
         // Infer return type hint for analysis
         this.currentReturnTypeHint = null;
-        var methodOnly = targetSymbol;
-        var classOnly = null;
-        if (targetSymbol.includes("::")) {
-            var lastCC = targetSymbol.lastIndexOf("::");
-            methodOnly = targetSymbol.substring(lastCC + 2);
-            classOnly = targetSymbol.substring(0, lastCC);
-            // clean chrome! prefix
-            if (classOnly.includes("!")) classOnly = classOnly.split("!")[1];
+
+        // Try programmatic detection first (WinDbg JS Object Model)
+        var detectedReturnType = SymbolUtils.getReturnType(targetSymbol);
+        if (detectedReturnType) {
+            Logger.info("    [Type Detection] Programmatically detected: " + detectedReturnType);
+            // If it's a class/struct but not a pointer, normalize as a pointer hint for chaining
+            if (!detectedReturnType.endsWith("*") && (detectedReturnType.includes("::") || /^[A-Z]/.test(detectedReturnType))) {
+                this.currentReturnTypeHint = "(" + detectedReturnType + "*)";
+            } else {
+                this.currentReturnTypeHint = detectedReturnType;
+            }
         }
 
-        var inferredType = Exec._inferReturnType(methodOnly, classOnly);
-        if (inferredType) {
-            Logger.info("    [Type Inference] Inferred return type: " + inferredType);
-            this.currentReturnTypeHint = inferredType;
+        if (!this.currentReturnTypeHint) {
+            var methodOnly = targetSymbol;
+            var classOnly = null;
+            if (targetSymbol.includes("::")) {
+                var lastCC = targetSymbol.lastIndexOf("::");
+                methodOnly = targetSymbol.substring(lastCC + 2);
+                classOnly = targetSymbol.substring(0, lastCC);
+                if (classOnly.includes("!")) classOnly = classOnly.split("!")[1];
+            }
+
+            var inferredType = Exec._inferReturnType(methodOnly, classOnly);
+            if (inferredType) {
+                Logger.info("    [Type Inference] Inferred return type (Fallback): " + inferredType);
+                this.currentReturnTypeHint = inferredType;
+            }
         }
 
         // Parse Args (before execution paths branch)
@@ -4014,9 +4237,11 @@ class Exec {
             }
 
             // 5. Set up for execution
+            // Set RIP first to establish context
+            ctl.ExecuteCommand("r @rip = 0x" + buf);
+
             // Argument 0: this -> inputReg
             ctl.ExecuteCommand("r @" + inputReg + " = 0x" + thisPtr.toString(16));
-
 
             // Argument 1: rdx
             if (args.length > 1) ctl.ExecuteCommand("r @rdx = 0x" + args[1].realValue.toString(16));
@@ -4024,9 +4249,6 @@ class Exec {
             if (args.length > 2) ctl.ExecuteCommand("r @r8 = 0x" + args[2].realValue.toString(16));
             // Argument 3: r9
             if (args.length > 3) ctl.ExecuteCommand("r @r9 = 0x" + args[3].realValue.toString(16));
-
-            // Set RIP to start of buffer
-            ctl.ExecuteCommand("r @rip = 0x" + buf);
 
 
             // 6. Clear any existing breakpoints (INT3 in the code will cause break)
@@ -4086,6 +4308,13 @@ class Exec {
 
             if (true) { // Always process result
                 Logger.info("    Result (Literal): 0x" + resultVal.toString(16));
+
+                // Safety Check: Result matches Code Buffer?
+                var bufBig = BigInt("0x" + buf);
+                if (resultVal >= bufBig && resultVal < (bufBig + BigInt(bufSize))) {
+                    Logger.warn("    [WARNING] Result points to execution buffer. Register corruption suspected.");
+                    Logger.warn("    This usually means 'this' was not passed correctly in " + inputReg);
+                }
 
                 // Analyze & Decompress (passing floatVal!)
                 resultVal = this._analyzeResult(resultVal, floatVal);
@@ -4210,7 +4439,12 @@ class Exec {
         var lowByte = resultVal & 0xFFn;
         var upperBytes = resultVal >> 8n;
 
-        if ((lowByte === 0n || lowByte === 1n) && upperBytes !== 0n && !isFloat) {
+        // FIX: Heuristic was too aggressive for valid pointers ending in 00/01.
+        // Skip check if we have a non-bool hint, or if value looks like a pointer (> 64KB)
+        var skipBoolCheck = (this.currentReturnTypeHint && this.currentReturnTypeHint !== "bool");
+        if (resultVal > 0x10000n) skipBoolCheck = true;
+
+        if (!skipBoolCheck && (lowByte === 0n || lowByte === 1n) && upperBytes !== 0n && !isFloat) {
             // Upper bytes look like garbage (leftover from previous operations)
             // This is likely a boolean return value
             var boolStr = lowByte === 1n ? "true" : "false";
@@ -4268,23 +4502,33 @@ class Exec {
             } catch (e) { }
 
             // 2. String Detection
-            if (!detectedType || detectedType.indexOf("String") !== -1) {
-                var strFn = host.memory.readString;
+            if (!detectedType || detectedType.indexOf("String") !== -1 || detectedType.indexOf("KURL") !== -1) {
                 try {
-                    var s = strFn(resultVal);
-                    if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
-                        if (s.length > 200) s = s.substring(0, 200) + "...";
-                        Logger.info("    String (ASCII):     \"" + s + "\"");
+                    var s = BlinkUnwrap.readString(resultVal);
+                    if (s && s.length > 0) {
+                        Logger.info("    String Result:      \"" + s + "\"");
                     }
                 } catch (e) { }
 
-                try {
-                    var s = host.memory.readWideString(resultVal);
-                    if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
-                        if (s.length > 200) s = s.substring(0, 200) + "...";
-                        Logger.info("    String (UTF-16):    \"" + s + "\"");
-                    }
-                } catch (e) { }
+                // Fallback for raw character pointers
+                if (detectedType && (detectedType.indexOf("char*") !== -1 || detectedType.indexOf("char *") !== -1)) {
+                    var strFn = host.memory.readString;
+                    try {
+                        var s = strFn(resultVal);
+                        if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
+                            if (s.length > 200) s = s.substring(0, 200) + "...";
+                            Logger.info("    String (ASCII):     \"" + s + "\"");
+                        }
+                    } catch (e) { }
+
+                    try {
+                        var s = host.memory.readWideString(resultVal);
+                        if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
+                            if (s.length > 200) s = s.substring(0, 200) + "...";
+                            Logger.info("    String (UTF-16):    \"" + s + "\"");
+                        }
+                    } catch (e) { }
+                }
             }
         }
         return resultVal;
