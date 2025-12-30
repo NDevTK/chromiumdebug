@@ -3651,11 +3651,39 @@ class Exec {
                 codeBytes.push(Number(byte));
             }
 
-            // 2. Append RET instruction
-            codeBytes.push(0xC3);
+            // 2. Append INT3 as fallback (in case no RET found in copied code)
+            codeBytes.push(0xCC);
 
             // 3. Write to our buffer
             MemoryUtils.writeMemory(buf, codeBytes);
+
+            // 4. Find the first RET in the copied code and replace it with INT3
+            // This ensures we break at the right place regardless of PDB inlineSize accuracy
+            var retOffset = null;
+            try {
+                var disasm = ctl.ExecuteCommand("u 0x" + buf + " L10");
+                for (var dLine of disasm) {
+                    var lineStr = dLine.toString();
+
+                    // Look for RET instruction
+                    if (retOffset === null && (/\sret[nf]?\s*$/.test(lineStr) || /\sret\s/.test(lineStr))) {
+                        // Extract address from start of line
+                        var addrMatch = lineStr.match(/^([0-9a-fA-F`]+)/);
+                        if (addrMatch) {
+                            var retAddrStr = addrMatch[1].replace(/`/g, "");
+                            var bufAddr = BigInt("0x" + buf);
+                            retOffset = BigInt("0x" + retAddrStr) - bufAddr;
+                        }
+                    }
+                }
+            } catch (e) { }
+
+            // Replace the RET with INT3 if found
+            if (retOffset !== null && retOffset < BigInt(codeBytes.length)) {
+                codeBytes[Number(retOffset)] = 0xCC; // INT3
+                // Re-write the modified code
+                MemoryUtils.writeMemory(buf, codeBytes);
+            }
 
             // 4. Save registers (using $t0-$t8 for WinDbg)
             ctl.ExecuteCommand("r @$t0 = @rip");
@@ -3711,24 +3739,27 @@ class Exec {
 
             // 5. Set up for execution
             // Argument 0: this -> inputReg
-            ctl.ExecuteCommand("r @" + inputReg + " = " + thisPtr.toString(16));
+            ctl.ExecuteCommand("r @" + inputReg + " = 0x" + thisPtr.toString(16));
+
 
             // Argument 1: rdx
-            if (args.length > 1) ctl.ExecuteCommand("r @rdx = " + args[1].realValue.toString(16));
+            if (args.length > 1) ctl.ExecuteCommand("r @rdx = 0x" + args[1].realValue.toString(16));
             // Argument 2: r8
-            if (args.length > 2) ctl.ExecuteCommand("r @r8 = " + args[2].realValue.toString(16));
+            if (args.length > 2) ctl.ExecuteCommand("r @r8 = 0x" + args[2].realValue.toString(16));
             // Argument 3: r9
-            if (args.length > 3) ctl.ExecuteCommand("r @r9 = " + args[3].realValue.toString(16));
+            if (args.length > 3) ctl.ExecuteCommand("r @r9 = 0x" + args[3].realValue.toString(16));
 
             // Set RIP to start of buffer
-            ctl.ExecuteCommand("r @rip = " + buf);
+            ctl.ExecuteCommand("r @rip = 0x" + buf);
 
-            // 6. Set breakpoint on RET and execute
-            var retAddr = MemoryUtils.parseBigInt(buf) + BigInt(inlineSize);
-            ctl.ExecuteCommand("bp " + "0x" + retAddr.toString(16));
+
+            // 6. Clear any existing breakpoints (INT3 in the code will cause break)
+            ctl.ExecuteCommand("bc *");
 
             Logger.info("    Executing real inlined code (with args)...");
-            ctl.ExecuteCommand("g");
+            // Use gH (go with exception handled) to clear any pending exception state
+            ctl.ExecuteCommand("gH");
+
 
             // 7. Read output register
             var outOutput = ctl.ExecuteCommand("r @" + outputReg);
