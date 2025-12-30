@@ -200,6 +200,59 @@ class GlobalCache {
 }
 
 /// =============================================================================
+/// OFFSET CACHE (NOT per-PID - offsets are constant for a given Chrome build)
+/// =============================================================================
+
+class OffsetCache {
+    // Cache: "className->memberPath" -> { offset: BigInt, path: String }
+    static _cache = new Map();
+
+    static get(className, memberName) {
+        var key = className + "->" + memberName;
+        return this._cache.get(key);
+    }
+
+    static set(className, memberName, offset, path) {
+        var key = className + "->" + memberName;
+        this._cache.set(key, { offset: offset, path: path });
+    }
+
+    static has(className, memberName) {
+        var key = className + "->" + memberName;
+        return this._cache.has(key);
+    }
+
+    static clear() {
+        this._cache.clear();
+    }
+}
+
+/// =============================================================================
+/// TYPE CACHE (NOT per-PID - vtables are constant for a given Chrome build)
+/// =============================================================================
+
+class TypeCache {
+    // Cache: vtableAddr (string) -> type string (e.g. "(blink::Document*)")
+    static _cache = new Map();
+
+    static get(vtableAddr) {
+        return this._cache.get(vtableAddr);
+    }
+
+    static set(vtableAddr, type) {
+        this._cache.set(vtableAddr, type);
+    }
+
+    static has(vtableAddr) {
+        return this._cache.has(vtableAddr);
+    }
+
+    static clear() {
+        this._cache.clear();
+    }
+}
+
+/// =============================================================================
 /// UTILITIES & CLASSES
 /// =============================================================================
 
@@ -351,20 +404,6 @@ class SymbolUtils {
 }
 
 class MemoryUtils {
-    // Cache for cage bases
-    // Now handled by GlobalCache
-
-    /// Invalidate cached cage bases (call when switching processes)
-    /// NOTE: With GlobalCache, we don't strictly *need* to invalidate on switch,
-    /// but we might want to if memory layout changes dynamically (unlikely for cage bases).
-    /// For now, we'll keep the method but make it a no-op or clear current PID only if requested.
-    static invalidateCaches() {
-        // GlobalCache handles PER-PID caching, so we don't need to wipe everything on context switch.
-        // If we really want to force refresh for current process:
-        // GlobalCache.clearCurrent(); 
-        // But usually we don't want to lose the cache just because we listed processes.
-    }
-
     /// Try to find cage bases (V8 and CppGC)
     static findCageBases() {
         this.getV8CageBase();
@@ -1323,36 +1362,57 @@ class BlinkUnwrap {
             if (debug) Logger.info("  [Debug] VTable Ptr at " + objHex + ": 0x" + vtablePtr.toString(16));
 
             if (vtablePtr.compareTo(0) !== 0) {
-                var symName = SymbolUtils.getSymbolName(vtablePtr.toString(16), debug);
+                var vtableHex = vtablePtr.toString(16);
+
+                // Check TypeCache first
+                if (TypeCache.has(vtableHex)) {
+                    var cached = TypeCache.get(vtableHex);
+                    if (debug) Logger.info("  [Debug] Type Cache Hit: " + cached);
+                    return cached;
+                }
+
+                var symName = SymbolUtils.getSymbolName(vtableHex, debug);
                 if (symName) {
+                    var resultType = null;
+
                     // Pattern 1: Standard vtable symbol (chrome!blink::ClassName::`vftable' or ::vftable)
                     // Handle both ::vftable and ::`vftable' formats
                     var matchVftable = symName.match(/!([a-zA-Z0-9_:]+)::(?:`vftable'|vftable)/);
                     if (matchVftable) {
                         var className = matchVftable[1];
                         if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
-                        return "(" + className + "*)";
+                        resultType = "(" + className + "*)";
                     }
 
                     // Pattern 2: MSVC mangled vtable symbol (??_7...)
-                    var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
-                    if (matchMangled) {
-                        var rawName = matchMangled[1];
-                        // Strip "blink" suffix from mangled names (5 = "blink".length)
-                        if (rawName.endsWith("blink") && rawName.length > "blink".length) {
-                            rawName = rawName.substring(0, rawName.length - "blink".length);
+                    if (!resultType) {
+                        var matchMangled = symName.match(/\?\?_7([a-zA-Z0-9_]+)/);
+                        if (matchMangled) {
+                            var rawName = matchMangled[1];
+                            // Strip "blink" suffix from mangled names (5 = "blink".length)
+                            if (rawName.endsWith("blink") && rawName.length > "blink".length) {
+                                rawName = rawName.substring(0, rawName.length - "blink".length);
+                            }
+                            var fullType = (rawName.indexOf("::") === -1) ? "blink::" + rawName : rawName;
+                            if (debug) Logger.info("  [Debug] Detected Type (Mangled): " + fullType);
+                            resultType = "(" + fullType + "*)";
                         }
-                        var fullType = (rawName.indexOf("::") === -1) ? "blink::" + rawName : rawName;
-                        if (debug) Logger.info("  [Debug] Detected Type (Mangled): " + fullType);
-                        return "(" + fullType + "*)";
                     }
 
                     // Pattern 3: Fallback - any symbol with module!namespace::ClassName:: pattern
-                    var matchFallback = symName.match(/!([a-zA-Z_][a-zA-Z0-9_:]*)::/);
-                    if (matchFallback) {
-                        var className = matchFallback[1];
-                        if (debug) Logger.info("  [Debug] Detected Type (Fallback): " + className);
-                        return "(" + className + "*)";
+                    if (!resultType) {
+                        var matchFallback = symName.match(/!([a-zA-Z_][a-zA-Z0-9_:]*)::/)
+                        if (matchFallback) {
+                            var className = matchFallback[1];
+                            if (debug) Logger.info("  [Debug] Detected Type (Fallback): " + className);
+                            resultType = "(" + className + "*)";
+                        }
+                    }
+
+                    // Cache and return result
+                    if (resultType) {
+                        TypeCache.set(vtableHex, resultType);
+                        return resultType;
                     }
                 }
             }
@@ -1637,6 +1697,108 @@ class BlinkUnwrap {
             if (res) return res;
         } catch (e) { }
 
+        return null;
+    }
+
+    /// Recursively find which class in the hierarchy defines a member
+    /// @param className - Starting class name (e.g. "blink::LocalDOMWindow")
+    /// @param thisPtr - Object pointer string
+    /// @param memberName - Member to find (e.g. "security_origin_")
+    /// @returns Object { fullCast: "blink::SecurityContext", offset: ... } or null
+    /// Recursively find member in hierarchy OR composition
+    /// @returns Object { path: "->member" (e.g. "->security_context_.security_origin_") } or null
+    static findMemberDeep(className, thisPtr, memberName) {
+        var ctl = SymbolUtils.getControl();
+        // Queue items: { class: "blink::Foo", path: "" }
+        var queue = [{ cls: className, path: "" }];
+        var visited = new Set();
+        visited.add(className);
+
+        var checks = 0;
+        var maxChecks = 50; // Allow more checks for composition
+
+        Logger.info("    [Deep Search] Starting BFS for '" + memberName + "' from '" + className + "'");
+
+        while (queue.length > 0 && checks < maxChecks) {
+            var item = queue.shift();
+            var currentClass = item.cls;
+            var currentPath = item.path;
+
+            // normalized visited check (without module prefix)
+            var normClass = currentClass.replace(/^(chrome!|blink::)/, "");
+            // visited.add(normClass); // Don't block revisit via different path?? No, block cycles.
+
+            checks++;
+
+            // Use * pointer dereference to see structure
+            var lookupClass = currentClass;
+            if (lookupClass.indexOf("!") === -1) lookupClass = "chrome!" + lookupClass;
+
+            // Construct expression to inspect: *((Class*)this)
+            // We use 0 if thisPtr is invalid, but better to use real ptr
+            var inspectExpr = "*((" + lookupClass + "*)" + thisPtr + ")";
+
+            // Logger.info("    [Deep Search] Checking " + currentClass + " (Path: " + (currentPath||"root") + ")");
+
+            try {
+                var output = ctl.ExecuteCommand("dx -r1 " + inspectExpr);
+                var pendingDelegates = [];
+
+                for (var line of output) {
+                    var lineStr = line.toString();
+
+                    // 1. Check for DIRECT MATCH of member
+                    // Line format: [+0x10] security_origin_ [Type: ...]
+                    // Or: security_origin_ : ...
+                    // Regex: Look for memberName followed by space or colon or [
+                    var memberRegex = new RegExp("(?:^|\\s)" + memberName + "(?:\\s|:|$)");
+                    if (memberRegex.test(lineStr)) {
+                        Logger.info("    [Deep Search] FOUND '" + memberName + "' in " + currentClass + " via path: " + currentPath);
+                        return { path: currentPath + "->" + memberName };
+                    }
+
+                    // 2. Identify Base Classes
+                    // [Base Class] : class blink::SecurityContext
+                    if (lineStr.indexOf("Base Class") !== -1) {
+                        var match = lineStr.match(/:\s*(?:class|struct)?\s*([a-zA-Z0-9_:]+)/);
+                        if (match) {
+                            var baseCls = match[1].replace(/^(public|private|protected)\s+/, "");
+                            if (!visited.has(baseCls)) {
+                                visited.add(baseCls);
+                                // Base class path is TRANSPARENT (no ->base needed in C++)
+                                // So we keep currentPath. 
+                                // Note: technically we should check if baseCls has the member.
+                                queue.push({ cls: baseCls, path: currentPath });
+                            }
+                        }
+                    }
+
+                    // 3. Identify Composite Delegates (e.g. security_context_)
+                    // Look for specific delegate patterns to avoid traversing everything
+                    // Pattern: *_context_, *_impl_, *controller_
+                    // And Type must be a defined class (blink::...)
+                    if (lineStr.indexOf("blink::") !== -1 && (lineStr.indexOf("context_") !== -1 || lineStr.indexOf("impl_") !== -1)) {
+                        // Extract Member Name and Type
+                        // [+0x0f8] security_context_ [Type: blink::SecurityContext]
+                        var matchComp = lineStr.match(/\]\s*([a-zA-Z0-9_]+)\s*\[Type:\s*([a-zA-Z0-9_:]+)/);
+                        if (matchComp) {
+                            var member = matchComp[1];
+                            var type = matchComp[2];
+                            if (!visited.has(type)) {
+                                // Add to queue with updated path
+                                pendingDelegates.push({ cls: type, path: currentPath + "->" + member });
+                            }
+                        }
+                    }
+                }
+
+                // Process delegates after direct checks to prioritize direct/base
+                for (var d of pendingDelegates) queue.push(d);
+
+            } catch (e) { }
+        }
+
+        Logger.info("    [Deep Search] Failed after checking " + checks + " nodes.");
         return null;
     }
     /// Helper: Traverse attributes of an element
@@ -2574,7 +2736,6 @@ class ProcessUtils {
             if (originalId !== null && originalId !== 0) {
                 SymbolUtils.execute("|" + originalId + "s");
             }
-            MemoryUtils.invalidateCaches();
         } catch (e) { }
 
         return results;
@@ -2634,7 +2795,6 @@ class ProcessUtils {
             if (proc.sysId === "?" || proc.sysId === null) continue;
             try {
                 SymbolUtils.execute("|" + proc.sysId + "s");
-                MemoryUtils.invalidateCaches(); // Clear cached cage bases for new process
                 var result = callback(proc);
                 count++;
                 if (result === false) break;
@@ -2647,7 +2807,6 @@ class ProcessUtils {
             } else {
                 SymbolUtils.execute("|0s");
             }
-            MemoryUtils.invalidateCaches();
         } catch (e) { }
         return count;
     }
@@ -2657,11 +2816,9 @@ class ProcessUtils {
         var originalId = this.getCurrentSysId();
         try {
             SymbolUtils.execute("|" + sysId + "s");
-            MemoryUtils.invalidateCaches(); // Clear cached cage bases for new process
             return callback();
         } finally {
             try { SymbolUtils.execute("|" + originalId + "s"); } catch (e) { }
-            MemoryUtils.invalidateCaches(); // Clear again when returning to original
         }
     }
 
@@ -2721,29 +2878,153 @@ class Exec {
             Logger.showUsage("!exec", '!exec "Target(Args)"', [
                 '!exec "chrome!blink::Document::IsSecureContext(0x12345678)"',
                 '!exec "0x12345678->MyMethod(10, true)"',
-                '!exec "chrome!SomeGlobal(0x123, \\"string arg\\")"'
+                '!exec "chrome!Func()->Method()"  // Chained calls'
             ]);
             return;
         }
 
-        // Basic parsing
-        var entry = cmdString.trim();
+        // Check for chained calls: Func()->Method() or Func()->Method()->Method2()
+        var chain = this._parseChain(cmdString.trim());
+        if (chain.length > 1) {
+            return this._execChain(chain);
+        }
+
+        // Single call (original logic)
+        return this._execSingle(cmdString.trim(), null);
+    }
+
+    /// Parse chained expression like "Func()->Method()->prop" into array of call descriptors
+    static _parseChain(cmdString) {
+        var calls = [];
+        var currentCall = "";
+        var depth = 0;
+
+        for (var i = 0; i < cmdString.length; i++) {
+            var c = cmdString[i];
+
+            // Check for "->" separator at depth 0
+            if (depth === 0 && c === '-' && i + 1 < cmdString.length && cmdString[i + 1] === '>') {
+                if (currentCall.trim().length > 0) {
+                    calls.push(currentCall.trim());
+                }
+                currentCall = "";
+                i++; // Skip '>'
+                continue;
+            }
+
+            if (c === '(') depth++;
+            else if (c === ')') depth--;
+
+            currentCall += c;
+        }
+
+        // Add final segment
+        if (currentCall.trim().length > 0) {
+            calls.push(currentCall.trim());
+        }
+
+        if (depth !== 0) {
+            Logger.error("Unbalanced parentheses in expression.");
+            return [cmdString]; // Fallback
+        }
+
+        return calls;
+    }
+
+    /// Execute a chain of calls, passing each result as 'this' for the next
+    static _execChain(calls) {
+        var currentThis = null;
+        var result = null;
+
+        for (var i = 0; i < calls.length; i++) {
+            var call = calls[i];
+            Logger.info("  [Chain " + (i + 1) + "/" + calls.length + "] " + call);
+
+            try {
+                result = this._execSingle(call, currentThis);
+            } catch (e) {
+                Logger.error("  [Trace] _execSingle threw: " + e.message);
+                return null;
+            }
+
+            // check for null result or "0x0"
+            if (result === null || result === "0x0") {
+                Logger.error("  Chain terminated: call returned null/0.");
+                return null;
+            }
+
+            Logger.info("  [Trace] Updating currentThis for next iteration...");
+
+            // Use result as 'this' for next call
+            // Result is already "0x..." string
+            currentThis = result;
+            this.currentThis = currentThis; // Store statically for _analyzeResult context
+
+            Logger.info("  [Trace] Next 'this': " + currentThis);
+        }
+
+        return null; // Don't return BigInt to host to avoid marshaling errors
+    }
+
+
+
+    /// Helper: Auto-resolve 'this' pointer for common Blink classes (REPL style)
+    /// @param className - Fully qualified class name (e.g., "blink::Document")
+    /// @param frameIndex - Optional frame index (default: 0)
+    static _resolveAutoThis(className, frameIndex = 0) {
+        // Lookup table: className -> resolver function (takes localFrame, returns instance)
+        var resolvers = {
+            "blink::LocalFrame": function (lf) { return lf; },
+            "blink::LocalDOMWindow": function (lf) { return BlinkUnwrap.getDomWindow(lf); },
+            "blink::ExecutionContext": function (lf) { return BlinkUnwrap.getDomWindow(lf); }, // LocalDOMWindow is-a ExecutionContext
+            "blink::Document": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                return win ? BlinkUnwrap.getDocument(win) : null;
+            }
+        };
+
+        var resolver = resolvers[className];
+        if (!resolver) return null;
+
+        // Get LocalFrame for requested frame index
+        var frame = _getFrameByIndex(frameIndex);
+        if (!frame) return null;
+
+        var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
+        if (!localFrame) return null;
+
+        var result = resolver(localFrame);
+        if (result) {
+            Logger.info("    [Auto-This] Using " + className + " from Frame " + frameIndex + ": 0x" + result);
+        }
+        return result;
+    }
+
+    /// Execute a single call expression, optionally with a 'this' pointer override
+    static _execSingle(entry, thisOverride) {
         var parenStart = entry.indexOf('(');
         var parenEnd = entry.lastIndexOf(')');
 
-        if (parenStart === -1 || parenEnd === -1 || parenEnd < parenStart) {
-            Logger.error("Invalid format. Expected: Name(Args) or Ptr->Name(Args)");
-            return;
+        var namePart, argsPart;
+
+        if (parenStart === -1) {
+            // Supports property access or 0-arg call without parens: "blink::Node::parentNode"
+            namePart = entry.trim();
+            argsPart = "";
+        } else {
+            if (parenEnd === -1 || parenEnd < parenStart) {
+                Logger.error("Invalid format. Expected: Name(Args)");
+                return null;
+            }
+            namePart = entry.substring(0, parenStart).trim();
+            argsPart = entry.substring(parenStart + 1, parenEnd);
         }
 
-        var namePart = entry.substring(0, parenStart).trim();
-        var argsPart = entry.substring(parenStart + 1, parenEnd);
-
         var targetSymbol = namePart;
-        var thisPtr = null;
+        var thisPtr = thisOverride;
 
-        // Handle 0xAddr->Method(...) syntax
-        if (namePart.indexOf("->") !== -1) {
+        // Handle 0xAddr->Method(...) syntax (only if no override)
+        if (!thisOverride && namePart.indexOf("->") !== -1) {
             var parts = namePart.split("->");
             if (parts.length === 2) {
                 var ptrPart = parts[0].trim();
@@ -2756,11 +3037,11 @@ class Exec {
                         // detectedType format: (chrome!Class*)
                         var className = detectedType.replace(/[()*]/g, "");
                         targetSymbol = className + "::" + methodPart;
-                        Logger.info("  [Auto-Detect] Resolved method: " + targetSymbol);
+                        Logger.info("    [Auto-Detect] Resolved method: " + targetSymbol);
                     } else {
                         Logger.error("Cannot resolve method '" + methodPart + "' without type information/symbol.");
-                        Logger.info("  Provide fully qualified name, e.g., !exec \"0x...->chrome!Class::Method(...)\"");
-                        return;
+                        Logger.info("    Provide fully qualified name, e.g., !exec \"0x...->chrome!Class::Method(...)\"");
+                        return null;
                     }
                 } else {
                     targetSymbol = methodPart;
@@ -2769,14 +3050,73 @@ class Exec {
             }
         }
 
+        // AUTO-THIS RESOLUTION (Repl Style)
+        // If no 'this' provided, but symbol looks like Method or Class::Method
+        if (!thisPtr) {
+            var className = null;
+            var methodName = null;
+
+            // parsing "blink::Document::Url" -> class="blink::Document"
+            if (targetSymbol.includes("::")) {
+                var lastCC = targetSymbol.lastIndexOf("::");
+                className = targetSymbol.substring(0, lastCC);
+                methodName = targetSymbol.substring(lastCC + 2);
+            }
+
+            if (className) {
+                // Try to resolve a default instance for this class
+                var autoThis = this._resolveAutoThis(className);
+                if (autoThis) {
+                    thisPtr = autoThis;
+                }
+            }
+            // Note: If className is null, we can't resolve auto-this
+        }
+
+        // Set the global currentThis for context (decompression etc)
+        this.currentThis = thisPtr;
+
+        // If we have a thisOverride for chained calls, we need to resolve the method symbol
+        // The namePart is just "Method" or "chrome!Class::Method" - prepend type if needed
+        if (thisOverride && namePart.indexOf("!") === -1 && namePart.indexOf("::") === -1) {
+            // Try to detect type from thisOverride pointer
+            var detectedType = BlinkUnwrap.detectType(thisOverride);
+            if (detectedType) {
+                var className = detectedType.replace(/[()*]/g, "");
+                targetSymbol = className + "::" + namePart;
+                Logger.info("    [Chain Auto-Detect] " + thisOverride + " -> " + targetSymbol);
+            } else {
+                Logger.error("Cannot resolve method '" + namePart + "' for chained call. Provide full symbol.");
+                return null;
+            }
+        }
+
         // Resolve Target
-        var targetAddr = SymbolUtils.findSymbolAddress(targetSymbol);
+        // Auto-prepend chrome! if no module prefix found
+        var targetAddr = null;
+        if (targetSymbol.indexOf("!") === -1 && !targetSymbol.startsWith("0x")) {
+            // Try with chrome! prefix first
+            targetAddr = SymbolUtils.findSymbolAddress("chrome!" + targetSymbol);
+            if (targetAddr) {
+                Logger.info("    [Auto-Module] Resolved as chrome!" + targetSymbol);
+            }
+        }
+
+        if (!targetAddr) {
+            targetAddr = SymbolUtils.findSymbolAddress(targetSymbol);
+        }
+
+        // If symbol not found, try dx-based evaluation (for inlined functions)
+        if (!targetAddr && !targetSymbol.startsWith("0x")) {
+            return this._execViaDx(targetSymbol, argsPart, thisPtr);
+        }
+
         if (!targetAddr) {
             // Try strict address
             if (targetSymbol.startsWith("0x")) targetAddr = targetSymbol;
             else {
                 Logger.error("Symbol not found: " + targetSymbol);
-                return;
+                return null;
             }
         }
 
@@ -2789,11 +3129,264 @@ class Exec {
             args.unshift(this._processArg(thisPtr));
         }
 
-        Logger.info("  Target: " + targetSymbol + " @ " + targetAddr);
-        Logger.info("  Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
+        // Safety Check: If it looks like an instance method (has ::) but no 'this' pointer
+        // and arguments don't include it (args.length == 0 check is rough heuristic, valid static methods exist)
+        // But for Blink, most :: calls are instance methods. Static ones usually take args or are singletons.
+        // If we have 0 args and no 'thisPtr', and it's Blink/content, warn user.
+        if (!thisPtr && args.length === 0 && targetSymbol.includes("::")) {
+            // Heuristic: If implicit 'this' failed, we warn.
+            Logger.warn("Running method without 'this' pointer (and Auto-This failed).");
+            Logger.warn("If this is an instance method, it will likely crash or return 0.");
+            Logger.warn("Ensure you are in a valid frame with 'g_frame_map' or provide explicit 'this'.");
+        }
+
+        Logger.info("    Target: " + targetSymbol + " @ " + targetAddr);
+        Logger.info("    Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
 
         // Generate and Run
-        this._runX64(targetAddr, args);
+        return this._runX64(targetAddr, args);
+    }
+
+    /// Fallback for inlined functions: synthesize shellcode to read member
+    /// Uses dx to find member offset, then generates shellcode to read [this + offset]
+    static _execViaDx(symbol, argsStr, thisPtr) {
+        Logger.info("    [Direct] Symbol not found, attempting direct member access...");
+
+        var ctl = SymbolUtils.getControl();
+
+        // Extract class and method from symbol
+        var lastColonColon = symbol.lastIndexOf("::");
+        if (lastColonColon === -1) {
+            Logger.error("Cannot parse symbol: " + symbol);
+            return null;
+        }
+
+        var className = symbol.substring(0, lastColonColon);
+        var methodName = symbol.substring(lastColonColon + 2);
+
+        if (!thisPtr) {
+            Logger.error("Member access requires a 'this' pointer.");
+            Logger.info("    Use: !exec \"0x<address>->" + symbol + "\"");
+            return null;
+        }
+
+        // STRICT MODE: No guessing. Use the exact member name provided.
+        var memberName = methodName;
+
+        Logger.info("    [Direct] Checking member: " + memberName);
+
+        var thisBigInt = MemoryUtils.parseBigInt(thisPtr);
+        var memberOffset = null;
+        var foundPath = null;
+
+        // Check cache first (using global OffsetCache)
+        if (OffsetCache.has(className, memberName)) {
+            var cached = OffsetCache.get(className, memberName);
+            Logger.info("    [Cache Hit] " + className + "->" + memberName + " offset=0x" + cached.offset.toString(16));
+            return this._runSynthesizedGetter(thisPtr, cached.offset);
+        }
+
+        // Automatic hierarchy search ("Deep Member Lookup")
+        Logger.info("    [Deep Search] Searching hierarchy for " + memberName + "...");
+
+        // 1. Try simple search (current class) + chrome! prefix
+        // 2. Try recursive search (base classes + composition)
+        var hit = BlinkUnwrap.findMemberDeep(className, thisPtr, memberName);
+        if (!hit) {
+            // Try valid chrome! prefix if original didn't have it
+            if (className.indexOf("!") === -1) {
+                hit = BlinkUnwrap.findMemberDeep("chrome!" + className, thisPtr, memberName);
+            }
+        }
+
+        if (hit) {
+            foundPath = hit.path;
+            Logger.info("    [Deep Search] Found member via path: " + foundPath);
+
+            // Calculate offset: &((StartClass*)this)->path - this
+            // Note: hit.path usually starts with "->"
+
+            // We need to use the class name that WORKED for the search (hit usually implies start class was ok)
+            // But if we retried with chrome!, we should use that.
+            var useClass = className;
+            if (className.indexOf("!") === -1) {
+                // If the hit was found, it implies the class name was likely resolveable with or without prefix.
+                // Safest to force chrome! if missing, as dx often prefers it.
+                useClass = "chrome!" + className;
+            }
+
+            var castExpr = "&((" + useClass + "*)" + thisPtr + ")" + foundPath;
+            try {
+                // Logger.info("    [Offset Calc] " + castExpr);
+                var output = ctl.ExecuteCommand("dx -r0 " + castExpr);
+                for (var line of output) {
+                    var lineStr = line.toString();
+                    // Match address after colon:  ... : 0x12345 ...
+                    var m = lineStr.match(/:\s*(0x[0-9a-fA-F`]+)/);
+                    if (m) {
+                        var memberAddr = MemoryUtils.parseBigInt(m[1].replace(/`/g, ""));
+                        memberOffset = memberAddr - thisBigInt;
+                        break;
+                    }
+                }
+            } catch (e) { }
+        }
+
+        if (memberOffset === null) {
+            Logger.error("Cannot find backing member '" + memberName + "' for " + methodName);
+            Logger.info("    Class: " + className);
+            Logger.info("    Make sure to provide the EXACT member name (e.g. 'url_' not 'Url')");
+            Logger.info("    Use !frame_attrs 0x... to see actual members.");
+            return null;
+        }
+
+        // Cache the result (using global OffsetCache)
+        OffsetCache.set(className, memberName, memberOffset, foundPath);
+
+        Logger.info("    Member offset: 0x" + memberOffset.toString(16));
+
+        // Generate shellcode to read [RCX + offset]
+        // This synthesizes: MOV RAX, [RCX + offset]; RET
+        return this._runSynthesizedGetter(thisPtr, memberOffset);
+    }
+
+    /// Run shellcode that reads a member at offset from 'this' pointer
+    static _runSynthesizedGetter(thisPtr, offset) {
+        var ctl = SymbolUtils.getControl();
+        var thisAddr = MemoryUtils.parseBigInt(thisPtr);
+
+        // Allocate RWX memory for shellcode
+        var memBlock = MemoryUtils.alloc(256);
+        if (!memBlock) {
+            Logger.error("Failed to allocate memory for synthesized getter.");
+            return null;
+        }
+
+        Logger.info("    Shellcode at: " + memBlock);
+
+        // Generate shellcode:
+        // MOV RAX, [RCX + offset]  ; read member (offset may be >127, use disp32)
+        // MOV [result_addr], RAX   ; store result
+        // RET
+        var resultOffset = 128; // Store result at memBlock + 128
+        var resultAddr = MemoryUtils.parseBigInt(memBlock) + BigInt(resultOffset);
+
+        var shellcode = [];
+
+        // If offset fits in signed byte (-128 to 127)
+        if (offset >= -128n && offset <= 127n) {
+            // MOV RAX, [RCX + disp8]  -> 48 8B 41 <disp8>
+            shellcode.push(0x48, 0x8B, 0x41, Number(offset & 0xFFn));
+        } else {
+            // MOV RAX, [RCX + disp32] -> 48 8B 81 <disp32>
+            shellcode.push(0x48, 0x8B, 0x81);
+            var off32 = Number(offset & 0xFFFFFFFFn);
+            shellcode.push(off32 & 0xFF, (off32 >> 8) & 0xFF, (off32 >> 16) & 0xFF, (off32 >> 24) & 0xFF);
+        }
+
+        // MOV [result_addr], RAX -> 48 A3 <imm64>
+        shellcode.push(0x48, 0xA3);
+        var resultBytes = this._to64BitLE(resultAddr);
+        for (var i = 0; i < 8; i++) shellcode.push(resultBytes[i]);
+
+        // RET -> C3
+        shellcode.push(0xC3);
+
+        // Write shellcode
+        MemoryUtils.writeMemory(memBlock, shellcode);
+
+        // Save registers
+        ctl.ExecuteCommand("r @$t0 = @rip");
+        ctl.ExecuteCommand("r @$t1 = @rsp");
+        ctl.ExecuteCommand("r @$t2 = @rcx");
+        ctl.ExecuteCommand("r @$t3 = @rax");
+
+        // Set RCX = this pointer
+        ctl.ExecuteCommand("r @rcx = " + thisPtr);
+
+        // Set RIP to shellcode
+        ctl.ExecuteCommand("r @rip = " + memBlock);
+
+        // Execute
+        Logger.info("    Executing synthesized getter...");
+        ctl.ExecuteCommand("g");
+
+        // Read result
+        var resultValue = host.memory.readMemoryValues(host.parseInt64(resultAddr.toString(16), 16), 1, 8)[0];
+        var result = BigInt(resultValue);
+
+        // Restore registers
+        ctl.ExecuteCommand("r @rip = @$t0");
+        ctl.ExecuteCommand("r @rsp = @$t1");
+        ctl.ExecuteCommand("r @rcx = @$t2");
+        ctl.ExecuteCommand("r @rax = @$t3");
+
+        Logger.info("    State restored.");
+        Logger.info("    Result: 0x" + result.toString(16));
+
+        this._analyzeResult(result);
+        // Return as hex string for consistency with _runX64
+        return "0x" + result.toString(16);
+    }
+
+    static _analyzeResult(resultVal) {
+        if (resultVal === 0n) return;
+
+        // Decimal (clean output, no signed by default unless negative)
+        Logger.info("    Decimal (Unsigned): " + resultVal.toString());
+
+        // Check for Compressed Pointer
+        if (resultVal > 0x10000n && resultVal <= 0xFFFFFFFFn) {
+            if (this.currentThis) {
+                try {
+                    var decompressed = MemoryUtils.decompressCppgcPtr(resultVal, this.currentThis);
+                    if (decompressed && decompressed !== resultVal.toString(16)) {
+                        Logger.info("    [Pointer Decompressed] -> 0x" + decompressed);
+                        resultVal = BigInt("0x" + decompressed);
+                    }
+                } catch (e) { }
+            }
+        }
+
+        // Pointer Analysis & Inspection
+        if (resultVal > 0x10000n) {
+            var ptrStr = "0x" + resultVal.toString(16);
+            var detectedType = null;
+
+            // 1. Try to detect C++ object type
+            try {
+                detectedType = BlinkUnwrap.detectType(ptrStr);
+                if (detectedType) {
+                    Logger.info("    C++ Object Detected (" + detectedType + "):");
+                    try {
+                        frame_attrs(ptrStr);
+                    } catch (e) {
+                        Logger.warn("    [Inspection Failed] " + e.message);
+                    }
+                }
+            } catch (e) { }
+
+            // 2. String Detection
+            if (!detectedType || detectedType.indexOf("String") !== -1) {
+                var strFn = host.memory.readString;
+                try {
+                    var s = strFn(resultVal);
+                    if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
+                        if (s.length > 200) s = s.substring(0, 200) + "...";
+                        Logger.info("    String (ASCII):     \"" + s + "\"");
+                    }
+                } catch (e) { }
+
+                try {
+                    var s = host.memory.readWideString(resultVal);
+                    if (s && s.length > 0 && /^[\x20-\x7E]+$/.test(s)) {
+                        if (s.length > 200) s = s.substring(0, 200) + "...";
+                        Logger.info("    String (UTF-16):    \"" + s + "\"");
+                    }
+                } catch (e) { }
+            }
+        }
+        return resultVal;
     }
 
     static _parseArgs(argsStr) {
@@ -2824,8 +3417,8 @@ class Exec {
         // Boolean
         if (arg === 'true') return { type: 'int', value: 1 };
         if (arg === 'false') return { type: 'int', value: 0 };
-        // Hex / Number
-        if (/^(0x)?[0-9a-fA-F]+$/.test(arg)) {
+        // Hex / Number (require at least one digit)
+        if (/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(arg)) {
             return { type: 'int', value: arg };
         }
         // Symbol?
@@ -3003,6 +3596,7 @@ class Exec {
         ctl.ExecuteCommand("r @$t4 = @r8");
         ctl.ExecuteCommand("r @$t5 = @r9");
         ctl.ExecuteCommand("r @$t6 = @rax");
+        ctl.ExecuteCommand("r @$t7 = @rbx");  // RBX is clobbered by shellcode
 
         // Set RIP and Go
         ctl.ExecuteCommand("r @rip = 0x" + codeAddr.toString(16));
@@ -3029,67 +3623,21 @@ class Exec {
         ctl.ExecuteCommand("r @r8 = @$t4");
         ctl.ExecuteCommand("r @r9 = @$t5");
         ctl.ExecuteCommand("r @rax = @$t6");
+        ctl.ExecuteCommand("r @rbx = @$t7");
 
         Logger.info("  State restored.");
-    }
+        Logger.info("  [Trace] Returning result...");
 
-    static _analyzeResult(result) {
-        // Result is BigInt or Host Object
-        var val = BigInt(result);
-        var hex = val.toString(16);
-
-        Logger.info("  Result (RAX): 0x" + hex);
-
-        // 1. Decimal Values
-        Logger.info("    Decimal (Unsigned): " + val.toString(10));
-
-        // Signed interpretation is trickier in JS BigInt without knowing bit-width, assume 64-bit for RAX
-        var signed = val;
-        if (signed >= 0x8000000000000000n) {
-            signed = signed - 0x10000000000000000n;
-        }
-        Logger.info("    Decimal (Signed):   " + signed.toString(10));
-
-        // 2. String Heuristics (Pointer?)
-        // Valid user-mode pointer approx range (0x10000 - 0x7FFFFFFFFFF)
-        if (val > 0x10000n && val < 0x7FFFFFFFFFFn) {
-            var ptrStr = "0x" + hex;
-
-            // Try reading as ASCII C-String
-            try {
-                // Read first 50 chars to check for printability
-                var ctl = SymbolUtils.getControl();
-                var cmd = "da " + ptrStr + " L50";
-                var output = ctl.ExecuteCommand(cmd);
-                for (var line of output) {
-                    // Windbg 'da' output: 00007ff6`...  "Hello World"
-                    var m = line.toString().match(/"(.*)"/);
-                    if (m) {
-                        Logger.info("    String (ASCII):     \"" + m[1] + "\"");
-                        // If long, might be truncated, but good enough for typical use
-                        break;
-                    }
-                }
-            } catch (e) { }
-
-            // Try reading as UTF-16 Wide-String works similarly with 'du'
-            try {
-                var cmd = "du " + ptrStr + " L50";
-                var output = ctl.ExecuteCommand(cmd);
-                for (var line of output) {
-                    var m = line.toString().match(/"(.*)"/);
-                    if (m) {
-                        Logger.info("    String (UTF-16):    \"" + m[1] + "\"");
-                        break;
-                    }
-                }
-            } catch (e) { }
-
-            // Check if it looks like a vtable (Symbol check)
-            var sym = SymbolUtils.getSymbolName(ptrStr);
-            if (sym) {
-                Logger.info("    Symbol:             " + sym);
-            }
+        // Return result for chaining
+        // Return as HEX STRING to avoid BigInt marshalling crashes
+        try {
+            var bi = BigInt(result);
+            var hexStr = "0x" + bi.toString(16);
+            Logger.info("  [Trace] Result returning as string: " + hexStr);
+            return hexStr;
+        } catch (e) {
+            Logger.error("  [Trace] Result conversion failed: " + e.message);
+            return "0x0";
         }
     }
 }
@@ -3416,7 +3964,6 @@ function get_browser_sysid() {
         if (originalId !== null && originalId !== 0) {
             SymbolUtils.execute("|" + originalId + "s");
         }
-        MemoryUtils.invalidateCaches();
     } catch (e) { }
 
     return result;
@@ -3512,10 +4059,10 @@ function get_site_locks(browserSysId, childIds) {
                                 }
                             }
                         } catch (e) { }
-                        if (instanceAddr) return false;
                     }
                 }
             } catch (e) { }
+            if (instanceAddr) return false;
         });
 
         if (!instanceAddr) {
@@ -3526,7 +4073,6 @@ function get_site_locks(browserSysId, childIds) {
         // Step 3: Switch to browser context for dx command
         try {
             SymbolUtils.execute("|" + workingBrowserId + "s");
-            MemoryUtils.invalidateCaches();
         } catch (e) { }
 
         // Step 4: Enumerate all entries in security_state_ map
@@ -3576,7 +4122,6 @@ function get_site_locks(browserSysId, childIds) {
             if (originalId !== null && originalId !== 0) {
                 SymbolUtils.execute("|" + originalId + "s");
             }
-            MemoryUtils.invalidateCaches();
         } catch (e) { }
     }
 }
