@@ -325,6 +325,49 @@ class SymbolUtils {
         return match ? match[1].replace(/`/g, "") : null;
     }
 
+    static getSymbolInfo(pattern) {
+        try {
+            var output = this.getControl().ExecuteCommand("x /v " + pattern);
+            for (var line of output) {
+                var lineStr = line.toString();
+
+                // Check if inlined
+                if (lineStr.indexOf("prv inline") !== -1) {
+                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+chrome!/);
+                    if (match) {
+                        return {
+                            type: 'inline',
+                            address: "0x" + match[1].replace(/`/g, ""),
+                            size: parseInt(match[2], 10),
+                            line: lineStr
+                        };
+                    }
+                }
+
+                // Check if normal function
+                if (lineStr.indexOf("prv func") !== -1) {
+                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+\d+\s+chrome!/);
+                    if (match) {
+                        return {
+                            type: 'func',
+                            address: "0x" + match[1].replace(/`/g, ""),
+                            size: 0,
+                            line: lineStr
+                        };
+                    }
+                }
+            }
+        } catch (e) { Logger.debug("getSymbolInfo failed: " + e.message); }
+
+        // Fallback: Try simple findSymbolAddress if x /v failed to parse but symbol exists
+        var simpleAddr = this.findSymbolAddress(pattern);
+        if (simpleAddr) {
+            return { type: 'unknown', address: simpleAddr, size: 0 };
+        }
+
+        return null;
+    }
+
     static findSymbolAddress(pattern) {
         // Only cache exact symbol matches, not patterns with wildcards
         var isExact = pattern.indexOf("*") === -1 && pattern.indexOf("?") === -1;
@@ -3086,25 +3129,70 @@ class Exec {
                 targetSymbol = className + "::" + namePart;
                 Logger.info("    [Chain Auto-Detect] " + thisOverride + " -> " + targetSymbol);
             } else {
-                Logger.error("Cannot resolve method '" + namePart + "' for chained call. Provide full symbol.");
+                Logger.error("    [Chain] Type detection failed for '" + namePart + "'.");
+                Logger.info("    Please use explicit type qualification: e.g. 'blink::ClassName::" + namePart + "'");
                 return null;
             }
         }
 
         // Resolve Target
         // Auto-prepend chrome! if no module prefix found
-        var targetAddr = null;
+        var symInfo = null;
         if (targetSymbol.indexOf("!") === -1 && !targetSymbol.startsWith("0x")) {
             // Try with chrome! prefix first
-            targetAddr = SymbolUtils.findSymbolAddress("chrome!" + targetSymbol);
-            if (targetAddr) {
+            symInfo = SymbolUtils.getSymbolInfo("chrome!" + targetSymbol);
+            if (symInfo) {
                 Logger.info("    [Auto-Module] Resolved as chrome!" + targetSymbol);
             }
         }
 
-        if (!targetAddr) {
-            targetAddr = SymbolUtils.findSymbolAddress(targetSymbol);
+        if (!symInfo) {
+            symInfo = SymbolUtils.getSymbolInfo(targetSymbol);
         }
+
+        // Parse Args (before execution paths branch)
+        var args = this._parseArgs(argsPart);
+        if (thisPtr) {
+            args.unshift(this._processArg(thisPtr));
+        }
+
+        // Handle Inlined Function Candidates - Find the best one
+        if (symInfo && symInfo.type === 'inline_candidates') {
+            Logger.info("    [Chain] Found " + symInfo.candidates.length + " inlined candidates for '" + targetSymbol + "'");
+
+            var bestCandidate = null;
+            var bestOffset = 999999;
+            var bestRegs = null;
+
+            for (var cand of symInfo.candidates) {
+                var regs = this._getInlinedRegs(cand.address);
+                // Heuristic: We want a simple getter, usually offset is small positive.
+                // If offset is 0x10, it's likely "mov rax, [rcx+10h]".
+                // If offset is huge (e.g. 0xB0), it might be "mov rax, [rcx+B0h]" where rcx is NOT 'this'.
+                // We prefer the smallest positive offset.
+                if (regs.offset >= 0 && regs.offset < bestOffset) {
+                    bestOffset = regs.offset;
+                    bestCandidate = cand;
+                    bestRegs = regs;
+                }
+            }
+
+            if (bestCandidate) {
+                Logger.info("    [Chain] Selected best inlined candidate @ " + bestCandidate.address + " (Offset: 0x" + bestOffset.toString(16) + ")");
+                return this._executeInlinedCode(bestCandidate.address, bestCandidate.size, args, bestRegs.inputReg, bestRegs.outputReg);
+            } else {
+                Logger.error("    [Chain] Could not find a suitable inlined candidate.");
+                return null;
+            }
+        }
+
+        // Handle Single Inline (Legacy/Fallback if getSymbolInfo behaves differently)
+        if (symInfo && symInfo.type === 'inline') {
+            var regs = this._getInlinedRegs(symInfo.address);
+            return this._executeInlinedCode(symInfo.address, symInfo.size, args, regs.inputReg, regs.outputReg);
+        }
+
+        var targetAddr = symInfo ? symInfo.address : null;
 
         // If symbol not found, try dx-based evaluation (for inlined functions)
         if (!targetAddr && !targetSymbol.startsWith("0x")) {
@@ -3120,14 +3208,7 @@ class Exec {
             }
         }
 
-        // Parse Args
-        var args = this._parseArgs(argsPart);
-
-        // Prepend 'this' if present
-        if (thisPtr) {
-            // Treat 'this' as a pointer argument
-            args.unshift(this._processArg(thisPtr));
-        }
+        // Safety Check
 
         // Safety Check: If it looks like an instance method (has ::) but no 'this' pointer
         // and arguments don't include it (args.length == 0 check is rough heuristic, valid static methods exist)
@@ -3183,7 +3264,7 @@ class Exec {
         if (OffsetCache.has(className, memberName)) {
             var cached = OffsetCache.get(className, memberName);
             Logger.info("    [Cache Hit] " + className + "->" + memberName + " offset=0x" + cached.offset.toString(16));
-            return this._runSynthesizedGetter(thisPtr, cached.offset);
+            return this._readMember(thisPtr, cached.offset);
         }
 
         // Automatic hierarchy search ("Deep Member Lookup")
@@ -3233,12 +3314,11 @@ class Exec {
         }
 
         if (memberOffset === null) {
-            // Before giving up, try virtual method call if this looks like a method (not a member)
-            // Heuristic: method names often start with uppercase or are verb-like
-            // But we try vtable for ALL cases since it doesn't hurt
-            var vtableResult = this._execViaVtable(className, methodName, thisPtr);
-            if (vtableResult !== null) {
-                return vtableResult;
+            // Before giving up, try PDB lookup for inlined functions
+            // This uses x /v to find non-inlined versions or disassemble inlined code
+            var inlineResult = this._execViaInline(className, methodName, thisPtr);
+            if (inlineResult !== null) {
+                return inlineResult;
             }
 
             Logger.error("Cannot find backing member '" + memberName + "' for " + methodName);
@@ -3255,160 +3335,349 @@ class Exec {
 
         // Generate shellcode to read [RCX + offset]
         // This synthesizes: MOV RAX, [RCX + offset]; RET
-        return this._runSynthesizedGetter(thisPtr, memberOffset);
+        return this._readMember(thisPtr, memberOffset);
     }
 
-    /// Try to call a virtual method by looking up its entry in the vtable
-    /// @param className - The class name (e.g., "blink::Document")
-    /// @param methodName - The method name (e.g., "GetExecutionContext")
+    /// Find and call a method using PDB inlined function info
+    /// Uses x /v to find:
+    ///   1. Non-inlined version (prv func) → call directly
+    ///   2. Inlined version (prv inline) → disassemble to extract offset → synthesize
+    /// @param className - The class name (e.g., "blink::ExecutionContext")
+    /// @param methodName - The method name (e.g., "GetSecurityContext")
     /// @param thisPtr - The object pointer
-    /// @returns Result of calling the virtual method, or null if not found
-    static _execViaVtable(className, methodName, thisPtr) {
-        Logger.info("    [VTable] Attempting virtual method call: " + className + "::" + methodName);
+    /// @returns Result string or null if not found
+    static _execViaInline(className, methodName, thisPtr) {
+        Logger.info("    [PDB] Looking up: " + className + "::" + methodName);
 
         var ctl = SymbolUtils.getControl();
-        var useClass = className;
-        if (className.indexOf("!") === -1) useClass = "chrome!" + className;
 
-        try {
-            // 1. Read vtable pointer from object (usually at offset 0)
-            var vtablePtr = host.memory.readMemoryValues(host.parseInt64(thisPtr.replace("0x", ""), 16), 1, 8)[0];
-            if (vtablePtr.compareTo(0) === 0) {
-                Logger.info("    [VTable] No vtable at object (null)");
-                return null;
+        // Check cache first (method address or offset)
+        if (OffsetCache.has(className, methodName)) {
+            var cached = OffsetCache.get(className, methodName);
+            if (cached.offset !== undefined && cached.offset !== null) {
+                Logger.info("    [Cache Hit] Offset = 0x" + cached.offset.toString(16));
+                return this._readMember(thisPtr, cached.offset);
             }
-            var vtableHex = "0x" + vtablePtr.toString(16);
-            Logger.info("    [VTable] VTable ptr: " + vtableHex);
-
-            // 2. Use dx to inspect the vtable type and find the method
-            // The vtable should be typed, e.g., chrome!blink::Document::`vftable'
-            // We can enumerate the vtable entries using dx
-            var dxExpr = "*(void*(**)())" + vtableHex;
-
-            // Alternative: Search for the method symbol in the vtable
-            // Pattern: chrome!blink::ClassName::MethodName (may have multiple overloads)
-            var methodSymbol = useClass + "::" + methodName;
-
-            // Try to find the method address directly
-            var methodAddr = SymbolUtils.findSymbolAddress(methodSymbol);
-            if (methodAddr) {
-                Logger.info("    [VTable] Found method symbol: " + methodSymbol + " @ " + methodAddr);
-
-                // Call the method
-                var args = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
-                return this._runX64(methodAddr, args);
-            }
-
-            // If direct symbol not found, try to find in vtable by scanning
-            // dx -r1 *((void***)0x...)[0..20] to see vtable entries
-            Logger.info("    [VTable] Searching vtable for " + methodName + "...");
-
-            // Scan first 50 vtable entries
-            for (var i = 0; i < 50; i++) {
-                try {
-                    var entryAddr = vtablePtr.add(i * 8);
-                    var funcPtr = host.memory.readMemoryValues(host.parseInt64(entryAddr.toString(16), 16), 1, 8)[0];
-                    if (funcPtr.compareTo(0) === 0) continue;
-
-                    var funcHex = funcPtr.toString(16);
-                    var symName = SymbolUtils.getSymbolName(funcHex);
-                    if (symName && symName.indexOf(methodName) !== -1) {
-                        Logger.info("    [VTable] Found at index " + i + ": " + symName);
-                        Logger.info("    [VTable] Function ptr: 0x" + funcHex);
-
-                        // Call the method
-                        var args = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
-                        return this._runX64("0x" + funcHex, args);
-                    }
-                } catch (e) { }
-            }
-
-            Logger.info("    [VTable] Method not found in vtable (may not be virtual)");
-
-        } catch (e) {
-            Logger.info("    [VTable] Failed: " + e.message);
         }
 
+        // Use x /v to find function info from PDB
+        // STRICT MODE: Only search for explicit class::method
+        var patterns = [
+            "chrome!" + className + "::" + methodName
+        ];
+
+        var funcAddr = null;
+        var inlineAddr = null;
+        var inlineSize = 0;
+        var exactFuncAddr = null;
+
+        for (var i = 0; i < patterns.length; i++) {
+            var pattern = patterns[i];
+            var isExactMatch = true;
+
+            try {
+                Logger.info("    [PDB] x /v " + pattern);
+                var output = ctl.ExecuteCommand("x /v " + pattern);
+
+                for (var line of output) {
+                    var lineStr = line.toString();
+
+                    // Look for non-inlined function (prv func) - only for exact matches
+                    if (isExactMatch && lineStr.indexOf("prv func") !== -1) {
+                        var match = lineStr.match(/([0-9a-fA-F`]+)\s+\d+\s+chrome!/);
+                        if (match) {
+                            exactFuncAddr = "0x" + match[1].replace(/`/g, "");
+                            Logger.info("    [PDB] Found exact non-inlined: " + exactFuncAddr);
+                        }
+                    }
+
+                    // Look for inlined function (prv inline) - PREFERRED
+                    // Must verify the symbol name contains our method (e.g., ::GetSecurityContext)
+                    // Format: prv inline ADDR SIZE chrome!Class::Method
+                    if (!inlineAddr && lineStr.indexOf("prv inline") !== -1 &&
+                        lineStr.indexOf("::" + methodName) !== -1) {
+                        // Match: address, size, then chrome!
+                        var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+chrome!/);
+                        if (match) {
+                            inlineAddr = "0x" + match[1].replace(/`/g, "");
+                            inlineSize = parseInt(match[2], 10);
+                            Logger.info("    [PDB] Found inlined at: " + inlineAddr + " (size=" + inlineSize + ")");
+                        }
+                    }
+                }
+
+                // Prefer inlined - stop as soon as we find one
+                if (inlineAddr) break;
+            } catch (e) { }
+        }
+
+        // PREFER inlined - execute the REAL inlined code
+        // BUT we must disassemble first to know which registers it uses!
+        if (inlineAddr && inlineSize > 0) {
+            Logger.info("    [PDB] Disassembling inlined function @ " + inlineAddr);
+            var regs = this._getInlinedRegs(inlineAddr);
+            Logger.info("    [PDB] Executing real inlined code from " + inlineAddr + " (" + inlineSize + " bytes)");
+            // NOTE: In _execViaInline, we might only have thisPtr. Wrap it in args array for compatibility.
+            var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+            return this._executeInlinedCode(inlineAddr, inlineSize, inlineArgs, regs.inputReg, regs.outputReg);
+        }
+    }
+
+    /// Helper: Analyze inlined function assembly to detect input/output registers
+    static _getInlinedRegs(inlineAddr) {
+        var ctl = SymbolUtils.getControl();
+        var inputReg = "rcx";  // Default input (this)
+        var outputReg = "rax"; // Default output (result)
+        var offset = 0;
+
+        try {
+            var uOutput = ctl.ExecuteCommand("u " + inlineAddr + " L5");
+            for (var line of uOutput) {
+                var lineStr = line.toString();
+
+                // LEA (pointer return): lea rax,[rcx+offset]
+                var leaMatch = lineStr.match(/lea\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                if (leaMatch) {
+                    outputReg = leaMatch[1];
+                    inputReg = leaMatch[2];
+                    offset = parseInt(leaMatch[3], 16);
+                    Logger.info("    [PDB] Pattern: LEA " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
+                    break;
+                }
+
+                // MOV (value read): mov rax,qword ptr [rcx+offset]
+                var movMatch = lineStr.match(/mov\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                if (movMatch) {
+                    outputReg = movMatch[1];
+                    inputReg = movMatch[2];
+                    offset = parseInt(movMatch[3], 16);
+                    Logger.info("    [PDB] Pattern: MOV " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
+                    break;
+                }
+
+                // ADD (pointer arithmetic): add r14,offset
+                // In this case, input and output are SAME register
+                var addMatch = lineStr.match(/add\s+(\w+),([0-9a-fA-F]+)h/i);
+                if (addMatch) {
+                    inputReg = addMatch[1];
+                    outputReg = addMatch[1]; // Result stays in same register
+                    offset = parseInt(addMatch[2], 16);
+                    Logger.info("    [PDB] Pattern: ADD " + inputReg + ", 0x" + offset.toString(16));
+                    break;
+                }
+
+                // MOVSXD (compressed pointer logic): movsxd rcx,dword ptr [rbx+28h]
+                var movsxdMatch = lineStr.match(/movsxd\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                if (movsxdMatch) {
+                    outputReg = movsxdMatch[1];
+                    inputReg = movsxdMatch[2];
+                    offset = parseInt(movsxdMatch[3], 16);
+                    Logger.info("    [PDB] Pattern: MOVSXD " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
+                    break;
+                }
+            }
+        } catch (e) {
+            Logger.info("    [PDB] Register detection failed: " + e.message);
+        }
+        return { inputReg: inputReg, outputReg: outputReg, offset: offset };
+    }
+
+    static _execViaInline_Part2(exactFuncAddr, thisPtr) {
+        // Fallback: Use exact class match non-inlined if available
+        if (exactFuncAddr) {
+            Logger.info("    [PDB] Using exact class non-inlined function @ " + exactFuncAddr);
+            var args = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+            return this._runX64(exactFuncAddr, args);
+        }
+
+        Logger.info("    [PDB] Method not found in PDB");
         return null;
     }
 
-    /// Run shellcode that reads a member at offset from 'this' pointer
-    static _runSynthesizedGetter(thisPtr, offset) {
+    /// Execute real inlined code by copying it to a buffer and running it
+    /// @param inlineAddr - Address where inlined code starts
+    /// @param inlineSize - Size of inlined code in bytes
+    /// @param args - Array of argument objects from _parseArgs (args[0] is 'this')
+    /// @param inputReg - Register that holds 'this' (e.g. "rcx", "r14")
+    /// @param outputReg - Register that holds result (e.g. "rax", "r14")
+    static _executeInlinedCode(inlineAddr, inlineSize, args, inputReg, outputReg) {
         var ctl = SymbolUtils.getControl();
-        var thisAddr = MemoryUtils.parseBigInt(thisPtr);
+        inputReg = inputReg || "rcx";
+        outputReg = outputReg || "rax";
 
-        // Allocate RWX memory for shellcode
-        var memBlock = MemoryUtils.alloc(256);
-        if (!memBlock) {
-            Logger.error("Failed to allocate memory for synthesized getter.");
+        // Allocate buffer for code + RET
+        var bufSize = inlineSize + 16;  // Extra space for RET and alignment
+        var buf = MemoryUtils.alloc(bufSize);
+        if (!buf) {
+            Logger.error("Failed to allocate execution buffer");
             return null;
         }
 
-        Logger.info("    Shellcode at: " + memBlock);
+        // Preparation: Allocate scratch memory for string arguments if any (reusing _runX64 logic)
+        var scratchBase = null;
+        var currentScratchOffset = 0n;
 
-        // Generate shellcode:
-        // MOV RAX, [RCX + offset]  ; read member (offset may be >127, use disp32)
-        // MOV [result_addr], RAX   ; store result
-        // RET
-        var resultOffset = 128; // Store result at memBlock + 128
-        var resultAddr = MemoryUtils.parseBigInt(memBlock) + BigInt(resultOffset);
+        try {
+            for (var i = 0; i < args.length; i++) {
+                if (args[i].type === 'string') {
+                    if (!scratchBase) scratchBase = BigInt("0x" + MemoryUtils.alloc(0x1000));
 
-        var shellcode = [];
+                    var str = args[i].value;
+                    var bytes = [];
+                    for (var j = 0; j < str.length; j++) bytes.push(str.charCodeAt(j));
+                    bytes.push(0); // Null term
 
-        // If offset fits in signed byte (-128 to 127)
-        if (offset >= -128n && offset <= 127n) {
-            // MOV RAX, [RCX + disp8]  -> 48 8B 41 <disp8>
-            shellcode.push(0x48, 0x8B, 0x41, Number(offset & 0xFFn));
-        } else {
-            // MOV RAX, [RCX + disp32] -> 48 8B 81 <disp32>
-            shellcode.push(0x48, 0x8B, 0x81);
-            var off32 = Number(offset & 0xFFFFFFFFn);
-            shellcode.push(off32 & 0xFF, (off32 >> 8) & 0xFF, (off32 >> 16) & 0xFF, (off32 >> 24) & 0xFF);
+                    var strAddr = scratchBase + currentScratchOffset;
+                    MemoryUtils.writeMemory(strAddr.toString(16), bytes);
+                    args[i].realValue = strAddr;
+
+                    currentScratchOffset += BigInt(bytes.length);
+                    if (currentScratchOffset % 8n !== 0n) currentScratchOffset += (8n - (currentScratchOffset % 8n));
+                } else if (args[i].realValue === undefined) {
+                    args[i].realValue = MemoryUtils.parseBigInt(args[i].value);
+                }
+            }
+
+            var thisPtr = args[0] ? args[0].realValue : 0n;
+
+            Logger.info("    Execution buffer: " + buf);
+            Logger.info("    Input: " + inputReg + " = 0x" + thisPtr.toString(16));
+            Logger.info("    Output: " + outputReg);
+
+            // 1. Copy real inlined bytes from target
+            var srcAddr = MemoryUtils.parseBigInt(inlineAddr);
+            var codeBytes = [];
+            for (var i = 0; i < inlineSize; i++) {
+                var byte = host.memory.readMemoryValues(host.parseInt64((srcAddr + BigInt(i)).toString(16), 16), 1, 1)[0];
+                codeBytes.push(Number(byte));
+            }
+
+            // 2. Append RET instruction
+            codeBytes.push(0xC3);
+
+            // 3. Write to our buffer
+            MemoryUtils.writeMemory(buf, codeBytes);
+
+            // 4. Save registers (using $t0-$t6 for WinDbg)
+            ctl.ExecuteCommand("r @$t0 = @rip");
+            ctl.ExecuteCommand("r @$t1 = @rsp");
+            ctl.ExecuteCommand("r @$t2 = @" + inputReg);
+            ctl.ExecuteCommand("r @$t3 = @" + outputReg);
+            ctl.ExecuteCommand("r @$t4 = @rdx");
+            ctl.ExecuteCommand("r @$t5 = @r8");
+            ctl.ExecuteCommand("r @$t6 = @r9");
+
+            // 5. Set up for execution
+            // Argument 0: this -> inputReg
+            ctl.ExecuteCommand("r @" + inputReg + " = " + thisPtr.toString(16));
+
+            // Argument 1: rdx
+            if (args.length > 1) ctl.ExecuteCommand("r @rdx = " + args[1].realValue.toString(16));
+            // Argument 2: r8
+            if (args.length > 2) ctl.ExecuteCommand("r @r8 = " + args[2].realValue.toString(16));
+            // Argument 3: r9
+            if (args.length > 3) ctl.ExecuteCommand("r @r9 = " + args[3].realValue.toString(16));
+
+            // Set RIP to start of buffer
+            ctl.ExecuteCommand("r @rip = " + buf);
+
+            // 6. Set breakpoint on RET and execute
+            var retAddr = MemoryUtils.parseBigInt(buf) + BigInt(inlineSize);
+            ctl.ExecuteCommand("bp " + "0x" + retAddr.toString(16));
+
+            Logger.info("    Executing real inlined code (with args)...");
+            ctl.ExecuteCommand("g");
+
+            // 7. Read output register
+            var outOutput = ctl.ExecuteCommand("r @" + outputReg);
+            var outMatch = null;
+            for (var line of outOutput) {
+                var m = line.toString().match(new RegExp(outputReg + "=([0-9a-fA-F`]+)", "i"));
+                if (m) {
+                    outMatch = m[1].replace(/`/g, "");
+                    break;
+                }
+            }
+
+            // 8. Clear breakpoint
+            ctl.ExecuteCommand("bc *");
+
+            // 9. Restore registers
+            ctl.ExecuteCommand("r @rip = @$t0");
+            ctl.ExecuteCommand("r @rsp = @$t1");
+            ctl.ExecuteCommand("r @" + inputReg + " = @$t2");
+            ctl.ExecuteCommand("r @" + outputReg + " = @$t3");
+            ctl.ExecuteCommand("r @rdx = @$t4");
+            ctl.ExecuteCommand("r @r8 = @$t5");
+            ctl.ExecuteCommand("r @r9 = @$t6");
+
+            if (outMatch) {
+                var result = BigInt("0x" + outMatch);
+                Logger.info("    Result (Literal): 0x" + result.toString(16));
+
+                // Analyze & Decompress
+                result = this._analyzeResult(result);
+
+                Logger.info("    Final Result: 0x" + result.toString(16));
+                return "0x" + result.toString(16);
+            } else {
+                Logger.error("Could not read result from " + outputReg);
+                return null;
+            }
+
+        } catch (e) {
+            Logger.error("Inlined execution failed: " + e.message);
+            // Try to restore state
+            try {
+                ctl.ExecuteCommand("bc *");
+                ctl.ExecuteCommand("r @rip = @$t0");
+                ctl.ExecuteCommand("r @rsp = @$t1");
+                ctl.ExecuteCommand("r @" + inputReg + " = @$t2");
+                ctl.ExecuteCommand("r @rdx = @$t4");
+                ctl.ExecuteCommand("r @r8 = @$t5");
+                ctl.ExecuteCommand("r @r9 = @$t6");
+            } catch (e2) { }
+            return null;
         }
+    }
 
-        // MOV [result_addr], RAX -> 48 A3 <imm64>
-        shellcode.push(0x48, 0xA3);
-        var resultBytes = this._to64BitLE(resultAddr);
-        for (var i = 0; i < 8; i++) shellcode.push(resultBytes[i]);
+    /// Return a pointer (this + offset) - for LEA/ADD patterns
+    /// Used for reference-returning getters like GetSecurityContext() -> SecurityContext&
+    static _returnPointer(thisPtr, offset) {
+        var thisAddr = MemoryUtils.parseBigInt(thisPtr);
+        var memberAddr = thisAddr + offset;
 
-        // RET -> C3
-        shellcode.push(0xC3);
+        Logger.info("    Pointer: 0x" + thisAddr.toString(16) + " + 0x" + offset.toString(16));
+        Logger.info("    Result: 0x" + memberAddr.toString(16));
 
-        // Write shellcode
-        MemoryUtils.writeMemory(memBlock, shellcode);
+        this._analyzeResult(memberAddr);
+        return "0x" + memberAddr.toString(16);
+    }
 
-        // Save registers
-        ctl.ExecuteCommand("r @$t0 = @rip");
-        ctl.ExecuteCommand("r @$t1 = @rsp");
-        ctl.ExecuteCommand("r @$t2 = @rcx");
-        ctl.ExecuteCommand("r @$t3 = @rax");
+    /// Read a member value at offset from 'this' pointer
+    /// Used for value-returning getters (MOV pattern)
+    static _readMember(thisPtr, offset) {
+        var thisAddr = MemoryUtils.parseBigInt(thisPtr);
+        var memberAddr = thisAddr + offset;
 
-        // Set RCX = this pointer
-        ctl.ExecuteCommand("r @rcx = " + thisPtr);
+        Logger.info("    Reading [0x" + thisAddr.toString(16) + " + 0x" + offset.toString(16) + "]");
+        Logger.info("    Member address: 0x" + memberAddr.toString(16));
 
-        // Set RIP to shellcode
-        ctl.ExecuteCommand("r @rip = " + memBlock);
+        try {
+            var value = host.memory.readMemoryValues(host.parseInt64(memberAddr.toString(16), 16), 1, 8)[0];
+            var result = BigInt(value);
 
-        // Execute
-        Logger.info("    Executing synthesized getter...");
-        ctl.ExecuteCommand("g");
+            Logger.info("    Result (Literal): 0x" + result.toString(16));
 
-        // Read result
-        var resultValue = host.memory.readMemoryValues(host.parseInt64(resultAddr.toString(16), 16), 1, 8)[0];
-        var result = BigInt(resultValue);
+            // Analyze & Decompress
+            result = this._analyzeResult(result);
 
-        // Restore registers
-        ctl.ExecuteCommand("r @rip = @$t0");
-        ctl.ExecuteCommand("r @rsp = @$t1");
-        ctl.ExecuteCommand("r @rcx = @$t2");
-        ctl.ExecuteCommand("r @rax = @$t3");
-
-        Logger.info("    State restored.");
-        Logger.info("    Result: 0x" + result.toString(16));
-
-        this._analyzeResult(result);
-        // Return as hex string for consistency with _runX64
-        return "0x" + result.toString(16);
+            Logger.info("    Final Result: 0x" + result.toString(16));
+            return "0x" + result.toString(16);
+        } catch (e) {
+            Logger.error("Failed to read memory at 0x" + memberAddr.toString(16) + ": " + e.message);
+            return null;
+        }
     }
 
     static _analyzeResult(resultVal) {
@@ -3695,7 +3964,7 @@ class Exec {
         var result = resultVals[0];
 
         // Analyze Result
-        this._analyzeResult(result);
+        result = this._analyzeResult(result);
 
         // Restore Registers
         ctl.ExecuteCommand("r @rip = @$t0");

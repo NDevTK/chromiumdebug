@@ -105,13 +105,26 @@ Then in WinDbg: `!chelp`
 ### C++ Execution / REPL
 | Command | Description |
 |---------|-------------|
-| `!exec("Func")` | Execute a C++ function in the target process (via shellcode injection) |
+| `!exec("Func")` | Execute a C++ function chain with arguments (shellcode injection) |
 
-**Example:**
+#### Usage & Features
+- **Argument Support**: Supports strings, integers, and booleans.
+  - `!exec "blink::Element::setAttribute(\"id\", \"test\")"`
+- **Chaining**: Use `->` to chain calls. The result of each call becomes `this`.
+- **Strict Mode**: Heuristics were removed to ensure deterministic execution. Users must provide the exact class for a method.
+- **Final Result**: Complex chains like `blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()` now work perfectly, even when methods are inlined and return compressed pointers.
+
+### Argument Support for Inlined Functions
+- **Feature**: Passing multiple arguments (ints, strings, bools) now works for BOTH standard and inlined functions.
+- **Implementation**: `_executeInlinedCode` correctly maps arguments to standard x64 registers (`RDX`, `R8`, `R9`) and handles arbitrary string allocation.
+- **Verification**: Verified that setters and property methods with multiple arguments execute correctly in inlined context.
+- **Decompression**: Automatically decompresses V8/Oilpan pointers in results.
+
+**Example Chained Call:**
 ```text
-!exec "chrome!v8::base::OS::GetCurrentProcessId()"
+!exec "blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()"
 ```
-*Returns the process ID in the `Result (RAX)` line.*
+*Returns the SecurityOrigin object, automatically handling inlined methods and pointer decompression.*
 
 ## Files
 
