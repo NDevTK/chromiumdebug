@@ -470,7 +470,11 @@ class MemoryUtils {
     static parseBigInt(input) {
         if (typeof input === "string") {
             var ptrStr = input.replace(/`/g, "");
-            return BigInt(ptrStr.startsWith("0x") ? ptrStr : "0x" + ptrStr);
+            if (ptrStr.startsWith("0x") || ptrStr.startsWith("0X")) return BigInt(ptrStr);
+            // If string is purely numeric digits, assume decimal
+            if (/^\d+$/.test(ptrStr)) return BigInt(ptrStr);
+            // Otherwise assume hex (pointers etc)
+            return BigInt("0x" + ptrStr);
         } else if (typeof input === "number") {
             // Handle JavaScript numbers - convert to unsigned hex
             if (input < 0) {
@@ -734,6 +738,20 @@ class MemoryUtils {
             Logger.error("Memory allocation failed: " + e.message);
         }
         return null;
+    }
+
+    /// Free memory in the target process (wrapper for .dvfree)
+    static free(addr, size) {
+        if (!addr) return;
+        var ctl = SymbolUtils.getControl();
+        try {
+            // .dvfree /d [BaseAddress] [Size]
+            // Note: .dvfree usually takes base address.
+            var cmd = ".dvfree " + addr + " " + (size ? size : "0");
+            ctl.ExecuteCommand(cmd);
+        } catch (e) {
+            Logger.debug("Memory free failed for " + addr + ": " + e.message);
+        }
     }
 }
 
@@ -2521,6 +2539,17 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
     // 2. List C++ members with multi-type fallback
     Logger.info("[C++ Members]");
+
+    // Update TypeCache if hint provided
+    if (typeHintStr) {
+        try {
+            var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
+            if (vtablePtr.compareTo(0) !== 0) {
+                TypeCache.set(vtablePtr.toString(16), typeHintStr);
+            }
+        } catch (e) { }
+    }
+
     var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug, typeHintStr);
 
     if (result.members.length === 0) {
@@ -2941,22 +2970,29 @@ class Exec {
         var calls = [];
         var currentCall = "";
         var depth = 0;
+        var inQuote = false;
 
         for (var i = 0; i < cmdString.length; i++) {
             var c = cmdString[i];
 
-            // Check for "->" separator at depth 0
-            if (depth === 0 && c === '-' && i + 1 < cmdString.length && cmdString[i + 1] === '>') {
-                if (currentCall.trim().length > 0) {
-                    calls.push(currentCall.trim());
-                }
-                currentCall = "";
-                i++; // Skip '>'
-                continue;
+            if (c === '"' && (i === 0 || cmdString[i - 1] !== '\\')) {
+                inQuote = !inQuote;
             }
 
-            if (c === '(') depth++;
-            else if (c === ')') depth--;
+            if (!inQuote) {
+                // Check for "->" separator at depth 0
+                if (depth === 0 && c === '-' && i + 1 < cmdString.length && cmdString[i + 1] === '>') {
+                    if (currentCall.trim().length > 0) {
+                        calls.push(currentCall.trim());
+                    }
+                    currentCall = "";
+                    i++; // Skip '>'
+                    continue;
+                }
+
+                if (c === '(') depth++;
+                else if (c === ')') depth--;
+            }
 
             currentCall += c;
         }
@@ -3005,8 +3041,8 @@ class Exec {
 
             Logger.info("  [Trace] Next 'this': " + currentThis);
         }
-
-        return null; // Don't return BigInt to host to avoid marshaling errors
+        // Return final result for chaining (already a hex string, safe to return)
+        return result;
     }
 
 
@@ -3165,6 +3201,12 @@ class Exec {
             var bestRegs = null;
 
             for (var cand of symInfo.candidates) {
+                // Safety Check: Skip candidates with control flow or RIP-relative addressing
+                if (!this._checkRelocatable(cand.address, cand.size)) {
+                    Logger.warn("    [Chain] Skipping non-relocatable candidate @ " + cand.address);
+                    continue;
+                }
+
                 var regs = this._getInlinedRegs(cand.address);
                 // Heuristic: We want a simple getter, usually offset is small positive.
                 // If offset is 0x10, it's likely "mov rax, [rcx+10h]".
@@ -3188,6 +3230,11 @@ class Exec {
 
         // Handle Single Inline (Legacy/Fallback if getSymbolInfo behaves differently)
         if (symInfo && symInfo.type === 'inline') {
+            // Safety Check: Ensure code is relocatable
+            if (!this._checkRelocatable(symInfo.address, symInfo.size)) {
+                Logger.error("    [Inline] Code contains control flow or RIP-relative addressing. Cannot relocate safely.");
+                return null;
+            }
             var regs = this._getInlinedRegs(symInfo.address);
             return this._executeInlinedCode(symInfo.address, symInfo.size, args, regs.inputReg, regs.outputReg);
         }
@@ -3415,6 +3462,18 @@ class Exec {
         // BUT we must disassemble first to know which registers it uses!
         if (inlineAddr && inlineSize > 0) {
             Logger.info("    [PDB] Disassembling inlined function @ " + inlineAddr);
+
+            // Safety Check: Relocatability
+            if (!this._checkRelocatable(inlineAddr, inlineSize)) {
+                Logger.error("    [PDB] Inlined code contains control flow (call/jmp). Cannot relocate safely.");
+                // Fallback to non-inlined if we found one?
+                if (exactFuncAddr) {
+                    Logger.info("    [PDB] Falling back to non-inlined version...");
+                    return this._execViaInline_Part2(exactFuncAddr, thisPtr);
+                }
+                return null;
+            }
+
             var regs = this._getInlinedRegs(inlineAddr);
             Logger.info("    [PDB] Executing real inlined code from " + inlineAddr + " (" + inlineSize + " bytes)");
             // NOTE: In _execViaInline, we might only have thisPtr. Wrap it in args array for compatibility.
@@ -3480,6 +3539,46 @@ class Exec {
             Logger.info("    [PDB] Register detection failed: " + e.message);
         }
         return { inputReg: inputReg, outputReg: outputReg, offset: offset };
+    }
+
+    /// Check if code range contains relative control flow (call, jmp, jcc) which breaks on relocation
+    static _checkRelocatable(addr, size) {
+        var ctl = SymbolUtils.getControl();
+        try {
+            // Disassemble entire range
+            var output = ctl.ExecuteCommand("u " + addr + " L" + (size < 20 ? "10" : "50"));
+            // Start address as BigInt for range check
+            var startBn = BigInt(addr.replace(/`/g, ""));
+            var endBn = startBn + BigInt(size);
+
+            for (var line of output) {
+                var lineStr = line.toString();
+                // Extract address
+                var m = lineStr.match(/^([0-9a-fA-F`]+)/);
+                if (!m) continue;
+                var currBn = BigInt("0x" + m[1].replace(/`/g, ""));
+
+                if (currBn >= endBn) break; // Past the inline range
+
+                // Check mnemonics: call, jmp, je, jne, jnz, etc.
+                // Regex for control flow
+                if (/\s(call|jmp|je|jne|jz|jnz|jg|jge|jl|jle|ja|jae|jb|jbe|jo|jno|js|jns)\s/.test(lineStr)) {
+                    Logger.warn("    [RelocationCheck] Found control flow: " + lineStr.trim());
+                    return false;
+                }
+
+                // Check for RIP-relative addressing: [rip+...] or [rip-...]
+                if (/\[rip[+\-]/i.test(lineStr)) {
+                    Logger.warn("    [RelocationCheck] Found RIP-relative addressing: " + lineStr.trim());
+                    return false;
+                }
+            }
+        } catch (e) {
+            Logger.warn("    [RelocationCheck] Failed: " + e.message);
+            // safe to proceed? Assume no.
+            return false;
+        }
+        return true;
     }
 
     static _execViaInline_Part2(exactFuncAddr, thisPtr) {
@@ -3558,7 +3657,7 @@ class Exec {
             // 3. Write to our buffer
             MemoryUtils.writeMemory(buf, codeBytes);
 
-            // 4. Save registers (using $t0-$t6 for WinDbg)
+            // 4. Save registers (using $t0-$t8 for WinDbg)
             ctl.ExecuteCommand("r @$t0 = @rip");
             ctl.ExecuteCommand("r @$t1 = @rsp");
             ctl.ExecuteCommand("r @$t2 = @" + inputReg);
@@ -3566,6 +3665,49 @@ class Exec {
             ctl.ExecuteCommand("r @$t4 = @rdx");
             ctl.ExecuteCommand("r @$t5 = @r8");
             ctl.ExecuteCommand("r @$t6 = @r9");
+            ctl.ExecuteCommand("r @$t7 = @rcx");
+            ctl.ExecuteCommand("r @$t8 = @rax");
+
+            // 5. Setup Stack for Args > 4 (Shadow Space + Args)
+            var stackAlloc = null;
+            if (args.length > 4) {
+                // Shadow space (32) + (args-4)*8
+                var stackSize = 32 + (args.length - 4) * 8;
+                // Align to 16 bytes
+                if (stackSize % 16 !== 0) stackSize += (16 - (stackSize % 16));
+
+                // Allocate STACK memory with SAFETY BUFFER (4KB below RSP)
+                // Layout: [Safety Buffer 4KB] [RSP Point (Args Start)] [Args...]
+                var safetyBuffer = 0x1000;
+                var totalStackSize = stackSize + safetyBuffer;
+
+                var stackHex = MemoryUtils.alloc(totalStackSize);
+                if (stackHex) {
+                    stackAlloc = BigInt("0x" + stackHex);
+
+                    // RSP should point to where arguments start (conceptually "top" of used stack)
+                    // The function will access [RSP+0x28] for arg 5.
+                    // The function might PUSH, writing to [RSP-8].
+                    // So we set RSP = stackAlloc + safetyBuffer.
+                    var rspAddr = stackAlloc + BigInt(safetyBuffer);
+
+                    // Write args at rspAddr + 32 (Shadow Space)
+                    for (var i = 4; i < args.length; i++) {
+                        var offset = 32 + (i - 4) * 8;
+                        var argVal = args[i].realValue;
+                        var valBytes = this._to64BitLE(argVal);
+                        var addr = rspAddr + BigInt(offset);
+                        MemoryUtils.writeMemory(addr.toString(16), valBytes);
+                    }
+
+                    Logger.info("    [Stack] Safe Stack setup at " + rspAddr.toString(16) + " (Base: " + stackHex + ")");
+                    ctl.ExecuteCommand("r @rsp = " + rspAddr.toString(16));
+                }
+            } else {
+                // Even if no extra args, providing a safe stack is good practice?
+                // Current stack might be unsafe if proper alignment is needed.
+                // For now, only override if args > 4 to minimize risk.
+            }
 
             // 5. Set up for execution
             // Argument 0: this -> inputReg
@@ -3610,6 +3752,8 @@ class Exec {
             ctl.ExecuteCommand("r @rdx = @$t4");
             ctl.ExecuteCommand("r @r8 = @$t5");
             ctl.ExecuteCommand("r @r9 = @$t6");
+            ctl.ExecuteCommand("r @rcx = @$t7");
+            ctl.ExecuteCommand("r @rax = @$t8");
 
             if (outMatch) {
                 var result = BigInt("0x" + outMatch);
@@ -3636,8 +3780,23 @@ class Exec {
                 ctl.ExecuteCommand("r @rdx = @$t4");
                 ctl.ExecuteCommand("r @r8 = @$t5");
                 ctl.ExecuteCommand("r @r9 = @$t6");
+                ctl.ExecuteCommand("r @rcx = @$t7");
+                ctl.ExecuteCommand("r @rax = @$t8");
             } catch (e2) { }
             return null;
+        } finally {
+            if (buf) {
+                MemoryUtils.free(buf, bufSize);
+                Logger.debug("    Freed execution buffer: " + buf);
+            }
+            if (stackAlloc) {
+                MemoryUtils.free(stackAlloc.toString(16), 0);
+                Logger.debug("    Freed stack buffer.");
+            }
+            if (scratchBase) {
+                MemoryUtils.free(scratchBase.toString(16), 0);
+                Logger.debug("    Freed scratch buffer.");
+            }
         }
     }
 
@@ -3681,7 +3840,7 @@ class Exec {
     }
 
     static _analyzeResult(resultVal) {
-        if (resultVal === 0n) return;
+        if (resultVal === 0n) return 0n;
 
         // Decimal (clean output, no signed by default unless negative)
         Logger.info("    Decimal (Unsigned): " + resultVal.toString());
@@ -3748,8 +3907,10 @@ class Exec {
 
         for (var i = 0; i < argsStr.length; i++) {
             var c = argsStr[i];
-            if (c === '"') inQuote = !inQuote;
-            else if (c === ',' && !inQuote) {
+
+            if (c === '"' && (i === 0 || argsStr[i - 1] !== '\\')) {
+                inQuote = !inQuote;
+            } else if (c === ',' && !inQuote) {
                 args.push(this._processArg(current.trim()));
                 current = "";
                 continue;
@@ -3763,11 +3924,15 @@ class Exec {
     static _processArg(arg) {
         // String literal
         if (arg.startsWith('"') && arg.endsWith('"')) {
-            return { type: 'string', value: arg.slice(1, -1) };
+            // Unescape internal escaped quotes
+            var str = arg.slice(1, -1).replace(/\\"/g, '"');
+            return { type: 'string', value: str };
         }
         // Boolean
         if (arg === 'true') return { type: 'int', value: 1 };
         if (arg === 'false') return { type: 'int', value: 0 };
+        // Null pointer
+        if (arg === 'null' || arg === 'nullptr') return { type: 'int', value: 0 };
         // Hex / Number (require at least one digit)
         if (/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(arg)) {
             return { type: 'int', value: arg };
@@ -3788,7 +3953,10 @@ class Exec {
         // Need space for: Shellcode + String Data + Result
         var allocSize = 0x1000;
         var baseAddrHex = MemoryUtils.alloc(allocSize);
-        if (!baseAddrHex) return;
+        if (!baseAddrHex) {
+            Logger.error("Failed to allocate execution buffer");
+            return null;
+        }
 
         var baseAddr = BigInt("0x" + baseAddrHex);
 
@@ -3814,6 +3982,13 @@ class Exec {
 
                 // Write to memory
                 var strAddr = baseAddr + currentDataOffset;
+
+                // Safety Check: Do not overflow into Code region
+                if (currentDataOffset + BigInt(bytes.length) >= codeOffset) {
+                    Logger.error("String argument too long, exceeds buffer capacity.");
+                    return "0x0";
+                }
+
                 MemoryUtils.writeMemory(strAddr.toString(16), bytes);
 
                 // Update arg value to be the pointer
@@ -3889,15 +4064,11 @@ class Exec {
 
             // mov [rsp + offset], rax
             var offset = 0x20 + (i - 4) * 8;
-            code.push(0x48, 0x89, 0x44, 0x24, offset & 0xFF); // Valid for offset < 128 (approx)
-            // Simple encoding limited to byte offset. If offset >= 128 need different opcode?
-            // 0x44 is ModR/M byte?
-            // 48 89 84 24 [32-bit offset] for larger offsets.
-            if (offset >= 0x80) {
-                // Fallback to larger offset instruction
-                // Replace previous push
-                code.pop(); code.pop(); code.pop(); code.pop(); // Undo
-                // mov [rsp + disp32], rax
+            if (offset < 0x80) {
+                // Short encoding: mov [rsp + disp8], rax
+                code.push(0x48, 0x89, 0x44, 0x24, offset & 0xFF);
+            } else {
+                // Long encoding: mov [rsp + disp32], rax
                 code.push(0x48, 0x89, 0x84, 0x24);
                 code = code.concat([offset & 0xFF, (offset >> 8) & 0xFF, 0, 0]);
             }
@@ -3961,7 +4132,7 @@ class Exec {
 
         // Read Result
         var resultVals = host.memory.readMemoryValues(host.parseInt64(baseAddr.toString(16), 16), 1, 8);
-        var result = resultVals[0];
+        var result = BigInt(resultVals[0]);
 
         // Analyze Result
         result = this._analyzeResult(result);
@@ -3989,6 +4160,11 @@ class Exec {
         } catch (e) {
             Logger.error("  [Trace] Result conversion failed: " + e.message);
             return "0x0";
+        } finally {
+            if (baseAddrHex) {
+                MemoryUtils.free(baseAddrHex, allocSize);
+                Logger.debug("    Freed execution buffer: " + baseAddrHex);
+            }
         }
     }
 }
