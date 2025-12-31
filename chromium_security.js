@@ -411,6 +411,8 @@ class SymbolUtils {
         return null;
     }
 
+
+
     /// Get symbol name for a given address (using ln)
     static getSymbolName(subsysAddr, debug) {
         var hexAddr = normalizeAddress(subsysAddr);
@@ -3679,6 +3681,11 @@ class Exec {
             Logger.warn("Ensure you are in a valid frame with 'g_frame_map' or provide explicit 'this'.");
         }
 
+        // Multi-Inheritance Support: Adjust 'this' pointer if method belongs to a base class
+        if (thisPtr && targetSymbol.includes("::")) {
+            thisPtr = this._adjustThisPointer(thisPtr, targetSymbol);
+        }
+
         Logger.info("    Target: " + targetSymbol + " @ " + targetAddr);
         Logger.info("    Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
 
@@ -3794,6 +3801,50 @@ class Exec {
         // This synthesizes: MOV RAX, [RCX + offset]; RET
         return this._readMember(thisPtr, memberOffset);
     }
+
+    /// Helper: Adjust 'this' pointer for multiple inheritance
+    /// Casts the pointer to the target class type to let the compiler/debugger handle offset adjustment
+    static _adjustThisPointer(thisPtr, targetSymbol) {
+        try {
+            // 1. Detect Original Type
+            var originalType = BlinkUnwrap.detectType(thisPtr);
+            if (!originalType) return thisPtr;
+
+            // Format: (chrome!blink::LocalDOMWindow*) -> blink::LocalDOMWindow
+            var originalClass = originalType.replace(/[()*]/g, "").replace(/^chrome!/, "");
+
+            // 2. Extract Target Class from Symbol
+            // format: chrome!blink::ExecutionContext::GetSecurityOrigin
+            var symClean = targetSymbol.replace(/^chrome!/, "");
+            var lastColon = symClean.lastIndexOf("::");
+            if (lastColon === -1) return thisPtr;
+            var targetClass = symClean.substring(0, lastColon);
+
+            // 3. Compare (if same, no adjustment needed)
+            if (originalClass === targetClass) return thisPtr;
+
+            // 4. Perform Cast via dx
+            // &((chrome!TargetClass*)((chrome!OriginalClass*)0xPtr))
+            var castExpr = "&((" + "chrome!" + targetClass + "*)(" + "chrome!" + originalClass + "*)" + thisPtr + ")";
+
+            // Use evaluate which uses '?' command
+            var adjustedPtr = SymbolUtils.evaluate(castExpr);
+
+            if (adjustedPtr && adjustedPtr !== thisPtr) {
+                // Formatting for log
+                var diff = BigInt("0x" + adjustedPtr) - BigInt(thisPtr.startsWith("0x") ? thisPtr : "0x" + thisPtr);
+                var sign = diff >= 0n ? "+" : "";
+
+                Logger.info("    [Multi-Inheritance] Adjusted 'this': " + thisPtr + " -> " + adjustedPtr +
+                    " (Offset: " + sign + diff.toString(16) + ")");
+                return adjustedPtr;
+            }
+        } catch (e) {
+            // Fail silently and return original, simpler is safer on error
+        }
+        return thisPtr;
+    }
+
 
     /// Find and call a method using PDB inlined function info
     /// Uses x /v to find:
@@ -3982,11 +4033,20 @@ class Exec {
         // Remove trailing parentheses if present
         methodName = methodName.replace(/\(\)$/, "");
 
-        // Convert CamelCase to snake_case
-        // Insert underscore before each uppercase letter and lowercase it
-        var snakeCase = methodName.replace(/([A-Z])/g, function (match, letter, offset) {
-            return (offset > 0 ? "_" : "") + letter.toLowerCase();
-        });
+        // Convert CamelCase to snake_case, handling acronyms gracefully
+        // 1. "innerHTML" -> "inner_html"
+        // 2. "URL" -> "url" (not u_r_l)
+        // 3. "GetURL" -> "get_url"
+
+        // Strategy: 
+        // 1. Insert underscore between lowercase and uppercase: "inner" "HTML" -> "inner_HTML"
+        // 2. Insert underscore between uppercase and uppercase followed by lowercase: "Get" "URL" "Spec" -> "Get_URL_Spec" (requires lookahead)
+        // 3. Lowercase everything.
+
+        var snakeCase = methodName
+            .replace(/([a-z])([A-Z])/g, '$1_$2') // lower-Upper -> lower_Upper
+            .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2') // UPPER-UpperLower -> UPPER_UpperLower (e.g. SVGLength -> SVG_Length)
+            .toLowerCase();
 
         // Add trailing underscore for member variable
         return snakeCase + "_";
@@ -4309,7 +4369,7 @@ class Exec {
             // This ensures we break at the right place regardless of PDB inlineSize accuracy
             var retOffset = null;
             try {
-                var disasm = ctl.ExecuteCommand("u 0x" + buf + " L10");
+                var disasm = ctl.ExecuteCommand("u 0x" + buf + " L50");
                 for (var dLine of disasm) {
                     var lineStr = dLine.toString();
 
@@ -5202,7 +5262,7 @@ function v8_cage_info() {
     var cppgcCageBase = MemoryUtils.getCppgcCageBase();
     if (cppgcCageBase) {
         Logger.info("Oilpan Cage Base: 0x" + cppgcCageBase);
-        Logger.info("  Formula: Full = (SignExtend32(Compressed) << 1) & Base");
+        Logger.info("  Formula: Full = (SignExtend32(Compressed) << 3) & Base");
     } else {
         Logger.info("Oilpan Cage Base: (not found)");
     }
