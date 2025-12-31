@@ -2635,26 +2635,30 @@ class BlinkUnwrap {
         if (!isValidPointer(addr)) return null;
         var hexAddr = normalizeAddress(addr);
         var ctl = SymbolUtils.getControl();
+        var bestCandidate = null; // Store empty results as fallback, prefer manual read if dx is empty
 
         // 1. Try as WTF::String object (contains impl_ pointer to StringImpl)
         try {
             var output = ctl.ExecuteCommand("dx ((WTF::String*)" + hexAddr + ")");
             var str = BlinkUnwrap._parseStringFromDxOutput(output);
-            if (str !== null) return str;
+            if (str !== null && str.length > 0) return str;
+            if (str !== null) bestCandidate = str;
         } catch (e) { }
 
         // 2. Try as direct StringImpl* (the address is the StringImpl itself)
         try {
             var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + hexAddr + ")");
             var str = BlinkUnwrap._parseStringFromDxOutput(output);
-            if (str !== null) return str;
+            if (str !== null && str.length > 0) return str;
+            if (str !== null) bestCandidate = str;
         } catch (e) { }
 
         // 3. Try as KURL (contains string_ member)
         try {
             var output = ctl.ExecuteCommand("dx ((blink::KURL*)" + hexAddr + ")->string_");
             var str = BlinkUnwrap._parseStringFromDxOutput(output);
-            if (str !== null) return str;
+            if (str !== null && str.length > 0) return str;
+            if (str !== null) bestCandidate = str;
         } catch (e) { }
 
         // 4. For WTF::String, first read the impl_ pointer, then read the StringImpl
@@ -2667,7 +2671,33 @@ class BlinkUnwrap {
                 // Try dx on the dereferenced StringImpl
                 var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + implAddr + ")");
                 var str = BlinkUnwrap._parseStringFromDxOutput(output);
-                if (str !== null) return str;
+                if (str !== null && str.length > 0) return str;
+                if (str !== null) bestCandidate = str;
+            }
+        } catch (e) { }
+
+        // 4.5. Manual memory read for WTF::String (read ptr at offset 0, then read StringImpl)
+        try {
+            var ptrVal = host.memory.readMemoryValues(host.parseInt64(hexAddr, 16), 1, 8)[0];
+            var implAddrBig = MemoryUtils.parseBigInt(ptrVal);
+
+            if (implAddrBig > 0x10000n && isValidUserModePointer(implAddrBig)) {
+                // Now read the StringImpl at implAddrBig
+                // Must use host.parseInt64 to get an object compatible with .add() and readMemoryValues
+                var baseAddr = host.parseInt64(implAddrBig.toString(16), 16);
+                var header = host.memory.readMemoryValues(baseAddr.add(4), 2, 4);
+                var length = header[0];
+                var flags = header[1];
+
+                if (length > 0 && length < 5000000) {
+                    var is8Bit = (flags & 1) === 1;
+                    var dataAddr = baseAddr.add(STRINGIMPL_DATA_OFFSET);
+                    if (is8Bit) {
+                        return host.memory.readString(dataAddr, length);
+                    } else {
+                        return host.memory.readWideString(dataAddr, length);
+                    }
+                }
             }
         } catch (e) { }
 
@@ -2694,7 +2724,7 @@ class BlinkUnwrap {
             }
         } catch (e) { }
 
-        return null;
+        return bestCandidate;
     }
 
     /// Inspect a Blink Node using robust logic
@@ -3565,13 +3595,18 @@ class Exec {
 
             if (!inQuote) {
                 // Check for "->" separator at depth 0
-                if (depth === 0 && c === '-' && i + 1 < cmdString.length && cmdString[i + 1] === '>') {
-                    if (currentCall.trim().length > 0) {
-                        calls.push(currentCall.trim());
+                if (depth === 0) {
+                    var isArrow = (c === '-' && i + 1 < cmdString.length && cmdString[i + 1] === '>');
+                    var isDot = (c === '.');
+
+                    if (isArrow || isDot) {
+                        if (currentCall.trim().length > 0) {
+                            calls.push(currentCall.trim());
+                        }
+                        currentCall = "";
+                        if (isArrow) i++; // Skip '>'
+                        continue;
                     }
-                    currentCall = "";
-                    i++; // Skip '>'
-                    continue;
                 }
 
                 if (c === '(') depth++;
@@ -3782,7 +3817,7 @@ class Exec {
             }
 
             if (detectedType) {
-                var className = detectedType.replace(/[()*]/g, "").trim();
+                var className = detectedType.replace(/[()*&]/g, "").trim();
                 targetSymbol = className + "::" + namePart;
                 Logger.info("    [Chain Auto-Detect] " + thisOverride + " -> " + targetSymbol);
             } else {
@@ -4310,8 +4345,9 @@ class Exec {
                 }
 
                 // Check offset validation - ensure inlined code accesses the expected member
+                // Pass 'className' (the target class) as the original target for validation
                 var regs = this._getInlinedRegs(cand.addr);
-                if (!this._validateInlinedOffset(cand.foundClass, cand.foundMethod, regs.offset)) {
+                if (!this._validateInlinedOffset(cand.foundClass, cand.foundMethod, regs.offset, className)) {
                     Logger.warn("    [PDB] Skipping (offset mismatch): " + cand.addr);
                     continue;
                 }
@@ -4424,26 +4460,52 @@ class Exec {
     }
 
     /// Helper: Validate that an inlined function's detected offset matches the expected member
-    /// @param className - Class name being accessed
+    /// @param className - Class name of the inline candidate
     /// @param methodName - Method name (e.g., "GetDocument", "document")
     /// @param detectedOffset - Offset detected from disassembly
+    /// @param originalTargetClass - (Optional) The original target class we were looking for
     /// @returns true if offset is valid or can't be validated, false if definitely wrong
-    static _validateInlinedOffset(className, methodName, detectedOffset) {
-        if (detectedOffset === 0) return true; // Can't validate zero offset
+    static _validateInlinedOffset(className, methodName, detectedOffset, originalTargetClass) {
+        if (detectedOffset === null) {
+            // If we are checking an unrelated class (Priority 3/Other), be strict:
+            // We MUST be able to validate the offset to trust it.
+            if (originalTargetClass && originalTargetClass !== className) {
+                Logger.debug("    [Offset Validation] Could not detect offset in candidate " + className + " - Strict mode rejecting.");
+                return false;
+            }
+            return true; // For exact/base class, allow complex code we can't parse
+        }
 
         // Convert method to expected member: GetDocument -> document_, DomWindow -> dom_window_
         var expectedMember = this._methodToMember(methodName);
         if (!expectedMember) return true; // Can't validate, allow it
 
-        // Look up actual offset via dt
+        // 1. Look up actual offset on the CANDIDATE class
         var actualOffset = this._getMemberOffset(className, expectedMember);
+
+        // 2. If not found, and we have an ORIGINAL TARGET class, try that
+        if (actualOffset === null && originalTargetClass && originalTargetClass !== className) {
+            Logger.debug("    [Offset Validation] Member '" + expectedMember + "' not found on candidate " + className + ", checking target " + originalTargetClass);
+            actualOffset = this._getMemberOffset(originalTargetClass, expectedMember);
+            if (actualOffset !== null) {
+                Logger.debug("    [Offset Validation] Found member on target " + originalTargetClass + " at 0x" + actualOffset.toString(16));
+            }
+        }
+
         if (actualOffset === null) {
             // Try without "Get" prefix: GetDocument -> Document -> document_
             if (methodName.startsWith("Get") && methodName.length > 3) {
                 var altMember = this._methodToMember(methodName.substring(3));
                 if (altMember) {
                     actualOffset = this._getMemberOffset(className, altMember);
-                    if (actualOffset !== null) expectedMember = altMember;
+
+                    // Retry on target class if needed
+                    if (actualOffset === null && originalTargetClass && originalTargetClass !== className) {
+                        actualOffset = this._getMemberOffset(originalTargetClass, altMember);
+                        if (actualOffset !== null) expectedMember = altMember;
+                    } else if (actualOffset !== null) {
+                        expectedMember = altMember;
+                    }
                 }
             }
         }
@@ -4452,7 +4514,7 @@ class Exec {
             // Member not found on this class - can't validate
             // Method might be a wrapper or access inherited/indirect member
             // Allow the inlined code to execute
-            Logger.debug("    [Offset Validation] Member '" + expectedMember + "' not found on " + className + ", allowing inline");
+            Logger.debug("    [Offset Validation] Member '" + expectedMember + "' not found on " + className + " (or target), allowing inline");
             return true;
         }
 
@@ -4634,7 +4696,7 @@ class Exec {
         var ctl = SymbolUtils.getControl();
         var inputReg = "rcx";  // Default input (this)
         var outputReg = "rax"; // Default output (result)
-        var offset = 0;
+        var offset = null;     // Default to null (not found)
 
         try {
             var uOutput = ctl.ExecuteCommand("u " + inlineAddr + " L5");
@@ -4642,31 +4704,31 @@ class Exec {
                 var lineStr = line.toString();
 
                 // LEA (pointer return): lea rax,[rcx+offset]
-                var leaMatch = lineStr.match(/lea\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                var leaMatch = lineStr.match(/lea\s+(\w+),.*?\[(\w+)(?:\+([0-9a-fA-F]+)h?)?\]/i);
                 if (leaMatch) {
                     outputReg = leaMatch[1];
                     inputReg = leaMatch[2];
-                    offset = parseInt(leaMatch[3], 16);
+                    offset = leaMatch[3] ? parseInt(leaMatch[3], 16) : 0;
                     Logger.info("    [PDB] Pattern: LEA " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
                     break;
                 }
 
                 // MOVSS/MOVSD (float/double): movss xmm0, ...
-                var movssMatch = lineStr.match(/movs[sd]\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                var movssMatch = lineStr.match(/movs[sd]\s+(\w+),.*?\[(\w+)(?:\+([0-9a-fA-F]+)h?)?\]/i);
                 if (movssMatch) {
                     outputReg = movssMatch[1];
                     inputReg = movssMatch[2];
-                    offset = parseInt(movssMatch[3], 16);
+                    offset = movssMatch[3] ? parseInt(movssMatch[3], 16) : 0;
                     Logger.info("    [PDB] Pattern: MOVSS/SD " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
                     break;
                 }
 
                 // MOV (value read): mov rax,qword ptr [rcx+offset]
-                var movMatch = lineStr.match(/mov\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                var movMatch = lineStr.match(/mov\s+(\w+),.*?\[(\w+)(?:\+([0-9a-fA-F]+)h?)?\]/i);
                 if (movMatch) {
                     outputReg = movMatch[1];
                     inputReg = movMatch[2];
-                    offset = parseInt(movMatch[3], 16);
+                    offset = movMatch[3] ? parseInt(movMatch[3], 16) : 0;
                     Logger.info("    [PDB] Pattern: MOV " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
                     break;
                 }
@@ -4683,11 +4745,11 @@ class Exec {
                 }
 
                 // MOVSXD (compressed pointer logic): movsxd rcx,dword ptr [rbx+28h]
-                var movsxdMatch = lineStr.match(/movsxd\s+(\w+),.*?\[(\w+)\+([0-9a-fA-F]+)h?\]/i);
+                var movsxdMatch = lineStr.match(/movsxd\s+(\w+),.*?\[(\w+)(?:\+([0-9a-fA-F]+)h?)?\]/i);
                 if (movsxdMatch) {
                     outputReg = movsxdMatch[1];
                     inputReg = movsxdMatch[2];
-                    offset = parseInt(movsxdMatch[3], 16);
+                    offset = movsxdMatch[3] ? parseInt(movsxdMatch[3], 16) : 0;
                     Logger.info("    [PDB] Pattern: MOVSXD " + outputReg + ", [" + inputReg + "+0x" + offset.toString(16) + "]");
                     break;
                 }
