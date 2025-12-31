@@ -11,6 +11,7 @@
 var g_rendererAttachCommands = [];
 var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string, pid: number}>
 var g_registeredPids = new Set();
+var g_exitHandlerRegistered = false;
 
 /// Constants
 const DEBUG_MODE = false; // Set to true to enable verbose error logging
@@ -1141,6 +1142,32 @@ function isValidPointer(ptr) {
     return true;
 }
 
+/// Helper: Check if memory address is writable
+/// @param addr - Address to check (host.Int64 or hex string)
+/// @returns true if PAGE_READWRITE or PAGE_WRITECOPY
+function _isWritable(addr) {
+    try {
+        var ctl = SymbolUtils.getControl();
+        var addrStr = (typeof addr === 'string') ? addr : addr.toString(16);
+        if (!addrStr.startsWith('0x')) addrStr = '0x' + addrStr;
+        var out = ctl.ExecuteCommand("!address " + addrStr);
+        for (var line of out) {
+            var s = line.toString();
+            if (s.includes("Protect:")) {
+                if (s.includes("PAGE_READWRITE") || s.includes("PAGE_WRITECOPY") ||
+                    s.includes("PAGE_EXECUTE_READWRITE") || s.includes("PAGE_EXECUTE_WRITECOPY")) {
+                    return true;
+                }
+                return false;
+            }
+        }
+    } catch (e) {
+        Logger.debug("_isWritable check failed: " + e.message);
+    }
+    // If check fails, assume not writable for safety
+    return false;
+}
+
 /// Helper: Extract pointee type from smart pointer types
 /// Examples:
 ///   "scoped_refptr<blink::SecurityOrigin>" -> "(blink::SecurityOrigin*)"
@@ -1404,7 +1431,6 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
                     continue;
                 }
 
-                var lengthUpdated = false;
                 var headerInfo = null;
 
                 // If lengths differ, we try to find and update the length field
@@ -1471,8 +1497,6 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
                                 MemoryUtils.writeMemory(newSuffixAddr.toString(16), suffixBytes);
                             }
                         }
-
-                        lengthUpdated = true;
                     } else {
                         skipped++;
                         continue;
@@ -3954,6 +3978,19 @@ class Exec {
                     }
                 }
 
+                // Adjust 'this' pointer for multi-inheritance if method is on a different class
+                // Extract the original class from targetSymbol to compare with bestCandidate.foundClass
+                var targetClass = targetSymbol.replace(/^chrome!/, "");
+                var lastCC = targetClass.lastIndexOf("::");
+                if (lastCC !== -1) targetClass = targetClass.substring(0, lastCC);
+
+                if (thisPtr && bestCandidate.foundClass !== targetClass) {
+                    var adjustedThis = this._adjustThisPointer(thisPtr, "chrome!" + inlinedSymbol);
+                    if (adjustedThis !== thisPtr && args.length > 0) {
+                        args[0] = this._processArg(adjustedThis);
+                    }
+                }
+
                 return this._executeInlinedCode(bestCandidate.address, bestCandidate.size, args, bestRegs.inputReg, bestRegs.outputReg);
             } else {
                 Logger.error("    [Chain] Could not find a suitable inlined candidate.");
@@ -4281,11 +4318,18 @@ class Exec {
                 }
             }
 
-            // Priority 3: Add remaining candidates
+            // Priority 3: Add remaining candidates (only if they share a namespace)
+            // This avoids selecting completely unrelated methods like mojo::X when looking for blink::Y
+            var requestedTopNs = className.split("::")[0];  // e.g., "blink" from "blink::Document"
             for (var cand of inlineCandidates) {
                 if (!cand.priority) {
-                    cand.priority = 3;
-                    orderedCandidates.push(cand);
+                    var candTopNs = cand.foundClass.split("::")[0];
+                    if (candTopNs === requestedTopNs) {
+                        cand.priority = 3;
+                        orderedCandidates.push(cand);
+                    } else {
+                        Logger.info("    [PDB] Skipping unrelated namespace: " + cand.foundClass + " (not in " + requestedTopNs + "::)");
+                    }
                 }
             }
 
@@ -4315,7 +4359,14 @@ class Exec {
 
                 var regs = this._getInlinedRegs(cand.addr);
                 Logger.info("    [PDB] Executing real inlined code from " + cand.addr + " (" + cand.size + " bytes)");
-                var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
+
+                // Adjust 'this' pointer for multi-inheritance if method is on a base class
+                var adjustedThis = thisPtr;
+                if (cand.foundClass !== className) {
+                    adjustedThis = this._adjustThisPointer(thisPtr, "chrome!" + inlinedSymbol);
+                }
+
+                var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(adjustedThis) }];
                 return this._executeInlinedCode(cand.addr, cand.size, inlineArgs, regs.inputReg, regs.outputReg);
             }
 
@@ -4628,8 +4679,27 @@ class Exec {
     /// @param outputReg - Register that holds result (e.g. "rax", "r14")
     static _executeInlinedCode(inlineAddr, inlineSize, args, inputReg, outputReg) {
         var ctl = SymbolUtils.getControl();
-        inputReg = inputReg || "rcx";
-        outputReg = outputReg || "rax";
+
+        // Valid x64 registers (GPR + XMM)
+        var validRegs = [
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"
+        ];
+
+        inputReg = (inputReg || "rcx").toLowerCase();
+        outputReg = (outputReg || "rax").toLowerCase();
+
+        // Validate registers to prevent command injection
+        if (validRegs.indexOf(inputReg) === -1) {
+            Logger.warn("    Invalid inputReg '" + inputReg + "', defaulting to rcx");
+            inputReg = "rcx";
+        }
+        if (validRegs.indexOf(outputReg) === -1) {
+            Logger.warn("    Invalid outputReg '" + outputReg + "', defaulting to rax");
+            outputReg = "rax";
+        }
 
         // Allocate buffer for code + RET
         var bufSize = inlineSize + 16;  // Extra space for RET and alignment
@@ -4646,7 +4716,14 @@ class Exec {
         try {
             for (var i = 0; i < args.length; i++) {
                 if (args[i].type === 'string') {
-                    if (!scratchBase) scratchBase = BigInt("0x" + MemoryUtils.alloc(0x1000));
+                    if (!scratchBase) {
+                        var scratchHex = MemoryUtils.alloc(0x1000);
+                        if (!scratchHex) {
+                            Logger.error("Failed to allocate scratch memory for string arguments");
+                            return null;
+                        }
+                        scratchBase = BigInt("0x" + scratchHex);
+                    }
 
                     var str = args[i].value;
                     var bytes = [];
@@ -4772,18 +4849,22 @@ class Exec {
             ctl.ExecuteCommand("r @rip = 0x" + buf);
 
             // Argument 0: this -> inputReg
+            var inputRegLower = inputReg.toLowerCase();
             ctl.ExecuteCommand("r @" + inputReg + " = 0x" + thisPtr.toString(16));
 
-            // Argument 1: rdx
-            if (args.length > 1) ctl.ExecuteCommand("r @rdx = 0x" + args[1].realValue.toString(16));
-            // Argument 2: r8
-            if (args.length > 2) ctl.ExecuteCommand("r @r8 = 0x" + args[2].realValue.toString(16));
-            // Argument 3: r9
-            if (args.length > 3) ctl.ExecuteCommand("r @r9 = 0x" + args[3].realValue.toString(16));
+            // Arguments 1-3: rdx, r8, r9 (skip if inputReg is the same register to avoid overwriting 'this')
+            if (args.length > 1 && inputRegLower !== "rdx") {
+                ctl.ExecuteCommand("r @rdx = 0x" + args[1].realValue.toString(16));
+            }
+            if (args.length > 2 && inputRegLower !== "r8") {
+                ctl.ExecuteCommand("r @r8 = 0x" + args[2].realValue.toString(16));
+            }
+            if (args.length > 3 && inputRegLower !== "r9") {
+                ctl.ExecuteCommand("r @r9 = 0x" + args[3].realValue.toString(16));
+            }
 
-
-            // 6. Clear any existing breakpoints (INT3 in the code will cause break)
-            ctl.ExecuteCommand("bc *");
+            // Note: We no longer use "bc *" as it clears ALL user breakpoints.
+            // The INT3 we inject will cause a break without needing to clear others.
 
             Logger.info("    Executing real inlined code (with args)...");
             // Use gH (go with exception handled) to clear any pending exception state
@@ -4823,8 +4904,7 @@ class Exec {
                 Logger.error("Failed to read result registers: " + e.message);
             }
 
-            // 8. Clear breakpoint
-            ctl.ExecuteCommand("bc *");
+            // Note: We no longer clear breakpoints here as bc * is too destructive
 
             // 9. Restore registers
             ctl.ExecuteCommand("r @rip = @$t0");
@@ -5083,13 +5163,22 @@ class Exec {
         var args = [];
         var current = "";
         var inQuote = false;
+        var depth = 0;  // Track parenthesis depth
 
         for (var i = 0; i < argsStr.length; i++) {
             var c = argsStr[i];
 
             if (c === '"' && (i === 0 || argsStr[i - 1] !== '\\')) {
                 inQuote = !inQuote;
-            } else if (c === ',' && !inQuote) {
+            }
+
+            if (!inQuote) {
+                if (c === '(') depth++;
+                else if (c === ')') depth--;
+            }
+
+            // Only split on comma if not in quote AND at depth 0
+            if (c === ',' && !inQuote && depth === 0) {
                 args.push(this._processArg(current.trim()));
                 current = "";
                 continue;
@@ -5437,6 +5526,7 @@ function uninitializeScript() {
     // Reset global state to prevent stale data on script reload
     g_rendererAttachCommands = [];
     g_spoofMap.clear();
+    g_registeredPids.clear();
     g_exitHandlerRegistered = false;
 
     // Invalidate cached memory addresses
@@ -6533,22 +6623,7 @@ function patch_function(funcName, returnValue) {
     return "";
 }
 
-/// Helper: Ensure the exit process handler is registered
-function _ensureExitHandler() {
-    if (g_exitHandlerRegistered) return;
-
-    // Register a silent handler for Process Exit (epr)
-    // We use ; g at the end to auto-continue unless we want to stop (we don't)
-    var cmd = "sxe -c \"!on_process_exit; g\" epr";
-    try {
-        var ctl = SymbolUtils.getControl();
-        ctl.ExecuteCommand(cmd);
-        g_exitHandlerRegistered = true;
-        Logger.info("  [Setup] Registered process exit handler for cleanup.");
-    } catch (e) {
-        Logger.warn("  [Setup] Failed to register process exit handler.");
-    }
-}
+// _ensureExitHandler moved below spoof_origin to consolidate duplicate definitions
 
 /// Helper: Handler for process exit (runs on every process exit)
 function on_process_exit() {
@@ -6825,9 +6900,26 @@ function spoof_origin(arg1, arg2, arg3) {
     return "";
 }
 
-/// Helper: Register process exit handler once per PID
+/// Helper: Register process exit handler for cleanup
+/// Uses both debugger exception handler (global) and per-PID event handler
 function _ensureExitHandler() {
     var pid = host.currentProcess.Id;
+
+    // Register global debugger exception handler once
+    if (!g_exitHandlerRegistered) {
+        try {
+            var ctl = SymbolUtils.getControl();
+            // Register handler for Process Exit (epr) exception
+            var cmd = "sxe -c \"!on_process_exit; g\" epr";
+            ctl.ExecuteCommand(cmd);
+            g_exitHandlerRegistered = true;
+            Logger.info("  [Setup] Registered global exit handler for cleanup.");
+        } catch (e) {
+            Logger.debug("Failed to register global exit handler: " + e.message);
+        }
+    }
+
+    // Register per-PID handler if not already registered
     if (g_registeredPids.has(pid)) return;
 
     try {
@@ -6842,9 +6934,9 @@ function _ensureExitHandler() {
             g_registeredPids.delete(pid);
         });
         g_registeredPids.add(pid);
-        Logger.info("  [Setup] Registered process exit handler for PID " + pid);
+        Logger.info("  [Setup] Registered exit handler for PID " + pid);
     } catch (e) {
-        Logger.debug("Failed to register exit handler for PID " + pid + ": " + e.message);
+        Logger.debug("Failed to register per-PID exit handler for " + pid + ": " + e.message);
     }
 }
 
@@ -7774,21 +7866,4 @@ function bp_jit() {
     return _bpFromConfig("jit");
 }
 
-function _isWritable(addr) {
-    try {
-        var ctl = SymbolUtils.getControl();
-        // Check protection
-        var out = ctl.ExecuteCommand("!address " + addr.toString(16));
-        for (var line of out) {
-            var s = line.toString();
-            // Protect: ...
-            if (s.includes("Protect:")) {
-                if (s.includes("PAGE_READWRITE") || s.includes("PAGE_WRITECOPY")) return true;
-                return false;
-            }
-        }
-    } catch (e) { }
-    // If check fails, assume unsafe or allow if we want to risk it? 
-    // Safer to assume FALSE if we can't verify.
-    return false;
-}
+// _isWritable moved to helpers section (after isValidPointer) for better code organization
