@@ -321,8 +321,6 @@ class Logger {
 class SymbolUtils {
     static getControl() { return host.namespace.Debugger.Utility.Control; }
 
-    static getControl() { return host.namespace.Debugger.Utility.Control; }
-
     /// Extract hex address from a line of debugger output (removes backticks)
     static extractAddress(line) {
         var match = line.toString().match(/^([0-9a-fA-F`]+)/);
@@ -473,7 +471,6 @@ class SymbolUtils {
                 var typeName = typeObj.Name || typeObj.name;
                 if (typeName) {
                     Logger.info("    [Type Detection] Host API (Expression): " + typeName);
-                    Logger.info("    [Type Detection] Host API (Expression): " + typeName);
                     ProcessCache.setReturnType(symbolName, typeName);
                     return typeName;
                 }
@@ -490,7 +487,6 @@ class SymbolUtils {
                 if (returnTypeObj) {
                     var typeName = returnTypeObj.Name || returnTypeObj.name;
                     if (typeName) {
-                        Logger.info("    [Type Detection] Host API (Symbol): " + typeName);
                         Logger.info("    [Type Detection] Host API (Symbol): " + typeName);
                         ProcessCache.setReturnType(symbolName, typeName);
                         return typeName;
@@ -511,7 +507,6 @@ class SymbolUtils {
                     var sig = m[1].replace(/\s*(__cdecl|__stdcall|__fastcall|__thiscall)/g, "").trim();
                     var retMatch = sig.match(/^([^(]+)\s*\(/);
                     var type = retMatch ? retMatch[1].trim() : sig;
-                    type = type.replace(/^(class|struct)\s+/, "");
                     Logger.info("    [Type Detection] PDB Signature: " + type);
                     type = type.replace(/^(class|struct)\s+/, "");
                     ProcessCache.setReturnType(symbolName, type);
@@ -541,7 +536,6 @@ class SymbolUtils {
                         var typeName = sym.Type.functionReturnType.Name || sym.Type.functionReturnType.name;
                         if (typeName) {
                             if (typeName) {
-                                Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
                                 Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
                                 ProcessCache.setReturnType(symbolName, typeName);
                                 return typeName;
