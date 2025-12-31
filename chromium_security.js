@@ -3741,7 +3741,7 @@ class Exec {
             // but for common classes we can try to cast the forced context itself.
             var detected = BlinkUnwrap.detectType(this._forcedContext);
             if (detected) {
-                var detectedName = detected.replace(/[()*]/g, "");
+                var detectedName = detected.replace(/[()*]/g, "").trim();
                 if (detectedName === className) {
                     Logger.info("    [Auto-This] Pinned context matches " + className + ": " + this._forcedContext);
                     return this._forcedContext;
@@ -3824,7 +3824,7 @@ class Exec {
                     var detectedType = BlinkUnwrap.detectType(ptrPart);
                     if (detectedType) {
                         // detectedType format: (chrome!Class*)
-                        var className = detectedType.replace(/[()*]/g, "");
+                        var className = detectedType.replace(/[()*]/g, "").trim();
                         targetSymbol = className + "::" + methodPart;
                         Logger.info("    [Auto-Detect] Resolved method: " + targetSymbol);
                     } else {
@@ -3879,7 +3879,7 @@ class Exec {
             }
 
             if (detectedType) {
-                var className = detectedType.replace(/[()*]/g, "");
+                var className = detectedType.replace(/[()*]/g, "").trim();
                 targetSymbol = className + "::" + namePart;
                 Logger.info("    [Chain Auto-Detect] " + thisOverride + " -> " + targetSymbol);
             } else {
@@ -4180,7 +4180,7 @@ class Exec {
             if (!originalType) return thisPtr;
 
             // Format: (chrome!blink::LocalDOMWindow*) -> blink::LocalDOMWindow
-            var originalClass = originalType.replace(/[()*]/g, "").replace(/^chrome!/, "");
+            var originalClass = originalType.replace(/[()*]/g, "").trim().replace(/^chrome!/, "");
 
             // 2. Extract Target Class from Symbol
             // format: chrome!blink::ExecutionContext::GetSecurityOrigin
