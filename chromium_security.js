@@ -70,15 +70,18 @@ function _registerRendererSxeHandler(commandString, displayLabel) {
 }
 
 /// =============================================================================
-/// GLOBAL CACHE
+/// PROCESS CACHE
 /// =============================================================================
 
-class GlobalCache {
+class ProcessCache {
     // Map<PID, Map<Key, Value>>
     static _symbolCache = new Map();
     static _reverseSymbolCache = new Map();
     static _v8CageBaseCache = new Map(); // Map<PID, AddressString>
     static _cppgcCageBaseCache = new Map(); // Map<PID, AddressString>
+    static _vtableTypeCache = new Map(); // Map<PID, Map<VTableAddr, TypeName>>
+    static _offsetCache = new Map(); // Map<PID, Map<ClassMember, Offset>>
+    static _returnTypeCache = new Map(); // Map<PID, Map<Symbol, TypeName>>
 
     static _getPid() {
         try {
@@ -90,7 +93,7 @@ class GlobalCache {
     }
 
     // Generic LRU Get: returns value or undefined, moves to end if found
-    static _getLru(map, key) {
+    static getLru(map, key) {
         if (map && map.has(key)) {
             const val = map.get(key);
             map.delete(key);
@@ -101,7 +104,7 @@ class GlobalCache {
     }
 
     // Generic LRU Set: sets value, moves to end, enforces size limit
-    static _setLru(map, key, value, maxSize) {
+    static setLru(map, key, value, maxSize) {
         if (!map) return;
         if (map.has(key)) {
             map.delete(key);
@@ -128,8 +131,8 @@ class GlobalCache {
     static getSymbol(symbolName) {
         var pid = this._getPid();
         if (!pid) return undefined;
-        var pidCache = this._getLru(this._symbolCache, pid);
-        return pidCache ? this._getLru(pidCache, symbolName) : undefined;
+        var pidCache = this.getLru(this._symbolCache, pid);
+        return pidCache ? this.getLru(pidCache, symbolName) : undefined;
     }
 
     static setSymbol(symbolName, address) {
@@ -137,14 +140,14 @@ class GlobalCache {
         if (!pid) return;
 
         var pidCache = this._ensurePidCache(this._symbolCache, pid);
-        this._setLru(pidCache, symbolName, address, MAX_CACHE_SIZE_PER_PID);
+        this.setLru(pidCache, symbolName, address, MAX_CACHE_SIZE_PER_PID);
     }
 
     static getSymbolName(address) {
         var pid = this._getPid();
         if (!pid) return undefined;
-        var pidCache = this._getLru(this._reverseSymbolCache, pid);
-        return pidCache ? this._getLru(pidCache, address) : undefined;
+        var pidCache = this.getLru(this._reverseSymbolCache, pid);
+        return pidCache ? this.getLru(pidCache, address) : undefined;
     }
 
     static setSymbolName(address, name) {
@@ -152,31 +155,77 @@ class GlobalCache {
         if (!pid) return;
 
         var pidCache = this._ensurePidCache(this._reverseSymbolCache, pid);
-        this._setLru(pidCache, address, name, MAX_CACHE_SIZE_PER_PID);
+        this.setLru(pidCache, address, name, MAX_CACHE_SIZE_PER_PID);
     }
 
     static getV8Cage() {
         var pid = this._getPid();
         if (!pid) return undefined;
-        return this._getLru(this._v8CageBaseCache, pid);
+        return this.getLru(this._v8CageBaseCache, pid);
     }
 
     static setV8Cage(address) {
         var pid = this._getPid();
         if (!pid) return;
-        this._setLru(this._v8CageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+        this.setLru(this._v8CageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
     }
 
     static getCppgcCage() {
         var pid = this._getPid();
         if (!pid) return undefined;
-        return this._getLru(this._cppgcCageBaseCache, pid);
+        return this.getLru(this._cppgcCageBaseCache, pid);
     }
 
     static setCppgcCage(address) {
         var pid = this._getPid();
         if (!pid) return;
-        this._setLru(this._cppgcCageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+        this.setLru(this._cppgcCageBaseCache, pid, address, MAX_PID_CACHE_SIZE);
+    }
+
+    // VTable Type Cache
+    static getVTableType(vtableAddr) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this.getLru(this._vtableTypeCache, pid);
+        return pidCache ? this.getLru(pidCache, vtableAddr) : undefined;
+    }
+
+    static setVTableType(vtableAddr, type) {
+        var pid = this._getPid();
+        if (!pid) return;
+        var pidCache = this._ensurePidCache(this._vtableTypeCache, pid);
+        this.setLru(pidCache, vtableAddr, type, MAX_CACHE_SIZE_PER_PID);
+    }
+
+    // Offset Cache
+    // key = className + "->" + memberName from helper functions
+    static getOffset(key) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this.getLru(this._offsetCache, pid);
+        return pidCache ? this.getLru(pidCache, key) : undefined;
+    }
+
+    static setOffset(key, offsetData) {
+        var pid = this._getPid();
+        if (!pid) return;
+        var pidCache = this._ensurePidCache(this._offsetCache, pid);
+        this.setLru(pidCache, key, offsetData, MAX_CACHE_SIZE_PER_PID);
+    }
+
+    // Return Type Cache
+    static getReturnType(symbolName) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this.getLru(this._returnTypeCache, pid);
+        return pidCache ? this.getLru(pidCache, symbolName) : undefined;
+    }
+
+    static setReturnType(symbolName, type) {
+        var pid = this._getPid();
+        if (!pid) return;
+        var pidCache = this._ensurePidCache(this._returnTypeCache, pid);
+        this.setLru(pidCache, symbolName, type, MAX_CACHE_SIZE_PER_PID);
     }
 
     static clearCurrent() {
@@ -189,6 +238,9 @@ class GlobalCache {
         this._reverseSymbolCache.delete(pid);
         this._v8CageBaseCache.delete(pid);
         this._cppgcCageBaseCache.delete(pid);
+        this._vtableTypeCache.delete(pid);
+        this._offsetCache.delete(pid);
+        this._returnTypeCache.delete(pid);
     }
 
     static clearAll() {
@@ -196,59 +248,9 @@ class GlobalCache {
         this._reverseSymbolCache.clear();
         this._v8CageBaseCache.clear();
         this._cppgcCageBaseCache.clear();
-    }
-}
-
-/// =============================================================================
-/// OFFSET CACHE (NOT per-PID - offsets are constant for a given Chrome build)
-/// =============================================================================
-
-class OffsetCache {
-    // Cache: "className->memberPath" -> { offset: BigInt, path: String }
-    static _cache = new Map();
-
-    static get(className, memberName) {
-        var key = className + "->" + memberName;
-        return this._cache.get(key);
-    }
-
-    static set(className, memberName, offset, path) {
-        var key = className + "->" + memberName;
-        this._cache.set(key, { offset: offset, path: path });
-    }
-
-    static has(className, memberName) {
-        var key = className + "->" + memberName;
-        return this._cache.has(key);
-    }
-
-    static clear() {
-        this._cache.clear();
-    }
-}
-
-/// =============================================================================
-/// TYPE CACHE (NOT per-PID - vtables are constant for a given Chrome build)
-/// =============================================================================
-
-class TypeCache {
-    // Cache: vtableAddr (string) -> type string (e.g. "(blink::Document*)")
-    static _cache = new Map();
-
-    static get(vtableAddr) {
-        return this._cache.get(vtableAddr);
-    }
-
-    static set(vtableAddr, type) {
-        this._cache.set(vtableAddr, type);
-    }
-
-    static has(vtableAddr) {
-        return this._cache.has(vtableAddr);
-    }
-
-    static clear() {
-        this._cache.clear();
+        this._vtableTypeCache.clear();
+        this._offsetCache.clear();
+        this._returnTypeCache.clear();
     }
 }
 
@@ -319,6 +321,8 @@ class Logger {
 class SymbolUtils {
     static getControl() { return host.namespace.Debugger.Utility.Control; }
 
+    static getControl() { return host.namespace.Debugger.Utility.Control; }
+
     /// Extract hex address from a line of debugger output (removes backticks)
     static extractAddress(line) {
         var match = line.toString().match(/^([0-9a-fA-F`]+)/);
@@ -373,7 +377,7 @@ class SymbolUtils {
         var isExact = pattern.indexOf("*") === -1 && pattern.indexOf("?") === -1;
 
         if (isExact) {
-            var cached = GlobalCache.getSymbol(pattern);
+            var cached = ProcessCache.getSymbol(pattern);
             if (cached) return cached;
         }
 
@@ -382,7 +386,7 @@ class SymbolUtils {
             for (var line of output) {
                 var addr = this.extractAddress(line);
                 if (addr) {
-                    if (isExact) GlobalCache.setSymbol(pattern, addr);
+                    if (isExact) ProcessCache.setSymbol(pattern, addr);
                     return addr;
                 }
             }
@@ -418,7 +422,7 @@ class SymbolUtils {
         var hexAddr = normalizeAddress(subsysAddr);
         if (!hexAddr) return null;
 
-        var cached = GlobalCache.getSymbolName(hexAddr);
+        var cached = ProcessCache.getSymbolName(hexAddr);
         if (cached) return cached;
 
         try {
@@ -437,7 +441,7 @@ class SymbolUtils {
                 var match = lineStr.match(/\)\s+([a-zA-Z0-9_!:.?@$]+)/);
                 if (match) {
                     if (debug) Logger.info("  [Debug] Matched symbol: " + match[1]);
-                    GlobalCache.setSymbolName(hexAddr, match[1]);
+                    ProcessCache.setSymbolName(hexAddr, match[1]);
                     return match[1];
                 }
             }
@@ -455,6 +459,11 @@ class SymbolUtils {
         }
         if (!symbolName || symbolName.startsWith("0x")) return null;
 
+        // Check cache
+        if (ProcessCache.getReturnType(symbolName)) {
+            return ProcessCache.getReturnType(symbolName);
+        }
+
         // 1. Try native host API (Using evaluateExpression which is more robust for ambiguous/inlined symbols)
         try {
             // Using &symbol ensures we get the function pointer type, which always has functionReturnType info
@@ -464,6 +473,8 @@ class SymbolUtils {
                 var typeName = typeObj.Name || typeObj.name;
                 if (typeName) {
                     Logger.info("    [Type Detection] Host API (Expression): " + typeName);
+                    Logger.info("    [Type Detection] Host API (Expression): " + typeName);
+                    ProcessCache.setReturnType(symbolName, typeName);
                     return typeName;
                 }
             }
@@ -480,6 +491,8 @@ class SymbolUtils {
                     var typeName = returnTypeObj.Name || returnTypeObj.name;
                     if (typeName) {
                         Logger.info("    [Type Detection] Host API (Symbol): " + typeName);
+                        Logger.info("    [Type Detection] Host API (Symbol): " + typeName);
+                        ProcessCache.setReturnType(symbolName, typeName);
                         return typeName;
                     }
                 }
@@ -500,6 +513,8 @@ class SymbolUtils {
                     var type = retMatch ? retMatch[1].trim() : sig;
                     type = type.replace(/^(class|struct)\s+/, "");
                     Logger.info("    [Type Detection] PDB Signature: " + type);
+                    type = type.replace(/^(class|struct)\s+/, "");
+                    ProcessCache.setReturnType(symbolName, type);
                     return type;
                 }
             }
@@ -525,8 +540,12 @@ class SymbolUtils {
                     if (sym && sym.Type && sym.Type.functionReturnType) {
                         var typeName = sym.Type.functionReturnType.Name || sym.Type.functionReturnType.name;
                         if (typeName) {
-                            Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
-                            return typeName;
+                            if (typeName) {
+                                Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
+                                Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
+                                ProcessCache.setReturnType(symbolName, typeName);
+                                return typeName;
+                            }
                         }
                     }
                 } catch (symErr) { }
@@ -587,20 +606,20 @@ class MemoryUtils {
     }
 
     static getV8CageBase() {
-        var cached = GlobalCache.getV8Cage();
+        var cached = ProcessCache.getV8Cage();
         if (cached) return cached;
 
         var val = this.readGlobalPointer("chrome!v8::internal::MainCage::base_");
-        if (val) GlobalCache.setV8Cage(val);
+        if (val) ProcessCache.setV8Cage(val);
         return val;
     }
 
     static getCppgcCageBase() {
-        var cached = GlobalCache.getCppgcCage();
+        var cached = ProcessCache.getCppgcCage();
         if (cached) return cached;
 
         var val = this.readGlobalPointer("chrome!cppgc::internal::CageBaseGlobal::g_base_");
-        if (val) GlobalCache.setCppgcCage(val);
+        if (val) ProcessCache.setCppgcCage(val);
         return val;
     }
 
@@ -757,17 +776,35 @@ class MemoryUtils {
         // Data likely at +12 or +16.
         // dx &characters... is best.
         var dataAddr = null;
+        var charType = is8Bit ? "characters8" : "characters16";
 
-        // Try dx
-        try {
-            var charType = is8Bit ? "characters8" : "characters16";
-            var cmd = "dx &((WTF::StringImpl*)" + hexAddr + ")->" + charType + "()[0]";
-            var out = ctl.ExecuteCommand(cmd);
-            for (var line of out) {
-                var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
-                if (m) dataAddr = m[1];
-            }
-        } catch (e) { Logger.debug("writeStringImpl dx characters failed: " + e.message); }
+        // 1. Try Offset Cache
+        var cachedOffset = ProcessCache.getOffset("WTF::StringImpl->" + charType);
+        if (cachedOffset) {
+            var baseInt = BigInt(hexAddr);
+            dataAddr = (baseInt + BigInt(cachedOffset.offset)).toString(16);
+        }
+
+        // 2. Try dx
+        if (!dataAddr) {
+            try {
+                var cmd = "dx &((WTF::StringImpl*)" + hexAddr + ")->" + charType + "()[0]";
+                var out = ctl.ExecuteCommand(cmd);
+                for (var line of out) {
+                    var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
+                    if (m) {
+                        dataAddr = m[1];
+                        // Cache it
+                        var baseInt = BigInt(hexAddr);
+                        var addrBig = BigInt(dataAddr);
+                        var offset = addrBig - baseInt;
+                        if (offset >= 0n && offset < 100n) { // Header size is small
+                            ProcessCache.setOffset("WTF::StringImpl->" + charType, { offset: offset.toString(), path: charType });
+                        }
+                    }
+                }
+            } catch (e) { Logger.debug("writeStringImpl dx characters failed: " + e.message); }
+        }
 
         // Fallback: Assume offset 12 (packed) or 16 (aligned)
         if (!dataAddr) {
@@ -1063,7 +1100,10 @@ function extractPointeeType(typeStr) {
     // e.g., "SomeWrapper<blink::StyleFoo>" -> "(blink::StyleFoo*)"
     match = typeStr.match(/^[a-zA-Z_][a-zA-Z0-9_:]*\s*<\s*([a-zA-Z_][a-zA-Z0-9_:]+)\s*>$/);
     if (match) {
-        return "(" + match[1].trim() + "*)";
+        var res = "(" + match[1].trim() + "*)";
+        // Cache this result if we can allow it (helper function doesn't have access to cache easily without passing it)
+        // But extractPointeeType is a helper, not a class method with state.
+        return res;
     }
 
     return null;
@@ -1075,17 +1115,50 @@ function extractPointeeType(typeStr) {
 /// @param memberName - Member name to read
 /// @returns Compressed pointer value or null
 function getCompressedMember(baseAddr, typeCast, memberName) {
+    var baseBig = MemoryUtils.parseBigInt(baseAddr);
+    if (baseBig === 0n) return null;
+
+    // 1. Try Offset Cache
+    var className = null;
+    var match = typeCast.match(/\((?:const\s+)?([a-zA-Z0-9_:]+)(?:\s*\*|\*)\)/);
+    if (match) className = match[1];
+
+    if (className) {
+        var cached = ProcessCache.getOffset(className + "->" + memberName);
+        if (cached) {
+            var memberAddr = baseBig + BigInt(cached.offset);
+            try {
+                // Read 32-bit compressed pointer value
+                return host.memory.readMemoryValues(host.parseInt64(memberAddr.toString(16), 16), 1, 4)[0];
+            } catch (e) {
+                // Fallback to dx if direct read fails
+            }
+        }
+    }
+
+    // 2. Fallback to dx command
     try {
         var ctl = SymbolUtils.getControl();
-        var cmd = "dx &(" + typeCast + baseAddr + ")->" + memberName;
+        var cmd = "dx &(" + typeCast + "0x" + baseBig.toString(16) + ")->" + memberName;
         var out = ctl.ExecuteCommand(cmd);
         for (var line of out) {
             var l = line.toString();
             var m = l.match(/:\s*(0x[0-9a-fA-F`]+)/);
             if (m) {
-                var addr = m[1].replace(/`/g, "");
+                var addrStr = m[1].replace(/`/g, "");
+                var addrBig = MemoryUtils.parseBigInt(addrStr);
+
+                // Cache the offset
+                if (className) {
+                    var calcedOffset = addrBig - baseBig;
+                    // Sanity check: Offset should be positive and reasonable
+                    if (calcedOffset >= 0n && calcedOffset < 0x10000n) {
+                        ProcessCache.setOffset(className + "->" + memberName, { offset: calcedOffset.toString(), path: memberName });
+                    }
+                }
+
                 try {
-                    var ptrVal = host.memory.readMemoryValues(host.parseInt64(addr, 16), 1, 4)[0];
+                    var ptrVal = host.memory.readMemoryValues(host.parseInt64(addrStr, 16), 1, 4)[0];
                     return ptrVal;
                 } catch (e) { Logger.error("ReadMem failed: " + e.message); }
             }
@@ -1583,9 +1656,9 @@ class BlinkUnwrap {
             if (vtablePtr.compareTo(0) !== 0) {
                 var vtableHex = vtablePtr.toString(16);
 
-                // Check TypeCache first
-                if (TypeCache.has(vtableHex)) {
-                    var cached = TypeCache.get(vtableHex);
+                // Check ProcessCache (VTable) first
+                if (ProcessCache.getVTableType(vtableHex)) {
+                    var cached = ProcessCache.getVTableType(vtableHex);
                     if (debug) Logger.info("  [Debug] Type Cache Hit: " + cached);
                     return cached;
                 }
@@ -1630,7 +1703,7 @@ class BlinkUnwrap {
 
                     // Cache and return result
                     if (resultType) {
-                        TypeCache.set(vtableHex, resultType);
+                        ProcessCache.setVTableType(vtableHex, resultType);
                         return resultType;
                     }
                 }
@@ -1682,6 +1755,20 @@ class BlinkUnwrap {
     static getMemberPointer(objectAddr, typeCast, memberPath) {
         var objHex = normalizeAddress(objectAddr);
         if (!objHex) return null;
+        var baseBig = MemoryUtils.parseBigInt(objHex);
+
+        // 1. Try Offset Cache
+        var className = null;
+        var match = typeCast.match(/\((?:const\s+)?([a-zA-Z0-9_:]+)(?:\s*\*|\*)\)/);
+        if (match) className = match[1];
+
+        if (className) {
+            var cached = ProcessCache.getOffset(className + "->" + memberPath);
+            if (cached) {
+                var memberAddr = baseBig + BigInt(cached.offset);
+                return "0x" + memberAddr.toString(16);
+            }
+        }
 
         var ctl = SymbolUtils.getControl();
         try {
@@ -1695,6 +1782,16 @@ class BlinkUnwrap {
                 var match = lineStr.match(/:\s+(0x[0-9a-fA-F`]+)/);
                 if (match) {
                     var addr = match[1].replace(/`/g, "");
+                    var addrBig = MemoryUtils.parseBigInt(addr);
+
+                    // Cache the offset
+                    if (className) {
+                        var calcedOffset = addrBig - baseBig;
+                        // Sanity check: Offset should be positive and reasonable
+                        if (calcedOffset >= 0n && calcedOffset < 0x10000n) {
+                            ProcessCache.setOffset(className + "->" + memberPath, { offset: calcedOffset.toString(), path: memberPath });
+                        }
+                    }
 
                     // Check if this is a compressed pointer (high bits are 0)
                     if (addr.length <= 10) { // Compressed (32-bit)
@@ -2769,12 +2866,12 @@ function frame_attrs(objectAddr, debug, typeHint) {
     // 3. List C++ members with multi-type fallback
     Logger.info("[C++ Members]");
 
-    // Update TypeCache if hint provided
+    // Update ProcessCache if hint provided
     if (typeHintStr) {
         try {
             var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
             if (vtablePtr.compareTo(0) !== 0) {
-                TypeCache.set(vtablePtr.toString(16), typeHintStr);
+                ProcessCache.setVTableType(vtablePtr.toString(16), typeHintStr);
             }
         } catch (e) { }
     }
@@ -3724,9 +3821,9 @@ class Exec {
         var memberOffset = null;
         var foundPath = null;
 
-        // Check cache first (using global OffsetCache)
-        if (OffsetCache.has(className, memberName)) {
-            var cached = OffsetCache.get(className, memberName);
+        // Check cache first (using ProcessCache)
+        if (ProcessCache.getOffset(className + "->" + memberName)) {
+            var cached = ProcessCache.getOffset(className + "->" + memberName);
             Logger.info("    [Cache Hit] " + className + "->" + memberName + " offset=0x" + cached.offset.toString(16));
             return this._readMember(thisPtr, cached.offset);
         }
@@ -3792,8 +3889,8 @@ class Exec {
             return null;
         }
 
-        // Cache the result (using global OffsetCache)
-        OffsetCache.set(className, memberName, memberOffset, foundPath);
+        // Cache the result (using ProcessCache)
+        ProcessCache.setOffset(className + "->" + memberName, { offset: memberOffset, path: foundPath });
 
         Logger.info("    Member offset: 0x" + memberOffset.toString(16));
 
@@ -3860,12 +3957,10 @@ class Exec {
         var ctl = SymbolUtils.getControl();
 
         // Check cache first (method address or offset)
-        if (OffsetCache.has(className, methodName)) {
-            var cached = OffsetCache.get(className, methodName);
-            if (cached.offset !== undefined && cached.offset !== null) {
-                Logger.info("    [Cache Hit] Offset = 0x" + cached.offset.toString(16));
-                return this._readMember(thisPtr, cached.offset);
-            }
+        var cached = ProcessCache.getOffset(className + "->" + methodName);
+        if (cached && cached.offset !== undefined && cached.offset !== null) {
+            Logger.info("    [Cache Hit] Offset = 0x" + cached.offset.toString(16));
+            return this._readMember(thisPtr, cached.offset);
         }
 
         // Use x /v to find function info from PDB
@@ -4097,7 +4192,7 @@ class Exec {
     /// Helper: Read a member variable directly using dx
     static _readMemberDirect(thisPtr, className, memberName) {
         // 1. Check Offset Cache for fast path
-        var cached = OffsetCache.get(className, memberName);
+        var cached = ProcessCache.getOffset(className + "->" + memberName);
         if (cached) {
             Logger.info("    [Cache] Reading member at offset 0x" + cached.offset.toString(16));
             return this._readMember(thisPtr, cached.offset);
@@ -4122,7 +4217,7 @@ class Exec {
                     for (var line of offsetOut) {
                         var m = line.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
                         if (m) {
-                            OffsetCache.set(className, memberName, BigInt(m[1]), "cached");
+                            ProcessCache.setOffset(className + "->" + memberName, { offset: BigInt(m[1]), path: "cached" });
                             Logger.info("    [Cache] Stored offset 0x" + m[1] + " for " + memberName);
                             break;
                         }
@@ -5127,7 +5222,7 @@ function uninitializeScript() {
     g_exitHandlerRegistered = false;
 
     // Invalidate cached memory addresses
-    GlobalCache.clearAll();
+    ProcessCache.clearAll();
 }
 
 /// Initialize the Chrome debugging environment
@@ -5237,7 +5332,7 @@ function help() {
 }
 
 function cache_clear() {
-    GlobalCache.clearAll();
+    ProcessCache.clearAll();
     Logger.info("Global security script cache cleared.");
     return "";
 }
@@ -6300,7 +6395,7 @@ function on_process_exit() {
         }
 
         // Cache Cleanup: Remove broken/stale cache entries for this PID to prevent PID reuse issues
-        GlobalCache.clearPid(currentPid);
+        ProcessCache.clearPid(currentPid);
 
     } catch (e) {
         // Suppress errors in exit handler to avoid spam
