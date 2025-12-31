@@ -82,6 +82,8 @@ class ProcessCache {
     static _vtableTypeCache = new Map(); // Map<PID, Map<VTableAddr, TypeName>>
     static _offsetCache = new Map(); // Map<PID, Map<ClassMember, Offset>>
     static _returnTypeCache = new Map(); // Map<PID, Map<Symbol, TypeName>>
+    static _patternCache = new Map(); // Map<PID, Map<Pattern, Array<{addr, name}>>>
+    static _verboseSymbolCache = new Map(); // Map<PID, Map<Pattern, Array<SymbolInfo>>>
 
     static _getPid() {
         try {
@@ -228,6 +230,36 @@ class ProcessCache {
         this.setLru(pidCache, symbolName, type, MAX_CACHE_SIZE_PER_PID);
     }
 
+    // Pattern Cache (Wildcards)
+    static getPattern(pattern) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this.getLru(this._patternCache, pid);
+        return pidCache ? this.getLru(pidCache, pattern) : undefined;
+    }
+
+    static setPattern(pattern, list) {
+        var pid = this._getPid();
+        if (!pid) return;
+        var pidCache = this._ensurePidCache(this._patternCache, pid);
+        this.setLru(pidCache, pattern, list, MAX_CACHE_SIZE_PER_PID);
+    }
+
+    // Verbose Symbol Cache (x /v output)
+    static getVerboseSymbols(pattern) {
+        var pid = this._getPid();
+        if (!pid) return undefined;
+        var pidCache = this.getLru(this._verboseSymbolCache, pid);
+        return pidCache ? this.getLru(pidCache, pattern) : undefined;
+    }
+
+    static setVerboseSymbols(pattern, list) {
+        var pid = this._getPid();
+        if (!pid) return;
+        var pidCache = this._ensurePidCache(this._verboseSymbolCache, pid);
+        this.setLru(pidCache, pattern, list, MAX_CACHE_SIZE_PER_PID);
+    }
+
     static clearCurrent() {
         var pid = this._getPid();
         if (pid) this.clearPid(pid);
@@ -241,6 +273,8 @@ class ProcessCache {
         this._vtableTypeCache.delete(pid);
         this._offsetCache.delete(pid);
         this._returnTypeCache.delete(pid);
+        this._patternCache.delete(pid);
+        this._verboseSymbolCache.delete(pid);
     }
 
     static clearAll() {
@@ -248,6 +282,8 @@ class ProcessCache {
         this._reverseSymbolCache.clear();
         this._v8CageBaseCache.clear();
         this._cppgcCageBaseCache.clear();
+        this._patternCache.clear();
+        this._verboseSymbolCache.clear();
         this._vtableTypeCache.clear();
         this._offsetCache.clear();
         this._returnTypeCache.clear();
@@ -327,68 +363,86 @@ class SymbolUtils {
         return match ? match[1].replace(/`/g, "") : null;
     }
 
-    static getSymbolInfo(pattern) {
+    static getVerboseSymbols(pattern) {
+        var cached = ProcessCache.getVerboseSymbols(pattern);
+        if (cached) return cached;
+
+        var results = [];
         try {
             var output = this.getControl().ExecuteCommand("x /v " + pattern);
             for (var line of output) {
                 var lineStr = line.toString();
 
-                // Check if inlined
-                if (lineStr.indexOf("prv inline") !== -1) {
-                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+chrome!/);
+                var type = null;
+                if (lineStr.indexOf("prv inline") !== -1) type = "inline";
+                else if (lineStr.indexOf("prv func") !== -1) type = "func";
+
+                if (type) {
+                    // Match: ADDR SIZE ... chrome!NAME
+                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+.*chrome!(.+)/);
                     if (match) {
-                        return {
-                            type: 'inline',
+                        results.push({
+                            type: type,
                             address: "0x" + match[1].replace(/`/g, ""),
                             size: parseInt(match[2], 10),
+                            name: "chrome!" + match[3].trim(),
                             line: lineStr
-                        };
-                    }
-                }
-
-                // Check if normal function
-                if (lineStr.indexOf("prv func") !== -1) {
-                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+\d+\s+chrome!/);
-                    if (match) {
-                        return {
-                            type: 'func',
-                            address: "0x" + match[1].replace(/`/g, ""),
-                            size: 0,
-                            line: lineStr
-                        };
+                        });
                     }
                 }
             }
-        } catch (e) { Logger.debug("getSymbolInfo failed: " + e.message); }
+        } catch (e) { Logger.debug("getVerboseSymbols failed: " + e.message); }
 
-        // Fallback: Try simple findSymbolAddress if x /v failed to parse but symbol exists
-        var simpleAddr = this.findSymbolAddress(pattern);
-        if (simpleAddr) {
-            return { type: 'unknown', address: simpleAddr, size: 0 };
-        }
+        ProcessCache.setVerboseSymbols(pattern, results);
+        return results;
+    }
 
-        return null;
+    static getSymbolInfo(pattern) {
+        var results = this.getVerboseSymbols(pattern);
+        return (results && results.length > 0) ? results[0] : null;
+    }
+
+    static findSymbols(pattern) {
+        // Check cache first
+        var cached = ProcessCache.getPattern(pattern);
+        if (cached) return cached;
+
+        var results = [];
+        try {
+            var output = this.getControl().ExecuteCommand("x " + pattern);
+            for (var line of output) {
+                var lineStr = line.toString();
+                // Extract BOTH the address and symbol name
+                // Matches: 00007ffc`12345678 module!Symbol
+                var match = lineStr.match(/^([0-9a-fA-F`]+)\s+(.+)/);
+                if (match) {
+                    var addr = match[1].replace(/`/g, "");
+                    var symName = match[2].trim();
+                    results.push({ addr: addr, name: symName });
+                }
+            }
+        } catch (e) { Logger.debug("findSymbols failed: " + e.message); }
+
+        // Cache result (even if empty, to avoid re-searching)
+        ProcessCache.setPattern(pattern, results);
+        return results;
     }
 
     static findSymbolAddress(pattern) {
-        // Only cache exact symbol matches, not patterns with wildcards
+        // For exact match, try legacy cache first (optimized for single address)
         var isExact = pattern.indexOf("*") === -1 && pattern.indexOf("?") === -1;
-
         if (isExact) {
             var cached = ProcessCache.getSymbol(pattern);
             if (cached) return cached;
         }
 
-        try {
-            var output = this.getControl().ExecuteCommand("x " + pattern);
-            for (var line of output) {
-                var addr = this.extractAddress(line);
-                if (addr) {
-                    if (isExact) ProcessCache.setSymbol(pattern, addr);
-                    return addr;
-                }
-            }
-        } catch (e) { Logger.debug("findSymbolAddress failed: " + e.message); }
+        // Use generic finder
+        var symbols = this.findSymbols(pattern);
+        if (symbols.length > 0) {
+            var addr = symbols[0].addr;
+            if (isExact) ProcessCache.setSymbol(pattern, addr);
+            return addr;
+        }
         return null;
     }
 
@@ -3982,37 +4036,31 @@ class Exec {
 
             try {
                 Logger.info("    [PDB] x /v " + pattern);
-                var output = ctl.ExecuteCommand("x /v " + pattern);
+                var symbols = SymbolUtils.getVerboseSymbols(pattern);
 
-                for (var line of output) {
-                    var lineStr = line.toString();
-
-                    // Look for non-inlined function (prv func) - only for exact matches
-                    if (isExactMatch && lineStr.indexOf("prv func") !== -1) {
-                        var match = lineStr.match(/([0-9a-fA-F`]+)\s+\d+\s+chrome!/);
-                        if (match) {
-                            exactFuncAddr = "0x" + match[1].replace(/`/g, "");
+                if (symbols) {
+                    for (var sym of symbols) {
+                        // Look for non-inlined function (prv func) - only for exact matches
+                        if (isExactMatch && sym.type === "func") {
+                            exactFuncAddr = sym.address;
                             Logger.info("    [PDB] Found exact non-inlined: " + exactFuncAddr);
                         }
-                    }
 
-                    // Look for inlined function (prv inline) - Collect ALL candidates
-                    // Must verify the symbol name contains ::methodName
-                    // Format: prv inline ADDR SIZE chrome!Namespace::Class::Method = (inline caller) ...
-                    if (lineStr.indexOf("prv inline") !== -1 &&
-                        lineStr.indexOf("::" + methodName) !== -1) {
-                        // Match: address, size, then chrome!FullClassName::Method
-                        // FullClassName can be "blink::Document" or "blink::WebDocument" etc.
-                        // We capture everything between "chrome!" and "::MethodName"
-                        var methodPattern = new RegExp("([0-9a-fA-F`]+)\\s+(\\d+)\\s+chrome!(.+)::" + methodName + "\\b");
-                        var match = lineStr.match(methodPattern);
-                        if (match) {
-                            inlineCandidates.push({
-                                addr: "0x" + match[1].replace(/`/g, ""),
-                                size: parseInt(match[2], 10),
-                                foundClass: match[3],  // Full class name e.g. "blink::Document"
-                                foundMethod: methodName
-                            });
+                        // Look for inlined function (prv inline)
+                        if (sym.type === "inline" && sym.name.indexOf("::" + methodName) !== -1) {
+                            // extract class name from sym.name (chrome!ClassName::MethodName)
+                            // remove "chrome!" and "::MethodName"
+                            var cleanName = sym.name.replace(/^chrome!/, "");
+                            var methodIdx = cleanName.lastIndexOf("::" + methodName);
+                            if (methodIdx !== -1) {
+                                var foundClass = cleanName.substring(0, methodIdx);
+                                inlineCandidates.push({
+                                    addr: sym.address,
+                                    size: sym.size,
+                                    foundClass: foundClass,
+                                    foundMethod: methodName
+                                });
+                            }
                         }
                     }
                 }
@@ -6174,15 +6222,7 @@ function patch_function(funcName, returnValue) {
 
         // If it contains '!' it's already a full symbol - resolve its address
         if (funcName.indexOf("!") !== -1) {
-            try {
-                var xOut = ctl.ExecuteCommand("x " + funcName);
-                for (var xLine of xOut) {
-                    var match = xLine.toString().match(/^([0-9a-fA-F`]+)\s+(.+)/);
-                    if (match) {
-                        symbols.push({ addr: match[1].replace(/`/g, ""), name: match[2].trim() });
-                    }
-                }
-            } catch (e) { }
+            symbols = SymbolUtils.findSymbols(funcName);
         } else {
             // Search for matching symbols
             Logger.info("  Searching for: *" + funcName + "*");
@@ -6195,26 +6235,15 @@ function patch_function(funcName, returnValue) {
             ];
 
             for (var pattern of patterns) {
-                try {
-                    var output = ctl.ExecuteCommand("x " + pattern);
-                    for (var line of output) {
-                        var lineStr = line.toString();
-                        // Extract BOTH the address and symbol name
-                        var match = lineStr.match(/^([0-9a-fA-F`]+)\s+(.+)/);
-                        if (match) {
-                            var addr = match[1].replace(/`/g, "");
-                            var symName = match[2].trim();
-                            // Store as object with address and name
-                            var exists = false;
-                            for (var s of symbols) {
-                                if (s.addr === addr) { exists = true; break; }
-                            }
-                            if (!exists) {
-                                symbols.push({ addr: addr, name: symName });
-                            }
-                        }
+                var found = SymbolUtils.findSymbols(pattern);
+                for (var f of found) {
+                    // Avoid duplicates
+                    var exists = false;
+                    for (var s of symbols) {
+                        if (s.addr === f.addr) { exists = true; break; }
                     }
-                } catch (e) { }
+                    if (!exists) symbols.push(f);
+                }
             }
         }
 
@@ -6298,24 +6327,17 @@ function patch_function(funcName, returnValue) {
 
             var callers = [];
             for (var callerPattern of callerPatterns) {
-                try {
-                    var callerOutput = ctl.ExecuteCommand("x " + callerPattern);
-                    for (var callerLine of callerOutput) {
-                        var callerMatch = callerLine.toString().match(/^([0-9a-fA-F`]+)\s+(.+)/);
-                        if (callerMatch) {
-                            var callerAddr = callerMatch[1].replace(/`/g, "");
-                            var callerName = callerMatch[2].trim();
-                            // Check if this caller is different from what we patched
-                            var isDifferent = true;
-                            for (var patched of symbols) {
-                                if (patched.addr === callerAddr) { isDifferent = false; break; }
-                            }
-                            if (isDifferent) {
-                                callers.push({ addr: callerAddr, name: callerName });
-                            }
-                        }
+                var foundCallers = SymbolUtils.findSymbols(callerPattern);
+                for (var caller of foundCallers) {
+                    // Check if this caller is different from what we patched
+                    var isDifferent = true;
+                    for (var patched of symbols) {
+                        if (patched.addr === caller.addr) { isDifferent = false; break; }
                     }
-                } catch (e) { }
+                    if (isDifferent) {
+                        callers.push(caller);
+                    }
+                }
             }
 
             if (callers.length > 0) {
@@ -6831,12 +6853,12 @@ function _hasChromeModule() {
 /// Helper: Find g_frame_map LazyInstance address
 function _findFrameMapAddress(ctl) {
     try {
-        var xOutput = ctl.ExecuteCommand("x chrome!*g_frame_map*");
-        for (var line of xOutput) {
-            var lineStr = line.toString();
-            Logger.info("    > " + lineStr);
-            var addr = SymbolUtils.extractAddress(line);
-            if (addr) return addr;
+        var pattern = "chrome!*g_frame_map*";
+        // SymbolUtils.findSymbolAddress now handles wildcard caching internally
+        var addr = SymbolUtils.findSymbolAddress(pattern);
+        if (addr) {
+            Logger.info("    > Found symbol at: " + addr);
+            return addr;
         }
     } catch (xErr) {
         Logger.error("Symbol lookup failed: " + (xErr.message || xErr));
