@@ -1,11 +1,11 @@
 # Chromium Security Research WinDbg Toolkit
 
 An experimental WinDbg debugging toolkit for Chromium security researchers  
-Inspired by <https://github.com/shhnjk/spoof.js>
+Inspired by [spoof.js](https://github.com/shhnjk/spoof.js)
 
 ## Quick Start
-- Install Chrome Canary <https://www.google.com/chrome/canary/>
-- Install WinDbg from MS Store <https://apps.microsoft.com/detail/9pgjgd53tn86>
+- Install [Chrome Canary](https://www.google.com/chrome/canary/)
+- Install [WinDbg from MS Store](https://apps.microsoft.com/detail/9pgjgd53tn86)
 - Download repository and run `debug_chrome.bat`
 - When it says BUSY you need to click Break to use the command line
 
@@ -20,7 +20,7 @@ Then in WinDbg: `!chelp`
 | `!procs` | List all Chrome processes with types & sites |
 | `!proc` | Show current process type (+ site if renderer) |
 | `!cmdline` | Show command line switches |
-| `!frames` | List all frames (Local/Remote) with URLs, IDs, and addresses for LocalFrame |
+| `!frames` | List all frames (Local/Remote) with URLs, IDs, and addresses |
 
 ### Sandbox & Security
 | Command | Description |
@@ -62,8 +62,8 @@ Then in WinDbg: `!chelp`
 | `!frame_origin(idx)` | Get SecurityOrigin for frame at index |
 | `!frame_elem(idx,"tag")` | List elements by tag name in frame |
 | `!frame_getattr(el,"attr")` | Get attribute value (decodes `WTF::String`, `KURL`) |
-| `!frame_setattr(el,"attr","val")` | Set attribute value (supports `AtomicString`, `KURL`) |
-| `!frame_attrs(el)` | List attributes, method signatures, and direct string preview |
+| `!frame_setattr(el,"attr","val")` | Set attribute value ⚠️ **Memory mutation warning** |
+| `!frame_attrs(el)` | List attributes with direct string preview |
 
 ### V8 Exploitation Hooks
 | Command | Description |
@@ -89,8 +89,8 @@ Then in WinDbg: `!chelp`
 ### Origin Spoofing & Function Patching
 | Command | Description |
 |---------|-------------|
-| `!spoof("url")` | Spoof renderer origin (memory patch). Supports subdomains/paths. |
-| `!patch("Func","val")` | Patch function return value. Supports booleans, hex, numbers, AND strings (allocates memory). |
+| `!spoof("url")` | Spoof renderer origin (memory patch) |
+| `!patch("Func","val")` | Patch function return value (supports strings) |
 
 ### Cross-Process Execution
 | Command | Description |
@@ -100,40 +100,30 @@ Then in WinDbg: `!chelp`
 | `!run_gpu("cmd")` | Run command in GPU process |
 | `!script_renderer("path")` | Load script in all renderers |
 | `!on_attach("cmd")` | Auto-run command when renderers attach |
-| `!script_attach("path")` | Auto-load script when renderers attach |
 
 ### C++ Execution / REPL
 | Command | Description |
 |---------|-------------|
-| `!exec("Func")` | Execute a C++ function chain with arguments (shellcode injection) |
+| `!exec("expr")` | Execute C++ function chains with shellcode injection |
 
-#### Usage & Features
-- **Integrated String Decoding**: `!exec` and `!frame_attrs` automatically decode `WTF::String`, `AtomicString`, and `KURL` types.
-- **Dual-Engine Type Detection**: 
-    - **Static Engine**: Queries PDBs for exact function signatures (100% accuracy for complex/inlined returns).
-    - **Dynamic Engine**: Scans memory for vtables to resolve polymorphic types (e.g. `Node*` -> `HTMLDivElement*`).
-- **Chaining**: Use `->` to chain calls. Supports complex paths even with inlined methods.
-- **Return Types**: Automatically handles integers, **floats/doubles** (e.g. `LayoutZoomFactor`), booleans, and compressed pointers.
-- **Type Inference**: Automatically infers return types for getters to enable deep object inspection.
-- **Example Chained Call:** `!exec "frame->GetDocument()->Url()"`
+#### Features
+- **Method Chaining**: Chain calls with `->` syntax
+- **Automatic String Decoding**: Decodes `WTF::String`, `AtomicString`, `KURL` 
+- **Type Detection**: PDB-based (inlined functions) + vtable-based (polymorphic types)
+- **Return Types**: Handles integers, floats/doubles, booleans, compressed pointers
 
-### Argument Support for Inlined Functions
-- **Feature**: Passing multiple arguments (ints, strings, bools) now works for BOTH standard and inlined functions.
-- **Implementation**: `_executeInlinedCode` correctly maps arguments to standard x64 registers (`RDX`, `R8`, `R9`) and handles arbitrary string allocation.
-- **Verification**: Verified that setters and property methods with multiple arguments execute correctly in inlined context.
-- **Decompression**: Automatically decompresses V8/Oilpan pointers in results.
-
-**Example Chained Call:**
+#### Examples
 ```text
-!exec "blink::ExecutionContext::GetSecurityContext()->blink::SecurityContext::GetSecurityOrigin()"
+!exec "blink::Document::Url()"
+!exec "blink::Document::Url()->GetString()"
+!exec "blink::LocalFrame::DomWindow()->document()"
 ```
-*Returns the SecurityOrigin object, automatically handling inlined methods and pointer decompression.*
 
 ## Files
 
 ```
-ChromeHelper/
+chromiumdebug/
 ├── debug_chrome.bat          # Launcher (auto-cleans old sessions)
-├── chromium_security.js      # Main WinDbg script (includes all hooks)
+├── chromium_security.js      # Main WinDbg script
 └── init.txt                  # WinDbg init commands
 ```

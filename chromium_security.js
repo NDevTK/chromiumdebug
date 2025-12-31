@@ -503,6 +503,34 @@ class SymbolUtils {
             }
         } catch (e) { }
 
+        // 4. Inlined function fallback: query symbol via host JavaScript API
+        try {
+            var cleanSym = symbolName.includes("!") ? symbolName.split("!")[1] : symbolName;
+
+            // Try accessing the symbol through host API
+            var chromeModule = null;
+            for (var mod of host.currentProcess.Modules) {
+                var modName = mod.Name.toLowerCase();
+                if (modName === "chrome.dll" || modName === "chrome.exe") {
+                    chromeModule = mod;
+                    break;
+                }
+            }
+
+            if (chromeModule && chromeModule.Contents && chromeModule.Contents.Symbols) {
+                try {
+                    var sym = chromeModule.Contents.Symbols.getValueAt(cleanSym);
+                    if (sym && sym.Type && sym.Type.functionReturnType) {
+                        var typeName = sym.Type.functionReturnType.Name || sym.Type.functionReturnType.name;
+                        if (typeName) {
+                            Logger.info("    [Type Detection] Host Symbol Type: " + typeName);
+                            return typeName;
+                        }
+                    }
+                } catch (symErr) { }
+            }
+        } catch (e) { }
+
         return null;
     }
 }
@@ -2212,43 +2240,66 @@ class BlinkUnwrap {
         return result;
     }
 
-    /// Robustly read a WTF::String or AtomicString from a pointer
+    /// Robustly read a WTF::String, AtomicString, KURL, or StringImpl from a pointer
     static readString(addr) {
         if (!isValidPointer(addr)) return null;
         var hexAddr = normalizeAddress(addr);
         var ctl = SymbolUtils.getControl();
 
-        // 1. Try dx approach first (most reliable if symbols are loaded)
+        // 1. Try as WTF::String object (contains impl_ pointer to StringImpl)
         try {
-            // WTF::String is usually just a pointer to StringImpl
-            // AtomicString is also a pointer to StringImpl (or contains one)
-            var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + hexAddr + ")");
+            var output = ctl.ExecuteCommand("dx ((WTF::String*)" + hexAddr + ")");
             var str = BlinkUnwrap._parseStringFromDxOutput(output);
-            if (str !== null) return str;
-
-            // Try casting as WTF::String in case it's the object wrapper
-            output = ctl.ExecuteCommand("dx ((WTF::String*)" + hexAddr + ")");
-            str = BlinkUnwrap._parseStringFromDxOutput(output);
             if (str !== null) return str;
         } catch (e) { }
 
-        // 2. Manual memory read fallback (works without full symbols)
+        // 2. Try as direct StringImpl* (the address is the StringImpl itself)
+        try {
+            var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + hexAddr + ")");
+            var str = BlinkUnwrap._parseStringFromDxOutput(output);
+            if (str !== null) return str;
+        } catch (e) { }
+
+        // 3. Try as KURL (contains string_ member)
+        try {
+            var output = ctl.ExecuteCommand("dx ((blink::KURL*)" + hexAddr + ")->string_");
+            var str = BlinkUnwrap._parseStringFromDxOutput(output);
+            if (str !== null) return str;
+        } catch (e) { }
+
+        // 4. For WTF::String, first read the impl_ pointer, then read the StringImpl
+        try {
+            // WTF::String has impl_ at offset 0 (usually a raw pointer to StringImpl)
+            var implPtr = host.memory.readMemoryValues(host.parseInt64(hexAddr, 16), 1, 8)[0];
+            var implAddrBig = MemoryUtils.parseBigInt(implPtr);
+            if (implAddrBig !== 0n && isValidUserModePointer(implAddrBig)) {
+                var implAddr = "0x" + implAddrBig.toString(16);
+                // Try dx on the dereferenced StringImpl
+                var output = ctl.ExecuteCommand("dx ((WTF::StringImpl*)" + implAddr + ")");
+                var str = BlinkUnwrap._parseStringFromDxOutput(output);
+                if (str !== null) return str;
+            }
+        } catch (e) { }
+
+        // 5. Manual memory read fallback for StringImpl (works without full symbols)
         try {
             // StringImpl layout: RefCount(4), Length(4), Hash/Flags(4), Data...
             // Read Length (offset 4) and Hash/Flags (offset 8)
-            var header = host.memory.readMemoryValues(host.parseInt64(hexAddr, 16) + 4, 2, 4);
+            var addrClean = hexAddr.replace(/^0x/i, "");
+            var baseAddr = host.parseInt64(addrClean, 16);
+            var header = host.memory.readMemoryValues(baseAddr.add(4), 2, 4);
             var length = header[0];
             var flags = header[1];
 
             if (length > 0 && length < 20000) {
                 // Bit 0 of flags often indicates is_8bit
                 var is8Bit = (flags & 1) === 1;
-                var dataAddr = BigInt(hexAddr) + BigInt(STRINGIMPL_DATA_OFFSET);
+                var dataAddr = baseAddr.add(STRINGIMPL_DATA_OFFSET);
 
                 if (is8Bit) {
-                    return host.memory.readString(dataAddr.toString(16), length);
+                    return host.memory.readString(dataAddr, length);
                 } else {
-                    return host.memory.readWideString(dataAddr.toString(16), length);
+                    return host.memory.readWideString(dataAddr, length);
                 }
             }
         } catch (e) { }
@@ -2729,12 +2780,14 @@ function frame_attrs(objectAddr, debug, typeHint) {
     var result = BlinkUnwrap.getCppMembersWithFallback(objHex, enableDebug, typeHintStr);
 
     // 4. Direct String/URL Preview (using hinted or detected type)
+    var didPrintStringContent = false;
     var activeType = result.typeCast || typeHintStr;
     if (activeType && (activeType.indexOf("String") !== -1 || activeType.indexOf("KURL") !== -1)) {
         var strVal = BlinkUnwrap.readString(objHex);
         if (strVal !== null) {
             Logger.info("[String Content]  \"" + strVal + "\"");
             Logger.empty();
+            didPrintStringContent = true;
         }
     }
 
@@ -2854,7 +2907,19 @@ function frame_attrs(objectAddr, debug, typeHint) {
                             }
                         }
                     } else {
-                        Logger.info("  (Type hint " + typeHintStr + " did not match)");
+                        // Check if this is a String/KURL type - use DRY readString logic
+                        // Skip if we already printed string content earlier
+                        if (!didPrintStringContent && typeHintStr && (typeHintStr.indexOf("String") !== -1 || typeHintStr.indexOf("KURL") !== -1)) {
+                            var strVal = BlinkUnwrap.readString(objHex);
+                            if (strVal !== null) {
+                                Logger.info("  [String Content]  \"" + strVal + "\"");
+                            } else {
+                                Logger.info("  (Type hint " + typeHintStr + " - string read returned null)");
+                            }
+                        } else if (!didPrintStringContent) {
+                            // Only show "did not match" if we haven't already printed string content
+                            Logger.info("  (Type hint " + typeHintStr + " did not match)");
+                        }
                     }
                 } else {
                     // No type hint - cannot determine type
@@ -3145,6 +3210,58 @@ class Exec {
         return bytes;
     }
 
+    /// Helper: Normalize a type string to pointer hint format for chaining
+    /// e.g., "blink::KURL" -> "(blink::KURL*)", "String" -> "String" (already simple)
+    static _normalizeTypeHint(type) {
+        if (!type) return null;
+        // Already a hint format or simple type
+        if (type.startsWith("(") || type === "String" || type === "bool" || type === "int") {
+            return type;
+        }
+        // Class/struct types need pointer format for chaining
+        if (!type.endsWith("*") && (type.includes("::") || /^[A-Z]/.test(type))) {
+            return "(" + type + "*)";
+        }
+        return type;
+    }
+
+    /// Helper: Detect return type from member offset using dt command
+    /// For inlined getters like "ADD rcx, 0x138", finds the member at that offset
+    /// @param targetSymbol - Full symbol name (e.g., "chrome!blink::Document::Url")
+    /// @param offset - Member offset in bytes
+    /// @returns Normalized type hint or null
+    static _detectTypeFromOffset(targetSymbol, offset) {
+        if (offset <= 0) return null;
+
+        var cleanSym = targetSymbol.includes("!") ? targetSymbol.split("!")[1] : targetSymbol;
+        var lastCC = cleanSym.lastIndexOf("::");
+        if (lastCC === -1) return null;
+
+        var className = cleanSym.substring(0, lastCC);
+        var offsetHex = offset.toString(16).toLowerCase();
+
+        try {
+            var ctl = SymbolUtils.getControl();
+            var dtOutput = ctl.ExecuteCommand("dt chrome!" + className);
+            var offsetPattern = new RegExp("\\+0x" + offsetHex + "\\s+(\\S+)\\s+:\\s+(.+)", "i");
+
+            for (var line of dtOutput) {
+                var lineStr = line.toString();
+                var m = lineStr.match(offsetPattern);
+                if (m) {
+                    var memberName = m[1];
+                    var memberType = m[2].trim();
+                    Logger.info("    [Type Detection] dt offset 0x" + offsetHex.toUpperCase() + " -> " + memberName + " : " + memberType);
+                    // Clean up type (remove template noise if simple type)
+                    var simpleType = memberType.split("<")[0].trim();
+                    return this._normalizeTypeHint(simpleType);
+                }
+            }
+        } catch (e) { }
+
+        return null;
+    }
+
     static exec(cmdString) {
         Logger.section("Exec Command");
         if (isEmpty(cmdString)) {
@@ -3229,10 +3346,12 @@ class Exec {
                 return null;
             }
 
-            // check for null result or "0x0" - but only for INTERMEDIATE calls
+            // check for null result or zero - but only for INTERMEDIATE calls
             // The final call can return 0x0 as a valid boolean (false)
             var isLastCall = (i === calls.length - 1);
-            if (result === null || (result === "0x0" && !isLastCall)) {
+            var isNullOrZero = (result === null || result === undefined ||
+                result === "0x0" || result === "0" || result === 0n);
+            if (isNullOrZero && !isLastCall) {
                 Logger.error("  Chain terminated: intermediate call returned null/0.");
                 return null;
             }
@@ -3435,12 +3554,7 @@ class Exec {
         var detectedReturnType = SymbolUtils.getReturnType(targetSymbol);
         if (detectedReturnType) {
             Logger.info("    [Type Detection] Programmatically detected: " + detectedReturnType);
-            // If it's a class/struct but not a pointer, normalize as a pointer hint for chaining
-            if (!detectedReturnType.endsWith("*") && (detectedReturnType.includes("::") || /^[A-Z]/.test(detectedReturnType))) {
-                this.currentReturnTypeHint = "(" + detectedReturnType + "*)";
-            } else {
-                this.currentReturnTypeHint = detectedReturnType;
-            }
+            this.currentReturnTypeHint = this._normalizeTypeHint(detectedReturnType);
         }
 
         if (!this.currentReturnTypeHint) {
@@ -3496,6 +3610,16 @@ class Exec {
             if (bestCandidate) {
                 Logger.info("    [Chain] Selected best inlined candidate @ " + bestCandidate.address + " (Offset: 0x" + bestOffset.toString(16) + ")");
 
+                // Inferred return type using DRY helper
+                var inlinedSymbol = bestCandidate.foundClass + "::" + bestCandidate.foundMethod;
+                var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
+                if (inlinedReturnType) {
+                    this.currentReturnTypeHint = this._normalizeTypeHint(inlinedReturnType);
+                    if (this.currentReturnTypeHint) {
+                        Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
+                    }
+                }
+
                 return this._executeInlinedCode(bestCandidate.address, bestCandidate.size, args, bestRegs.inputReg, bestRegs.outputReg);
             } else {
                 Logger.error("    [Chain] Could not find a suitable inlined candidate.");
@@ -3510,7 +3634,19 @@ class Exec {
                 Logger.error("    [Inline] Code contains control flow or RIP-relative addressing. Cannot relocate safely.");
                 return null;
             }
+
+            // Get register info (includes offset for ADD pattern getters)
             var regs = this._getInlinedRegs(symInfo.address);
+
+            // Infer return type from member offset via DRY helper
+            if (regs.offset > 0) {
+                var detectedType = this._detectTypeFromOffset(targetSymbol, regs.offset);
+                if (detectedType) {
+                    this.currentReturnTypeHint = detectedType;
+                    Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
+                }
+            }
+
             return this._executeInlinedCode(symInfo.address, symInfo.size, args, regs.inputReg, regs.outputReg);
         }
 
@@ -3793,6 +3929,20 @@ class Exec {
 
                 // This candidate is relocatable - use it!
                 Logger.info("    [PDB] Selected inlined at: " + cand.addr + " (size=" + cand.size + ")");
+
+                // Inferred return type for chaining: Use the resolved symbol
+                var inlinedSymbol = cand.foundClass + "::" + cand.foundMethod;
+                var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
+                if (inlinedReturnType) {
+                    // Normalize to pointer hint for chaining
+                    if (!inlinedReturnType.endsWith("*") && (inlinedReturnType.includes("::") || /^[A-Z]/.test(inlinedReturnType))) {
+                        this.currentReturnTypeHint = "(" + inlinedReturnType + "*)";
+                    } else {
+                        this.currentReturnTypeHint = inlinedReturnType;
+                    }
+                    Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
+                }
+
                 var regs = this._getInlinedRegs(cand.addr);
                 Logger.info("    [PDB] Executing real inlined code from " + cand.addr + " (" + cand.size + " bytes)");
                 var inlineArgs = [{ type: 'int', realValue: MemoryUtils.parseBigInt(thisPtr) }];
@@ -4434,33 +4584,54 @@ class Exec {
 
         if (resultVal === 0n && !isFloat) return 0n;
 
-        // Check for boolean return value - low byte is 0 or 1, upper bytes are garbage
-        // Garbage patterns: code addresses (0x7ff...), heap addresses (0x...0000XXXX), etc.
+        // Check for boolean return value
+        var isBoolHint = (this.currentReturnTypeHint && this.currentReturnTypeHint.toLowerCase() === "bool");
         var lowByte = resultVal & 0xFFn;
         var upperBytes = resultVal >> 8n;
 
-        // FIX: Heuristic was too aggressive for valid pointers ending in 00/01.
-        // Skip check if we have a non-bool hint, or if value looks like a pointer (> 64KB)
+        if (isBoolHint) {
+            var boolVal = resultVal !== 0n;
+            Logger.info("    Result (bool hint): " + boolVal + " (0x" + resultVal.toString(16) + ")");
+            return resultVal !== 0n ? 1n : 0n;
+        }
+
+        // Fallback boolean heuristic for cases without hints
         var skipBoolCheck = (this.currentReturnTypeHint && this.currentReturnTypeHint !== "bool");
         if (resultVal > 0x10000n) skipBoolCheck = true;
 
         if (!skipBoolCheck && (lowByte === 0n || lowByte === 1n) && upperBytes !== 0n && !isFloat) {
-            // Upper bytes look like garbage (leftover from previous operations)
-            // This is likely a boolean return value
             var boolStr = lowByte === 1n ? "true" : "false";
-            Logger.info("    Result (bool): " + boolStr + " (0x" + lowByte.toString(16) + ")");
-            Logger.info("    [Note] Upper bytes ignored (garbage from AL-only return)");
-            return lowByte;  // Return just the boolean value
+            Logger.info("    Result (bool heuristic): " + boolStr + " (0x" + lowByte.toString(16) + ")");
+            return lowByte;
         }
 
         // Decimal (clean output, no signed by default unless negative)
         Logger.info("    Decimal (Unsigned): " + resultVal.toString());
 
-        // Check for Compressed Pointer
-        // Check for Compressed Pointer
-        // Relaxed check: allow values up to ~1TB (0xFFFFFFFFFF) as some compressed pointers exceed 32 bits
-        if (!isFloat && resultVal > 0x10000n && resultVal <= 0xFFFFFFFFFFn) {
-            if (this.currentThis) {
+        // Check for compressed pointers (CppGC / Oilpan)
+        // MOVSXD and other inlined loads often sign-extend or leave garbage in high bits.
+        // If high bits are set (> 1TB) but it's not a valid user-mode pointer, 
+        // try extracting the low 32 bits for decompression.
+        if (!isFloat && resultVal > 0x10000n) {
+            var low32 = resultVal & 0xFFFFFFFFn;
+            var high32 = resultVal >> 32n;
+
+            // If it's sign-extended (high bits != 0) and not a valid pointer, try low32 recovery
+            if (high32 !== 0n && !isValidUserModePointer(resultVal)) {
+                if (this.currentThis && low32 > 0n) {
+                    try {
+                        var decompressed = MemoryUtils.decompressCppgcPtr(low32, this.currentThis);
+                        if (decompressed && decompressed !== low32.toString(16)) {
+                            Logger.info("    [Pointer recovered] 0x" + resultVal.toString(16) + " -> 0x" + decompressed);
+                            resultVal = BigInt("0x" + decompressed);
+                            return resultVal;
+                        }
+                    } catch (e) { }
+                }
+            }
+
+            // Standard compressed pointer check (up to 1TB raw value)
+            if (resultVal <= 0xFFFFFFFFFFn && this.currentThis) {
                 try {
                     var decompressed = MemoryUtils.decompressCppgcPtr(resultVal, this.currentThis);
                     if (decompressed && decompressed !== resultVal.toString(16)) {
@@ -4568,8 +4739,8 @@ class Exec {
         if (arg === 'false') return { type: 'int', value: 0 };
         // Null pointer
         if (arg === 'null' || arg === 'nullptr') return { type: 'int', value: 0 };
-        // Hex / Number (require at least one digit)
-        if (/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(arg)) {
+        // Hex / Number (allow with or without 0x prefix)
+        if (/^(0x)?[0-9a-fA-F]+$/.test(arg)) {
             return { type: 'int', value: arg };
         }
         // Symbol?
@@ -4578,8 +4749,8 @@ class Exec {
             if (addr) return { type: 'int', value: addr };
         }
 
-        // Helper: check for 'compressed' syntax? 
-        // Assuming simple ints/pointers for now as per plan
+        // Fallback: treat as raw value (may cause issues if not valid)
+        Logger.warn("    [Args] Unrecognized argument format: '" + arg + "' - treating as literal");
         return { type: 'int', value: arg };
     }
 
