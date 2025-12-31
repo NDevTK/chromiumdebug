@@ -20,7 +20,9 @@ const BROWSER_CMDLINE_MIN_LENGTH = 500;
 const USER_MODE_ADDR_LIMIT = "0x7fffffffffff";
 const MIN_PTR_VALUE_LENGTH = 4;
 const MAX_DOM_TRAVERSAL_NODES = 5000;
-const STRINGIMPL_DATA_OFFSET = 12; // Offset from StringImpl to character data
+// StringImpl memory layout (x64): RefCount:4 + Length:4 + Hash/Flags:4 = 12 bytes header
+// Data starts immediately after the header at offset 12
+const STRINGIMPL_DATA_OFFSET = 12;
 const MAX_URL_STRING_LENGTH = 10000; // Maximum reasonable URL length for validation
 const MAX_BACKWARD_SCAN_BYTES = 1536; // 1.5KB backward scan limit for vtable detection
 const MAX_INTEGRITY_DISPLAY_LENGTH = 25; // Truncation length for integrity level display
@@ -49,6 +51,28 @@ function parseIntAuto(str) {
 function isValidUserModePointer(val) {
     if (typeof val !== "bigint") return false;
     return val > BigInt(MIN_VALID_VTABLE_ADDR) && val < BigInt(USER_MODE_ADDR_LIMIT);
+}
+
+/// Helper: Normalize a type name to a pointer cast format
+/// Ensures the type is wrapped in parentheses with a pointer suffix for dx casting
+/// @param typeName - Type name to normalize (e.g., "blink::Document" or "(blink::Document*)")
+/// @returns Normalized type hint (e.g., "(blink::Document*)")
+function normalizeTypeHint(typeName) {
+    if (!typeName) return null;
+    // Already in pointer cast format
+    if (typeName.startsWith("(") && typeName.endsWith(")")) {
+        return typeName;
+    }
+    // Already has pointer suffix, just wrap in parens
+    if (typeName.endsWith("*")) {
+        return "(" + typeName + ")";
+    }
+    // Check if it looks like a class/namespace (contains ::) or starts with uppercase
+    if (typeName.includes("::") || /^[A-Z]/.test(typeName)) {
+        return "(" + typeName + "*)";
+    }
+    // Primitive or unknown type, return as-is (no pointer)
+    return typeName;
 }
 
 /// Helper: Register sxe cpr handler for renderer attach
@@ -500,6 +524,7 @@ class SymbolUtils {
         } catch (e) {
             if (debug) Logger.info("  [Debug] ln failed: " + e.message);
         }
+        return null;
     }
 
     /// Programmatically get the return type of a function symbol or address
@@ -529,7 +554,7 @@ class SymbolUtils {
                     return typeName;
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("getReturnType host API (Expression) failed: " + e.message); }
 
         // 2. Try native host API (Modules path - Case Sensitive as per official documentation)
         try {
@@ -547,7 +572,7 @@ class SymbolUtils {
                     }
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("getReturnType host API (Symbol) failed: " + e.message); }
 
         // 3. Robust Fallback: dx -r0 (Best for complex templates)
         try {
@@ -567,7 +592,7 @@ class SymbolUtils {
                     return type;
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("getReturnType dx fallback failed: " + e.message); }
 
         // 4. Inlined function fallback: query symbol via host JavaScript API
         try {
@@ -596,9 +621,9 @@ class SymbolUtils {
                             }
                         }
                     }
-                } catch (symErr) { }
+                } catch (symErr) { Logger.debug("getReturnType symbol access failed: " + symErr.message); }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("getReturnType inlined function fallback failed: " + e.message); }
 
         return null;
     }
@@ -626,7 +651,9 @@ class MemoryUtils {
     }
 
     static parseBigInt(input) {
-        if (typeof input === "string") {
+        if (typeof input === "bigint") {
+            return input;
+        } else if (typeof input === "string") {
             var ptrStr = input.replace(/`/g, "");
             if (ptrStr.startsWith("0x") || ptrStr.startsWith("0X")) return BigInt(ptrStr);
             // If string is purely numeric digits, assume decimal
@@ -1661,14 +1688,14 @@ class BlinkUnwrap {
                 // Try to parse "member_ [Type: ...]" format (no colon)
                 var noColonMatch = afterOffset.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s+\[Type:\s*([^\]]+)\]/);
                 if (noColonMatch) {
-                    var name = noColonMatch[1];
-                    var type = noColonMatch[2];
+                    var memberName = noColonMatch[1];
+                    var memberType = noColonMatch[2];
                     var value = "{...}";
 
                     // DRY: Use readString for opaque string/URL members
-                    if (type.indexOf("String") !== -1 || type.indexOf("KURL") !== -1) {
+                    if (memberType.indexOf("String") !== -1 || memberType.indexOf("KURL") !== -1) {
                         try {
-                            var memberAddrCmd = "dx &((" + typeCast + objHex + ")->" + name + ")";
+                            var memberAddrCmd = "dx &((" + typeCast + objHex + ")->" + memberName + ")";
                             var memberAddrOutput = ctl.ExecuteCommand(memberAddrCmd);
                             for (var maLine of memberAddrOutput) {
                                 var maMatch = maLine.toString().match(/:\s+(0x[0-9a-fA-F`]+)/);
@@ -1679,7 +1706,7 @@ class BlinkUnwrap {
                             }
                         } catch (e) { }
                     }
-                    members.push({ name: name, value: value, type: type });
+                    members.push({ name: memberName, value: value, type: memberType });
                 }
             }
         } catch (e) { Logger.debug("getCppMembers parse error: " + e.message); }
@@ -4024,7 +4051,6 @@ class Exec {
             "chrome!*::" + methodName                          // Method-only search (finds base class methods)
         ];
 
-        var funcAddr = null;
         var inlineAddr = null;
         var inlineSize = 0;
         var exactFuncAddr = null;
@@ -4123,11 +4149,7 @@ class Exec {
                 var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
                 if (inlinedReturnType) {
                     // Normalize to pointer hint for chaining
-                    if (!inlinedReturnType.endsWith("*") && (inlinedReturnType.includes("::") || /^[A-Z]/.test(inlinedReturnType))) {
-                        this.currentReturnTypeHint = "(" + inlinedReturnType + "*)";
-                    } else {
-                        this.currentReturnTypeHint = inlinedReturnType;
-                    }
+                    this.currentReturnTypeHint = normalizeTypeHint(inlinedReturnType);
                     Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
                 }
 
@@ -4544,6 +4566,7 @@ class Exec {
 
             // 5. Setup Stack for Args > 4 (Shadow Space + Args)
             var stackAlloc = null;
+            var stackAllocSize = 0;  // Track allocated size for proper deallocation
             if (args.length > 4) {
                 // Shadow space (32) + (args-4)*8
                 var stackSize = 32 + (args.length - 4) * 8;
@@ -4558,6 +4581,7 @@ class Exec {
                 var stackHex = MemoryUtils.alloc(totalStackSize);
                 if (stackHex) {
                     stackAlloc = BigInt("0x" + stackHex);
+                    stackAllocSize = totalStackSize;  // Store size for later deallocation
 
                     // RSP should point to where arguments start (conceptually "top" of used stack)
                     // The function will access [RSP+0x28] for arg 5.
@@ -4653,25 +4677,20 @@ class Exec {
             ctl.ExecuteCommand("r @rcx = @$t7");
             ctl.ExecuteCommand("r @rax = @$t8");
 
-            if (true) { // Always process result
-                Logger.info("    Result (Literal): 0x" + resultVal.toString(16));
+            Logger.info("    Result (Literal): 0x" + resultVal.toString(16));
 
-                // Safety Check: Result matches Code Buffer?
-                var bufBig = BigInt("0x" + buf);
-                if (resultVal >= bufBig && resultVal < (bufBig + BigInt(bufSize))) {
-                    Logger.warn("    [WARNING] Result points to execution buffer. Register corruption suspected.");
-                    Logger.warn("    This usually means 'this' was not passed correctly in " + inputReg);
-                }
-
-                // Analyze & Decompress (passing floatVal!)
-                resultVal = this._analyzeResult(resultVal, floatVal);
-
-                Logger.info("    Final Result: 0x" + resultVal.toString(16));
-                return "0x" + resultVal.toString(16);
-            } else {
-                Logger.error("Could not read result from " + outputReg);
-                return null;
+            // Safety Check: Result matches Code Buffer?
+            var bufBig = BigInt("0x" + buf);
+            if (resultVal >= bufBig && resultVal < (bufBig + BigInt(bufSize))) {
+                Logger.warn("    [WARNING] Result points to execution buffer. Register corruption suspected.");
+                Logger.warn("    This usually means 'this' was not passed correctly in " + inputReg);
             }
+
+            // Analyze & Decompress (passing floatVal!)
+            resultVal = this._analyzeResult(resultVal, floatVal);
+
+            Logger.info("    Final Result: 0x" + resultVal.toString(16));
+            return "0x" + resultVal.toString(16);
 
         } catch (e) {
             Logger.error("Inlined execution failed: " + e.message);
@@ -4694,11 +4713,11 @@ class Exec {
                 Logger.debug("    Freed execution buffer: " + buf);
             }
             if (stackAlloc) {
-                MemoryUtils.free(stackAlloc.toString(16), 0);
-                Logger.debug("    Freed stack buffer.");
+                MemoryUtils.free(stackAlloc.toString(16), stackAllocSize);
+                Logger.debug("    Freed stack buffer (" + stackAllocSize + " bytes).");
             }
             if (scratchBase) {
-                MemoryUtils.free(scratchBase.toString(16), 0);
+                MemoryUtils.free(scratchBase.toString(16), 0x1000);
                 Logger.debug("    Freed scratch buffer.");
             }
         }
@@ -4850,10 +4869,7 @@ class Exec {
 
                 // Fallback: Use type hint if detection failed
                 if (!detectedType && this.currentReturnTypeHint) {
-                    detectedType = this.currentReturnTypeHint;
-                    if (!detectedType.startsWith("(")) {
-                        detectedType = "(" + detectedType + ")";
-                    }
+                    detectedType = normalizeTypeHint(this.currentReturnTypeHint);
                     Logger.info("    [Type Hint] Using hinted type: " + detectedType);
                 }
 
@@ -4867,7 +4883,7 @@ class Exec {
                         Logger.warn("    [Inspection Failed] " + e.message);
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Logger.debug("_analyzeResult type detection failed: " + e.message); }
 
             // 2. String Detection
             if (!detectedType || detectedType.indexOf("String") !== -1 || detectedType.indexOf("KURL") !== -1) {
@@ -4876,7 +4892,7 @@ class Exec {
                     if (s && s.length > 0) {
                         Logger.info("    String Result:      \"" + s + "\"");
                     }
-                } catch (e) { }
+                } catch (e) { Logger.debug("_analyzeResult string read failed: " + e.message); }
 
                 // Fallback for raw character pointers
                 if (detectedType && (detectedType.indexOf("char*") !== -1 || detectedType.indexOf("char *") !== -1)) {
@@ -4887,7 +4903,7 @@ class Exec {
                             if (s.length > 200) s = s.substring(0, 200) + "...";
                             Logger.info("    String (ASCII):     \"" + s + "\"");
                         }
-                    } catch (e) { }
+                    } catch (e) { Logger.debug("_analyzeResult ASCII string failed: " + e.message); }
 
                     try {
                         var s = host.memory.readWideString(resultVal);
@@ -4895,7 +4911,7 @@ class Exec {
                             if (s.length > 200) s = s.substring(0, 200) + "...";
                             Logger.info("    String (UTF-16):    \"" + s + "\"");
                         }
-                    } catch (e) { }
+                    } catch (e) { Logger.debug("_analyzeResult UTF-16 string failed: " + e.message); }
                 }
             }
         }
@@ -6281,8 +6297,8 @@ function patch_function(funcName, returnValue) {
                 } else if (typeof retVal === "bigint") {
                     // mov rax, IMM64; ret = 48 B8 ... C3
                     var bytes = [0x48, 0xB8];
-                    for (var i = 0n; i < 64n; i += 8n) {
-                        bytes.push(Number((retVal >> i) & 0xFFn));
+                    for (var i = 0; i < 8; i++) {
+                        bytes.push(Number((retVal >> BigInt(i * 8)) & 0xFFn));
                     }
                     bytes.push(0xC3);
                     MemoryUtils.writeMemory(funcAddr, bytes);
