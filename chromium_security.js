@@ -5474,17 +5474,7 @@ function get_site_locks(browserSysId, childIds) {
 
     try {
         // Step 1: Get the GetInstance symbol address
-        var funcAddr = null;
-        try {
-            var xOutput = ctl.ExecuteCommand("x chrome!content::ChildProcessSecurityPolicyImpl::GetInstance");
-            for (var xLine of xOutput) {
-                var addr = SymbolUtils.extractAddress(xLine);
-                if (addr) {
-                    funcAddr = addr;
-                    break;
-                }
-            }
-        } catch (xErr) { /* continue with null funcAddr */ }
+        var funcAddr = SymbolUtils.findSymbolAddress("chrome!content::ChildProcessSecurityPolicyImpl::GetInstance");
 
         if (!funcAddr) {
             // Early exit - will restore in finally
