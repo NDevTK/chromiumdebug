@@ -10,7 +10,7 @@
 /// Global state
 var g_rendererAttachCommands = [];
 var g_spoofMap = new Map(); // Map<ClientId, {currentUrl: string, pid: number}>
-var g_exitHandlerRegistered = false;
+var g_registeredPids = new Set();
 
 /// Constants
 const DEBUG_MODE = false; // Set to true to enable verbose error logging
@@ -1262,6 +1262,103 @@ function readUrlStringFromDx(addr, typeCast) {
     return null;
 }
 
+/// Helper: Validate if an address looks like a StringImpl header
+/// @param dataAddr - Address where string data starts
+/// @param minLen - Minimum length to match
+/// @param logFailures - If true, log detailed reasons for validation failures
+/// @returns Object {valid: bool, lengthAddr: host.Int64|null, refCountAddr: host.Int64|null} or null
+function _validateStringImplHeader(dataAddr, minLen, logFailures) {
+    var addrVal = host.parseInt64(dataAddr, 16);
+
+    // Scan window: -32 to +32 bytes
+    var startScan = addrVal.subtract(32);
+    var bytes = null;
+    var ints = null;
+
+    try {
+        ints = host.memory.readMemoryValues(startScan, 16, 4);
+        bytes = [];
+        for (var i = 0; i < ints.length; i++) {
+            var val = ints[i];
+            bytes.push(val & 0xFF);
+            bytes.push((val >> 8) & 0xFF);
+            bytes.push((val >> 16) & 0xFF);
+            bytes.push((val >> 24) & 0xFF);
+        }
+
+        // Offset of dataAddr in 'bytes' array is 32.
+
+        for (var i = 0; i < bytes.length; i++) {
+            var offsetFromData = i - 32;
+            var byteVal = bytes[i];
+
+            // Check 4-byte Length (Raw/SMI)
+            if (i + 4 <= bytes.length) {
+                var val32 = bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
+                val32 = val32 >>> 0;
+
+                // Restrict 32-bit header search to EXACTLY -8 (WTF::StringImpl Length offset x64)
+                // Matching -12 (RefCount) or -4 (Hash) causes corruption.
+                if (offsetFromData === -8) {
+
+                    // STRICT VALIDATION for WTF::StringImpl
+                    // Layout: [Ref:4][Len:4][Flags:4][Data...]
+                    // Length is at -8. RefCount at -12. Flags at -4.
+
+                    if (offsetFromData === -8) {
+                        // 1. Check Flags (Is8Bit) at -4
+                        if (i + 4 < bytes.length) {
+                            var flags = bytes[i + 4];
+                            if ((flags & 1) !== 1) {
+                                if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Flags not 8-bit.");
+                                continue;
+                            }
+                        }
+
+                        // 2. Check RefCount at -12 (Must be > 0 for live object)
+                        if (i - 4 >= 0) {
+                            var refCount = bytes[i - 4] | (bytes[i - 3] << 8) | (bytes[i - 2] << 16) | (bytes[i - 1] << 24);
+                            if (refCount === 0) {
+                                if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: RefCount is 0 (Dead Object).");
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Raw 32
+                    if (val32 >= minLen && val32 < minLen + 1000) {
+                        var matchAddr = startScan.add(i);
+                        if (logFailures) Logger.info("  [DEBUG] Found Raw 32-bit Length " + val32 + " at " + offsetFromData);
+                        return { valid: true, lengthAddr: matchAddr, encoding: 'raw', actualLen: val32 };
+                    }
+                    // SMI 32
+                    var valSmi = val32 >> 1;
+                    if ((val32 & 1) === 0 && valSmi >= minLen && valSmi < minLen + 1000) {
+                        var matchAddr = startScan.add(i);
+                        if (logFailures) Logger.info("  [DEBUG] Found SMI 32-bit Length " + valSmi + " at " + offsetFromData);
+                        return { valid: true, lengthAddr: matchAddr, encoding: 'smi', actualLen: valSmi };
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        if (logFailures) Logger.info("  [DEBUG] Scan failed: " + e.message);
+    }
+
+    if (logFailures) {
+        Logger.info("  [DEBUG] No valid header found in preceding 32 bytes.");
+        // Dump the hex values to see what's actually there
+        var hexDump = [];
+        if (ints) {
+            for (var val of ints) {
+                hexDump.push("0x" + val.toString(16));
+            }
+        }
+        Logger.info("  [DEBUG] Memory dump [-32..0]: " + hexDump.join(", "));
+    }
+    return { valid: false, lengthAddr: null };
+}
+
 /// Helper: Patch strings in memory (used by spoof_origin)
 /// @param ctl - Debugger control object
 /// @param searchStr - String to search for
@@ -1274,6 +1371,8 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
         Logger.warn("  " + label + ": Replacement string too long (" + replaceStr.length + " > " + searchStr.length + "). Aborting to prevent overflow.");
         return 0;
     }
+
+    var needsLengthUpdate = (replaceStr.length !== searchStr.length);
 
     try {
         var cmdType = isUnicode ? "-u" : "-a";
@@ -1291,35 +1390,92 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
         }
 
         var patched = 0;
+        var skipped = 0;
+        var hasLoggedFailure = false;
+
         for (var addr of addresses) {
             try {
-                // StringImpl Layout (approx): RefCount(+0), Length(+4), Hash(+8), Data(+12)
-                // So Length is at Data - 8.
-                // Try multiple offsets to find the length field for variable-length string support
-                var addrVal = host.parseInt64(addr, 16);
+                if (typeof addr === 'string') {
+                    addr = host.parseInt64(addr, 16);
+                }
+
+                if (!_isWritable(addr)) {
+                    skipped++;
+                    continue;
+                }
+
                 var lengthUpdated = false;
+                var headerInfo = null;
 
-                // Try multiple offsets for StringImpl length field:
-                // -8: Standard layout (Data at +12, Length at +4, so Data - Length = -8)
-                // -4: Alternate layout with different padding
-                // -12: Older StringImpl layouts
-                var lenOffsets = [-8, -4, -12];
-                for (var offsetIdx = 0; offsetIdx < lenOffsets.length && !lengthUpdated; offsetIdx++) {
-                    try {
-                        var lenAddr = addrVal.add(lenOffsets[offsetIdx]);
-                        var ptrVal = host.memory.readMemoryValues(lenAddr, 1, 4)[0];
+                // If lengths differ, we try to find and update the length field
+                if (needsLengthUpdate) {
+                    var doLog = (skipped < 3);
+                    headerInfo = _validateStringImplHeader(addr, searchStr.length, doLog);
 
-                        // Memory safety: Only update length if we're confident this is the length field
-                        // - Must EXACTLY match searchStr.length (not just >= to prevent false positives)
-                        // - Must be reasonable (<MAX_URL_STRING_LENGTH chars for a URL)
-                        if (ptrVal === searchStr.length && ptrVal < MAX_URL_STRING_LENGTH) {
-                            // Update length to replaceStr.length
-                            var newLen = replaceStr.length;
-                            MemoryUtils.writeU32(lenAddr, newLen);
-                            lengthUpdated = true;
+                    if (headerInfo && headerInfo.valid) {
+                        var finalNewLen = replaceStr.length;
+                        var actualOldLen = headerInfo.actualLen || searchStr.length;
+                        var suffixBytes = [];
+
+                        // Check if we found a larger string (backing store)
+                        if (actualOldLen > searchStr.length) {
+                            var suffixLen = actualOldLen - searchStr.length;
+                            // Sanity check
+                            if (suffixLen < 5000) {
+                                // Read existing suffix
+                                var suffixAddr = addr.add(searchStr.length * (isUnicode ? 2 : 1));
+                                var suffixBytesCount = suffixLen * (isUnicode ? 2 : 1);
+                                try {
+                                    var suffixInts = host.memory.readMemoryValues(suffixAddr, Math.ceil(suffixBytesCount / 4), 4);
+
+                                    for (var v of suffixInts) {
+                                        suffixBytes.push(v & 0xFF);
+                                        suffixBytes.push((v >> 8) & 0xFF);
+                                        suffixBytes.push((v >> 16) & 0xFF);
+                                        suffixBytes.push((v >> 24) & 0xFF);
+                                    }
+                                    if (suffixBytes.length > suffixBytesCount) {
+                                        suffixBytes = suffixBytes.slice(0, suffixBytesCount);
+                                    }
+                                    Logger.info("  [" + label + "] Preserving suffix of length " + suffixLen);
+                                } catch (e) { }
+                            }
                         }
-                    } catch (e) {
-                        // Ignore read errors, try next offset
+
+                        finalNewLen = replaceStr.length + (suffixBytes.length / (isUnicode ? 2 : 1));
+
+                        // Update Header
+                        var lenAddrStr = headerInfo.lengthAddr.toString(16);
+
+                        // Safety: Check if Length Header is writable
+                        if (_isWritable(headerInfo.lengthAddr)) {
+                            if (headerInfo.encoding === "smi") {
+                                MemoryUtils.writeU32(lenAddrStr, finalNewLen << 1);
+                            } else if (headerInfo.encoding === "smi_byte") {
+                                MemoryUtils.writeMemory(lenAddrStr, [(finalNewLen << 1) & 0xFF]);
+                            } else if (headerInfo.encoding === "raw_byte") {
+                                MemoryUtils.writeMemory(lenAddrStr, [finalNewLen & 0xFF]);
+                            } else {
+                                MemoryUtils.writeU32(lenAddrStr, finalNewLen);
+                            }
+                        } else {
+                            Logger.warn("Skipping Header Update: Address RO " + lenAddrStr);
+                            skipped++;
+                            continue;
+                        }
+
+                        // Write Suffix at new offset
+                        if (suffixBytes.length > 0) {
+                            var newSuffixAddr = addr.add(replaceStr.length * (isUnicode ? 2 : 1));
+                            if (_isWritable(newSuffixAddr)) {
+                                MemoryUtils.writeMemory(newSuffixAddr.toString(16), suffixBytes);
+                            }
+                        }
+
+                        lengthUpdated = true;
+                    } else {
+                        skipped++;
+                        continue;
                     }
                 }
 
@@ -1335,21 +1491,25 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
                     }
                 }
 
-                // Pad remainder with nulls to overwrite old longer string
-                for (var k = replaceStr.length; k < searchStr.length; k++) {
-                    if (isUnicode) { bytes.push(0); bytes.push(0); }
-                    else bytes.push(0);
-                }
-
-                MemoryUtils.writeMemory(addr, bytes);
+                MemoryUtils.writeMemory(addr.toString(16), bytes);
                 patched++;
-            } catch (e) { Logger.debug("Memory write failed at " + addr + ": " + e.message); }
+
+            } catch (e) {
+                Logger.info("  Error patching address " + addr + ": " + e.message);
+                skipped++;
+            }
         }
 
-        Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " " + (isUnicode ? "Unicode" : "ASCII") + " occurrences");
+        if (skipped > 0 && !hasLoggedFailure) {
+            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " (Skipped " + skipped + " due to missing headers/strict mode)");
+            hasLoggedFailure = true;
+        } else if (skipped === 0) {
+            Logger.info("  " + label + ": Patched " + patched + "/" + addresses.length + " occurrences");
+        }
         return patched;
+
     } catch (e) {
-        Logger.debug("_patchStringInMemory failed: " + e.message);
+        Logger.info("  Error executing search for " + label + ": " + e.message);
         return 0;
     }
 }
@@ -6425,28 +6585,111 @@ function on_process_exit() {
 }
 
 /// Usage: !spoof_origin "https://target.com"
-/// Spoofs the current origin to a target origin
-/// Patches both host and full URL occurrences in memory
-function spoof_origin(targetUrl) {
-    Logger.section("Spoof Origin");
+/// Generic memory string replacement and origin spoofing
+/// Modes:
+///   - "origin" (default): Auto-detect current origin, replace host and scheme
+///   - "host": Replace only the host component
+///   - "scheme": Replace only the scheme/protocol component
+///   - "full": Replace the full origin URL (scheme://host)
+///   - "string": Generic string replacement (requires searchStr and replaceStr)
+///   - "unicode": Generic Unicode string replacement
+/// @param arg1 - Target URL (for origin modes) or search string (for string mode)
+/// @param arg2 - Optional: replacement string (for string mode) or mode override
+/// @param arg3 - Optional: mode when arg2 is replacement string
+function spoof_origin(arg1, arg2, arg3) {
+    Logger.section("Memory String Replacement");
 
     var ctl = SymbolUtils.getControl();
 
-    if (isEmpty(targetUrl)) {
-        Logger.info("  Usage: !spoof_origin(\"https://target.com\")");
+    // Determine mode and arguments
+    var mode = "origin";  // Default mode
+    var targetUrl = null;
+    var searchStr = null;
+    var replaceStr = null;
+
+    // Parse arguments based on what was provided
+    if (isEmpty(arg1)) {
+        // No arguments - show usage
+        Logger.info("  Usage:");
+        Logger.empty();
+        Logger.info("  Origin Spoofing (default):");
+        Logger.info("    !spoof(\"https://target.com\")              - Spoof to target origin");
+        Logger.info("    !spoof(\"https://target.com\", \"host\")      - Replace host only");
+        Logger.info("    !spoof(\"https://target.com\", \"scheme\")    - Replace scheme only");
+        Logger.info("    !spoof(\"https://target.com\", \"full\")      - Replace full origin URL");
+        Logger.empty();
+        Logger.info("  Generic String Replacement:");
+        Logger.info("    !spoof(\"oldstring\", \"newstring\", \"string\")  - Replace ASCII string");
+        Logger.info("    !spoof(\"oldstring\", \"newstring\", \"unicode\") - Replace Unicode string");
         Logger.empty();
         Logger.info("  Examples:");
-        Logger.info("    !spoof_origin(\"https://google.com\")");
-        Logger.info("    !spoof_origin(\"chrome://settings\")");
-        Logger.info("    !spoof_origin(\"file://localhost\")");
+        Logger.info("    !spoof(\"https://evil.com\")                - Spoof origin to evil.com");
+        Logger.info("    !spoof(\"example.com\", \"evil.com\", \"string\") - Replace all 'example.com'");
+        Logger.info("    !spoof(\"secret\", \"public\", \"string\")      - Replace 'secret' with 'public'");
         Logger.empty();
-        Logger.info("  Patches all occurrences of current origin in memory.");
+        Logger.info("  Note: Replacement must be <= search length to prevent buffer overflow.");
         Logger.empty();
         return "";
     }
 
-    // Strip quotes from target and normalize (remove trailing slash)
-    var targetOrigin = targetUrl.replace(/"/g, "").replace(/\/+$/, "");
+    // Clean up arg1
+    arg1 = String(arg1).replace(/"/g, "");
+
+    // Determine mode based on arguments
+    if (arg3 !== undefined && arg3 !== null) {
+        // Three arguments: spoof(search, replace, mode)
+        mode = String(arg3).replace(/"/g, "").toLowerCase();
+        searchStr = arg1;
+        replaceStr = String(arg2).replace(/"/g, "");
+    } else if (arg2 !== undefined && arg2 !== null) {
+        // Two arguments - could be (target, mode) or (search, replace)
+        var arg2Clean = String(arg2).replace(/"/g, "");
+        var knownModes = ["origin", "host", "scheme", "full", "string", "unicode"];
+        if (knownModes.indexOf(arg2Clean.toLowerCase()) !== -1) {
+            // (target, mode) - e.g. !spoof("target", "host")
+            mode = arg2Clean.toLowerCase();
+            targetUrl = arg1;
+        } else {
+            // (search, replace) - e.g. !spoof("search", "replace")
+            mode = "string";
+            searchStr = arg1;
+            replaceStr = arg2Clean;
+        }
+    } else {
+        // One argument: target URL for origin mode
+        targetUrl = arg1;
+    }
+
+    // Handle string/unicode replacement modes
+    if (mode === "string" || mode === "unicode") {
+        if (!searchStr || !replaceStr) {
+            Logger.error("String mode requires both search and replace strings.");
+            Logger.info("  Usage: !spoof(\"search\", \"replace\", \"string\")");
+            return "";
+        }
+
+        Logger.info("  Mode: " + (mode === "unicode" ? "Unicode" : "ASCII") + " String Replacement");
+        Logger.info("  Search:  \"" + searchStr + "\" (len=" + searchStr.length + ")");
+        Logger.info("  Replace: \"" + replaceStr + "\" (len=" + replaceStr.length + ")");
+        Logger.empty();
+
+        var isUnicode = (mode === "unicode");
+        var patched = _patchStringInMemory(ctl, searchStr, replaceStr, "String", isUnicode);
+
+        Logger.empty();
+        Logger.info("  Total: Patched " + patched + " locations");
+        Logger.empty();
+        return "";
+    }
+
+    // Origin-based modes (origin, host, scheme, full)
+    if (!targetUrl) {
+        Logger.error("Target URL required for origin mode.");
+        return "";
+    }
+
+    // Normalize target
+    var targetOrigin = targetUrl.replace(/\/+$/, "");
 
     // Parse target into scheme and host
     var targetMatch = targetOrigin.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
@@ -6457,14 +6700,14 @@ function spoof_origin(targetUrl) {
     var targetScheme = targetMatch[1];
     var targetHost = targetMatch[2];
 
-    // Get current origin from renderer_site (this is the TRUE browser-side origin)
+    // Get current origin from renderer_site
+    Logger.info("  Mode: " + mode.charAt(0).toUpperCase() + mode.slice(1));
     Logger.info("  Target: " + targetOrigin);
-    Logger.info("  Detecting true origin...");
+    Logger.info("  Detecting current origin...");
 
     var trueOrigin = "";
     var clientId = null;
     try {
-        // We need to parse client ID to look up in spoof map
         var cmdLine = getCommandLine();
         var clientMatch = cmdLine ? cmdLine.match(/--renderer-client-id=(\d+)/) : null;
         if (clientMatch) clientId = clientMatch[1];
@@ -6479,75 +6722,133 @@ function spoof_origin(targetUrl) {
         Logger.empty();
         Logger.warn("Could not detect current origin.");
         Logger.info("Make sure you're in a renderer with a loaded page.");
+        Logger.info("For generic string replacement, use: !spoof(\"old\", \"new\", \"string\")");
         Logger.empty();
         return "";
     }
 
-    // Determine what is currently in memory (Source)
+    // Determine current values (may have been spoofed before)
     var currentOrigin = trueOrigin;
     if (clientId && g_spoofMap.has(clientId)) {
         currentOrigin = g_spoofMap.get(clientId).currentUrl;
-        Logger.info("  [State] Detected active spoof: " + currentOrigin);
-    } else {
-        Logger.info("  [State] No active spoof detected. Using true origin.");
+        Logger.info("  [State] Active spoof detected: " + currentOrigin);
     }
 
-    // Parse current into scheme and host
+    // Parse current origin
     var currentMatch = currentOrigin.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
     if (!currentMatch) {
-        Logger.warn("Could not parse source origin: " + currentOrigin);
+        Logger.warn("Could not parse current origin: " + currentOrigin);
         return "";
     }
     var currentScheme = currentMatch[1];
     var currentHost = currentMatch[2];
 
     if (currentOrigin === targetOrigin) {
-        Logger.info("  Target matches current detected origin. No changes needed.");
+        Logger.info("  Target matches current origin. No changes needed.");
         return "";
     }
 
-    Logger.info("  Source: " + currentOrigin);
-    Logger.info("  Current Host: " + currentHost + " -> Target Host: " + targetHost);
+    Logger.info("  Current: " + currentOrigin);
     Logger.empty();
 
     var totalPatched = 0;
 
-    // Patch protocol/scheme (SecurityOrigin's protocol_ field)
-    if (currentScheme !== targetScheme) {
-        totalPatched += _patchStringInMemory(ctl, currentScheme, targetScheme, "Scheme (ASCII)", false);
-    } else {
-        Logger.info("  Schemes are identical (" + currentScheme + "), skipping");
-    }
+    // Apply patches based on mode
+    switch (mode) {
+        case "scheme":
+            if (currentScheme !== targetScheme) {
+                totalPatched += _patchStringInMemory(ctl, currentScheme, targetScheme, "Scheme", false);
+            } else {
+                Logger.info("  Schemes are identical, skipping");
+            }
+            break;
 
-    // Patch host (SecurityOrigin's host_ field)
-    if (currentHost !== targetHost) {
-        totalPatched += _patchStringInMemory(ctl, currentHost, targetHost, "Host (ASCII)", false);
-    } else {
-        Logger.info("  Hosts are identical (" + currentHost + "), skipping");
+        case "host":
+            if (currentHost !== targetHost) {
+                totalPatched += _patchStringInMemory(ctl, currentHost, targetHost, "Host", false);
+            } else {
+                Logger.info("  Hosts are identical, skipping");
+            }
+            break;
+
+        case "full":
+            if (currentOrigin !== targetOrigin) {
+                totalPatched += _patchStringInMemory(ctl, currentOrigin, targetOrigin, "Full Origin", false);
+            }
+            break;
+
+        case "origin":
+        default:
+            // Mode: Origin (Updates everything to match target)
+
+            // 1. Patch Full Origin (Scheme://Host) - High priority
+            // Finding the full string is most likely to find the "Owner" StringImpl
+            // which has the correct length header.
+            if (currentOrigin !== targetOrigin) {
+                totalPatched += _patchStringInMemory(ctl, currentOrigin, targetOrigin, "Full Origin (ASCII)", false);
+            }
+
+            // 2. Patch Scheme
+            if (currentScheme !== targetScheme) {
+                totalPatched += _patchStringInMemory(ctl, currentScheme, targetScheme, "Scheme (ASCII)", false);
+            } else {
+                Logger.info("  Schemes identical (" + currentScheme + "), skipping");
+            }
+
+            // 3. Patch Host
+            if (currentHost !== targetHost) {
+                totalPatched += _patchStringInMemory(ctl, currentHost, targetHost, "Host (ASCII)", false);
+            } else {
+                Logger.info("  Hosts identical (" + currentHost + "), skipping");
+            }
+            break;
     }
 
     Logger.empty();
     Logger.info("  Total: Patched " + totalPatched + " locations");
     Logger.empty();
 
-    // Update State
-    if (clientId) {
+    // Update state for origin-based modes
+    if (clientId && totalPatched > 0) {
         if (targetOrigin === trueOrigin) {
             Logger.info("  Reverted to true origin. Clearing spoof state.");
             g_spoofMap.delete(clientId);
         } else {
-            // New spoof - store state WITH PID
             var currentPid = host.currentProcess.Id;
             g_spoofMap.set(clientId, { currentUrl: targetOrigin, pid: currentPid });
             _ensureExitHandler();
-
         }
-    } else {
-        Logger.warn("  Could not determine Client ID. State not updated.");
+    } else if (clientId && totalPatched === 0 && targetOrigin !== trueOrigin) {
+        Logger.warn("  No patches applied. Spoof state not updated.");
     }
 
     return "";
 }
+
+/// Helper: Register process exit handler once per PID
+function _ensureExitHandler() {
+    var pid = host.currentProcess.Id;
+    if (g_registeredPids.has(pid)) return;
+
+    try {
+        host.currentProcess.on("exit", function () {
+            Logger.info("  [Cleanup] Process " + pid + " exiting. Clearing related spoofing entries.");
+            // Remove only entries for this PID
+            for (var [cid, data] of g_spoofMap.entries()) {
+                if (data.pid === pid) {
+                    g_spoofMap.delete(cid);
+                }
+            }
+            g_registeredPids.delete(pid);
+        });
+        g_registeredPids.add(pid);
+        Logger.info("  [Setup] Registered process exit handler for PID " + pid);
+    } catch (e) {
+        Logger.debug("Failed to register exit handler for PID " + pid + ": " + e.message);
+    }
+}
+
+
 
 
 
@@ -7463,10 +7764,31 @@ function bp_gc() {
     return _bpFromConfig("gc");
 }
 
+
+
 function bp_wasm() {
     return _bpFromConfig("wasm");
 }
 
 function bp_jit() {
     return _bpFromConfig("jit");
+}
+
+function _isWritable(addr) {
+    try {
+        var ctl = SymbolUtils.getControl();
+        // Check protection
+        var out = ctl.ExecuteCommand("!address " + addr.toString(16));
+        for (var line of out) {
+            var s = line.toString();
+            // Protect: ...
+            if (s.includes("Protect:")) {
+                if (s.includes("PAGE_READWRITE") || s.includes("PAGE_WRITECOPY")) return true;
+                return false;
+            }
+        }
+    } catch (e) { }
+    // If check fails, assume unsafe or allow if we want to risk it? 
+    // Safer to assume FALSE if we can't verify.
+    return false;
 }

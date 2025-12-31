@@ -89,7 +89,10 @@ Then in WinDbg: `!chelp`
 ### Origin Spoofing & Function Patching
 | Command | Description |
 |---------|-------------|
-| `!spoof("url")` | Spoof renderer origin (memory patch) |
+| `!spoof("url")` | Spoof origin (default). `!spoof("https://site.com")` |
+| `!spoof("s1","s2")` | Replace strings. `!spoof("old","new")` |
+| `!spoof("s1","")` | Delete string. `!spoof("token","")` |
+| `!spoof(...,"host")` | Partial spoof. `!spoof("x.com","host")` |
 | `!patch("Func","val")` | Patch function return value (supports strings) |
 
 ### Cross-Process Execution
