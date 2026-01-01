@@ -47,11 +47,15 @@ function parseIntAuto(str) {
 }
 
 /// Helper: Check if a BigInt value is a valid user-mode pointer
+/// On x64 Chromium, CppGC/Oilpan heap addresses are always above 4GB (0x100000000)
+/// Compressed pointers like 0x80080ede are 32-bit values and should NOT pass this check
 /// @param val - BigInt value to check
-/// @returns true if val is within valid user-mode address range (0x10000 < val < 0x7fffffffffff)
+/// @returns true if val is within valid 64-bit user-mode heap address range
 function isValidUserModePointer(val) {
     if (typeof val !== "bigint") return false;
-    return val > BigInt(MIN_VALID_VTABLE_ADDR) && val < BigInt(USER_MODE_ADDR_LIMIT);
+    // On x64, Chromium heaps are above 4GB. 32-bit values are compressed pointers.
+    const MIN_64BIT_HEAP_ADDR = BigInt("0x100000000"); // 4GB - addresses below this are likely compressed
+    return val >= MIN_64BIT_HEAP_ADDR && val < BigInt(USER_MODE_ADDR_LIMIT);
 }
 
 /// Helper: Normalize a type name to a pointer cast format
@@ -1165,6 +1169,73 @@ function isValidPointer(ptr) {
     return true;
 }
 
+/// Helper: Check if an address is likely a compressed CppGC/Oilpan pointer
+/// Compressed pointers are 32-bit values that look like valid heap offsets
+/// but fall outside the normal user-mode address range when used directly.
+/// @param addr - Address value (string, number, or BigInt)
+/// @returns true if address looks like a compressed pointer
+function isLikelyCompressedPointer(addr) {
+    if (!addr) return false;
+    var addrBig = 0n;
+    try {
+        addrBig = MemoryUtils.parseBigInt(addr);
+    } catch (e) { return false; }
+
+    // Null or zero is not a compressed pointer
+    if (addrBig === 0n) return false;
+
+    // Compressed pointers are typically 32-bit values in the range ~0x00010000 to ~0xFFFFFFFF
+    // They are NOT valid 64-bit user-mode addresses (which are typically > 0x7FF000000000)
+    // Key heuristic: If the value fits in 32 bits and is above MIN_VALID_VTABLE_ADDR
+    // but below the typical cage base start, it's likely compressed
+    const MAX_COMPRESSED = BigInt("0xFFFFFFFF");
+    const MIN_HEAP_OFFSET = BigInt(MIN_VALID_VTABLE_ADDR); // 0x10000
+
+    // If address is in the 32-bit range (excluding low invalid addresses)
+    // and NOT a valid 64-bit user-mode pointer, it's likely compressed
+    if (addrBig >= MIN_HEAP_OFFSET && addrBig <= MAX_COMPRESSED) {
+        // Check if it could be a valid 64-bit address (unlikely for compressed ptrs)
+        // Valid user-mode 64-bit addresses are typically > 0x10000000000 on Windows
+        return !isValidUserModePointer(addrBig);
+    }
+    return false;
+}
+
+/// Helper: Attempt to decompress an address if it looks like a compressed pointer
+/// Returns the decompressed address or the original address if not compressed.
+/// @param addr - Address to potentially decompress
+/// @param contextAddr - Optional context address for cage base derivation
+/// @returns Normalized hex address string (with 0x prefix)
+function tryDecompressAddress(addr, contextAddr) {
+    var normalized = normalizeAddress(addr);
+    if (!normalized) return null;
+
+    var addrBig = 0n;
+    try {
+        addrBig = MemoryUtils.parseBigInt(normalized);
+    } catch (e) { return normalized; }
+
+    // If already a valid full pointer, return as-is
+    if (isValidUserModePointer(addrBig)) {
+        return normalized;
+    }
+
+    // Check if this looks like a compressed pointer
+    if (isLikelyCompressedPointer(addrBig)) {
+        // Try to decompress using CppGC decompression
+        var decompressed = MemoryUtils.decompressCppgcPtr(addrBig, contextAddr);
+        if (decompressed && decompressed !== "0") {
+            var decompressedBig = BigInt("0x" + decompressed);
+            if (isValidUserModePointer(decompressedBig)) {
+                return "0x" + decompressed;
+            }
+        }
+    }
+
+    // Return original if decompression failed or not needed
+    return normalized;
+}
+
 /// Helper: Check if memory address is writable
 /// @param addr - Address to check (host.Int64 or hex string)
 /// @returns true if PAGE_READWRITE or PAGE_WRITECOPY
@@ -1240,7 +1311,11 @@ function extractPointeeType(typeStr) {
 /// @param memberName - Member name to read
 /// @returns Compressed pointer value or null
 function getCompressedMember(baseAddr, typeCast, memberName) {
-    var baseBig = MemoryUtils.parseBigInt(baseAddr);
+    // Auto-decompress the base address if it's a compressed pointer
+    var decompressedAddr = tryDecompressAddress(baseAddr);
+    if (!decompressedAddr) return null;
+
+    var baseBig = MemoryUtils.parseBigInt(decompressedAddr);
     if (baseBig === 0n) return null;
 
     // 1. Try Offset Cache
@@ -1645,7 +1720,7 @@ class BlinkUnwrap {
     /// @param memberPath - Member name or path (e.g., "node_flags_" or "element_data_.ptr_")
     /// @returns Object with {value, type, raw} or null if failed
     static getCppMember(objectAddr, typeCast, memberPath) {
-        var objHex = normalizeAddress(objectAddr);
+        var objHex = tryDecompressAddress(objectAddr);
         if (!objHex) return null;
 
         var ctl = SymbolUtils.getControl();
@@ -1725,7 +1800,7 @@ class BlinkUnwrap {
     /// @param value - Value to write (number or hex string)
     /// @returns true if successful
     static setCppMember(objectAddr, typeCast, memberPath, value) {
-        var objHex = normalizeAddress(objectAddr);
+        var objHex = tryDecompressAddress(objectAddr);
         if (!objHex) return false;
 
         var ctl = SymbolUtils.getControl();
@@ -1843,7 +1918,7 @@ class BlinkUnwrap {
     /// @param typeCast - Type cast string, e.g. "(blink::Element*)"
     /// @returns Array of {name, value, type} objects
     static getCppMembers(objectAddr, typeCast) {
-        var objHex = normalizeAddress(objectAddr);
+        var objHex = tryDecompressAddress(objectAddr);
         if (!objHex) return [];
 
         var ctl = SymbolUtils.getControl();
@@ -1915,7 +1990,7 @@ class BlinkUnwrap {
     /// Inspect an address and return structured information (Type, String, Pointer, etc.)
     static inspect(addr, options) {
         options = options || {};
-        var objHex = normalizeAddress(addr);
+        var objHex = tryDecompressAddress(addr);
         if (!objHex) return null;
         var addrBig = MemoryUtils.parseBigInt(objHex);
         var debug = options.debug === true;
@@ -1981,7 +2056,7 @@ class BlinkUnwrap {
     /// Detect the type of a Blink object using its vtable
     /// Supports backward scanning to detect embedded struct types.
     static detectType(objectAddr, debug, noScan) {
-        var objHex = normalizeAddress(objectAddr);
+        var objHex = tryDecompressAddress(objectAddr);
         if (!objHex) return null;
 
         try {
@@ -2089,7 +2164,7 @@ class BlinkUnwrap {
     /// @param memberPath - Member name
     /// @returns Decompressed pointer address string or null
     static getMemberPointer(objectAddr, typeCast, memberPath) {
-        var objHex = normalizeAddress(objectAddr);
+        var objHex = tryDecompressAddress(objectAddr);
         if (!objHex) return null;
         var baseBig = MemoryUtils.parseBigInt(objHex);
 
@@ -2824,7 +2899,7 @@ function frame_setattr(objectAddr, memberName, value, typeHint) {
         return "";
     }
 
-    var objHex = normalizeAddress(objectAddr);
+    var objHex = tryDecompressAddress(objectAddr);
     var member = memberName.replace(/"/g, "");
     var newValue = value ? value.replace(/"/g, "") : "";
     var typeHintStr = typeHint || null;
@@ -3157,7 +3232,7 @@ function frame_getattr(objectAddr, memberName, typeHint) {
         return "";
     }
 
-    var objHex = normalizeAddress(objectAddr);
+    var objHex = tryDecompressAddress(objectAddr);
     var member = memberName.replace(/"/g, "");
     var typeHintStr = typeHint || null;
 
@@ -3217,13 +3292,33 @@ function frame_attrs(objectAddr, debug, typeHint) {
         return "";
     }
 
-    var objHex = normalizeAddress(objectAddr);
     var enableDebug = debug === true || debug === "true";
     var typeHintStr = typeHint || null;
-    var addrBig = 0n;
-    try { addrBig = BigInt(objHex); } catch (e) { }
 
-    Logger.section("Object Attributes & Members: " + objHex);
+    // Auto-decompress compressed pointers before any memory operations
+    var originalAddr = normalizeAddress(objectAddr);
+    var objHex = tryDecompressAddress(objectAddr);
+
+    // Report if decompression occurred
+    if (objHex !== originalAddr) {
+        Logger.section("Object Attributes & Members: " + objHex);
+        Logger.info("[Decompressed] " + originalAddr + " -> " + objHex);
+        Logger.empty();
+    } else {
+        Logger.section("Object Attributes & Members: " + objHex);
+    }
+
+    // Check if address is still invalid after decompression attempt
+    var addrBig = 0n;
+    try { addrBig = MemoryUtils.parseBigInt(objHex); } catch (e) { }
+
+    if (!isValidUserModePointer(addrBig) && addrBig !== 0n) {
+        Logger.error("Address " + objHex + " appears to be a compressed pointer that could not be decompressed.");
+        Logger.info("This may happen if the CppGC cage base is not yet available.");
+        Logger.info("Try: !v8_cage to check cage bases, or provide a full 64-bit address.");
+        Logger.empty();
+        return "";
+    }
 
     // 1. Try DOM attributes (only works for Elements)
     var attrs = [];
@@ -3298,7 +3393,15 @@ function frame_attrs(objectAddr, debug, typeHint) {
                             } else if (ptrValBig === 0n) {
                                 Logger.info("  " + m.name + " = null  !frame_getattr(" + objHex + ", \"" + m.name + "\", \"" + typeCast + "\")");
                             } else {
-                                Logger.info("  " + m.name + " -> " + memberAddr + "  !frame_attrs(" + memberAddr + ", false, \"" + memberTypeHint + "\")");
+                                // Try to decompress using parent object as context for cage base
+                                var decompressed = MemoryUtils.decompressCppgcPtr(ptrValBig, objHex);
+                                if (decompressed && decompressed !== "0") {
+                                    var decompAddr = "0x" + decompressed;
+                                    Logger.info("  " + m.name + " -> " + decompAddr + "  !frame_attrs(" + decompAddr + ", false, \"" + memberTypeHint + "\")");
+                                } else {
+                                    // Fallback: show original value with warning
+                                    Logger.info("  " + m.name + " -> 0x" + ptrValBig.toString(16) + " (compressed?)  !frame_getattr(" + objHex + ", \"" + m.name + "\", \"" + typeCast + "\")");
+                                }
                             }
                         } catch (e) {
                             Logger.info("  " + m.name + " -> " + memberAddr + "  !frame_attrs(" + memberAddr + ", false, \"" + memberTypeHint + "\")");
