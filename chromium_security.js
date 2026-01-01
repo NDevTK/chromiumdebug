@@ -84,12 +84,6 @@ function normalizeTypeHint(typeName) {
     if (clean.startsWith("(") && clean.endsWith(")")) {
         return clean;
     }
-
-    // Common primitive types that shouldn't be cast as pointers for chaining
-    if (clean === "String" || clean === "bool" || clean === "int" || clean === "long" || clean === "short" || clean === "char") {
-        return clean;
-    }
-
     // Already has pointer suffix, just wrap in parens
     if (clean.endsWith("*")) {
         return "(" + clean + ")";
@@ -1388,6 +1382,9 @@ function getCompressedMember(baseAddr, typeCast, memberName) {
 }
 
 /// Helper: Read URL string from dx output for a url_.string_ member
+/// @param addr - Address of the object containing url_
+/// @param typeCast - Type cast string, e.g. "(blink::DocumentLoader*)"
+/// @returns URL string or null
 function readUrlStringFromDx(addr, typeCast) {
     try {
         var ctl = SymbolUtils.getControl();
@@ -2058,7 +2055,7 @@ class BlinkUnwrap {
                 }
             } else if (high32 === 0 && low32 !== 0) {
                 // Potential compressed pointer
-                var cppgcPtr = MemoryUtils.decompressCppgcPtr(low32, objHex, objHex); // Pass objHex as context
+                var cppgcPtr = MemoryUtils.decompressCppgcPtr(low32, objHex);
                 if (cppgcPtr && cppgcPtr !== "0") {
                     result.isPointer = true;
                     result.pointerTarget = "0x" + cppgcPtr;
@@ -2099,7 +2096,7 @@ class BlinkUnwrap {
                     // Handle both ::vftable and ::`vftable' formats
                     var matchVftable = symName.match(/!([a-zA-Z0-9_:]+)::(?:`vftable'|vftable)/);
                     if (matchVftable) {
-                        var className = cleanType(matchVftable[1]);
+                        var className = matchVftable[1];
                         if (debug) Logger.info("  [Debug] Detected Type (Std): " + className);
                         resultType = "(" + className + "*)";
                     }
@@ -2123,7 +2120,7 @@ class BlinkUnwrap {
                     if (!resultType) {
                         var matchFallback = symName.match(/!([a-zA-Z_][a-zA-Z0-9_:]*)::/)
                         if (matchFallback) {
-                            var className = cleanType(matchFallback[1]);
+                            var className = matchFallback[1];
                             if (debug) Logger.info("  [Debug] Detected Type (Fallback): " + className);
                             resultType = "(" + className + "*)";
                         }
@@ -3678,6 +3675,20 @@ class Exec {
         return bytes;
     }
 
+    /// Helper: Normalize a type string to pointer hint format for chaining
+    /// e.g., "blink::KURL" -> "(blink::KURL*)", "String" -> "String" (already simple)
+    static _normalizeTypeHint(type) {
+        if (!type) return null;
+        // Already a hint format or simple type
+        if (type.startsWith("(") || type === "String" || type === "bool" || type === "int") {
+            return type;
+        }
+        // Class/struct types need pointer format for chaining
+        if (!type.endsWith("*") && (type.includes("::") || /^[A-Z]/.test(type))) {
+            return "(" + type + "*)";
+        }
+        return type;
+    }
 
     /// Helper: Detect return type from member offset using dt command
     /// For inlined getters like "ADD rcx, 0x138", finds the member at that offset
@@ -3706,7 +3717,9 @@ class Exec {
                     var memberName = m[1];
                     var memberType = m[2].trim();
                     Logger.info("    [Type Detection] dt offset 0x" + offsetHex.toUpperCase() + " -> " + memberName + " : " + memberType);
-                    return normalizeTypeHint(memberType);
+                    // Clean up type (remove template noise if simple type)
+                    var simpleType = memberType.split("<")[0].trim();
+                    return this._normalizeTypeHint(simpleType);
                 }
             }
         } catch (e) { }
@@ -3797,6 +3810,8 @@ class Exec {
 
         for (var i = 0; i < calls.length; i++) {
             var call = calls[i];
+            Logger.info("  [Chain " + (i + 1) + "/" + calls.length + "] " + call);
+
             try {
                 result = this._execSingle(call, currentThis, prevHint);
                 prevHint = this.currentReturnTypeHint;
@@ -3844,7 +3859,7 @@ class Exec {
             Logger.info("    [Auto-This] Attempting resolution from pinned context: " + this._forcedContext);
             var detected = BlinkUnwrap.detectType(this._forcedContext);
             if (detected) {
-                var detectedName = cleanType(detected);
+                var detectedName = detected.replace(/[()*]/g, "").trim();
                 // Exact match
                 if (detectedName === className) {
                     Logger.info("    [Auto-This] Pinned context matches " + className + ": " + this._forcedContext);
@@ -4095,7 +4110,7 @@ class Exec {
             }
 
             if (detectedType) {
-                var className = cleanType(detectedType);
+                var className = detectedType.replace(/[()*&]/g, "").trim();
                 targetSymbol = className + "::" + namePart;
                 Logger.info("    [Chain Auto-Detect] " + thisOverride + " -> " + targetSymbol);
             } else {
@@ -4128,7 +4143,7 @@ class Exec {
         var detectedReturnType = SymbolUtils.getReturnType(targetSymbol);
         if (detectedReturnType) {
             Logger.info("    [Type Detection] Programmatically detected: " + detectedReturnType);
-            this.currentReturnTypeHint = normalizeTypeHint(detectedReturnType);
+            this.currentReturnTypeHint = this._normalizeTypeHint(detectedReturnType);
         }
 
         if (!this.currentReturnTypeHint) {
@@ -4195,7 +4210,7 @@ class Exec {
                 var inlinedSymbol = bestCandidate.foundClass + "::" + bestCandidate.foundMethod;
                 var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
                 if (inlinedReturnType) {
-                    this.currentReturnTypeHint = normalizeTypeHint(inlinedReturnType);
+                    this.currentReturnTypeHint = this._normalizeTypeHint(inlinedReturnType);
                     if (this.currentReturnTypeHint) {
                         Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
                     }
@@ -4463,7 +4478,7 @@ class Exec {
             if (!originalType) return thisPtr;
 
             // Format: (chrome!blink::LocalDOMWindow*) -> blink::LocalDOMWindow
-            var originalClass = cleanType(originalType);
+            var originalClass = originalType.replace(/[()*]/g, "").trim().replace(/^chrome!/, "");
 
             // 2. Extract Target Class from Symbol
             // format: chrome!blink::ExecutionContext::GetSecurityOrigin
@@ -4674,7 +4689,7 @@ class Exec {
                 var inlinedReturnType = cand.returnType || SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
                 if (inlinedReturnType) {
                     // Normalize to pointer hint for chaining
-                    this.currentReturnTypeHint = normalizeTypeHint(inlinedReturnType);
+                    this.currentReturnTypeHint = this._normalizeTypeHint(inlinedReturnType);
                     Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
                 }
 
