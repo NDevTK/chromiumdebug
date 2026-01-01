@@ -1462,34 +1462,12 @@ function _validateStringImplHeader(dataAddr, searchStr, logFailures) {
                 if (i + 4 < bytes.length) {
                     var flags = bytes[i + 4];
 
-                    // 1. Must be 8-bit
-                    if ((flags & kIs8Bit) !== kIs8Bit) {
-                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Flags not 8-bit.");
-                        continue;
-                    }
 
-                    // 2. Reject Static Strings (avoid modifying constants/RO memory)
-                    if ((flags & kIsStatic) === kIsStatic) {
-                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Static String.");
-                        continue;
-                    }
 
                     // 3. Reject Atomic Strings (avoid corrupting AtomicStringTable)
                     if ((flags & kIsAtomic) === kIsAtomic) {
                         if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Atomic String.");
                         continue;
-                    }
-
-                    // 2. Validate ASCII flags if applicable
-                    if (isAscii) {
-                        if ((flags & kContainsOnlyAscii) !== kContainsOnlyAscii) {
-                            if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Missing kContainsOnlyAscii flag.");
-                            continue;
-                        }
-                        if (isLower && (flags & kIsLowerAscii) !== kIsLowerAscii) {
-                            if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Missing kIsLowerAscii flag.");
-                            continue;
-                        }
                     }
                 }
 
