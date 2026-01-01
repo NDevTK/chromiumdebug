@@ -518,36 +518,62 @@ class SymbolUtils {
 
 
 
-    /// Get symbol name for a given address (using ln)
-    static getSymbolName(subsysAddr, debug) {
+    /// Get symbol name for a given address (using ln /i for inline function support)
+    /// @param subsysAddr - Address to resolve
+    /// @param debug - Enable debug logging
+    /// @param includeInline - If true, use ln /i to resolve S_INLINESITE entries (default: true)
+    static getSymbolName(subsysAddr, debug, includeInline) {
         var hexAddr = normalizeAddress(subsysAddr);
         if (!hexAddr) return null;
+
+        // Default includeInline to true for better inline function resolution
+        if (includeInline === undefined) includeInline = true;
 
         var cached = ProcessCache.getSymbolName(hexAddr);
         if (cached) return cached;
 
         try {
-            // Use ln (list nearest) to get symbol
-            var cmd = "ln " + hexAddr;
+            // Use ln /i (list nearest with inline info) to resolve S_INLINESITE entries
+            // This is the WinDbg equivalent of resolving inline function call sites
+            var cmd = includeInline ? "ln /i " + hexAddr : "ln " + hexAddr;
             if (debug) Logger.info("  [Debug] Running: " + cmd);
 
             var output = this.getControl().ExecuteCommand(cmd);
+            var inlinedSymbol = null;
+            var outerSymbol = null;
+
             for (var line of output) {
                 var lineStr = line.toString();
                 if (debug) Logger.info("  [Debug] ln output: " + lineStr);
+
+                // Check for inlined function line first (takes precedence)
+                // Format: "   Inlined function: chrome!blink::SomeClass::SomeMethod (00007ff`12345680 - ...)"
+                // Use non-greedy match to capture symbol name before the address (starts with hex in parens)
+                var inlineMatch = lineStr.match(/Inlined function:\s+(.+?)\s+\([0-9a-fA-F]/);
+                if (inlineMatch) {
+                    inlinedSymbol = inlineMatch[1].trim();
+                    if (debug) Logger.info("  [Debug] Matched inlined symbol: " + inlinedSymbol);
+                    continue;
+                }
 
                 // Format: (00007ffc`12345678)   module!SymbolName   |  (0000...) ...
                 // or:     (00007ffc`12345678)   module!SymbolName
                 // Match the symbol name part, allowing . ? @ $ which appear in mangled names
                 var match = lineStr.match(/\)\s+([a-zA-Z0-9_!:.?@$]+)/);
-                if (match) {
-                    if (debug) Logger.info("  [Debug] Matched symbol: " + match[1]);
-                    ProcessCache.setSymbolName(hexAddr, match[1]);
-                    return match[1];
+                if (match && !outerSymbol) {
+                    outerSymbol = match[1];
+                    if (debug) Logger.info("  [Debug] Matched outer symbol: " + outerSymbol);
                 }
             }
+
+            // Prefer inlined symbol over outer symbol when available
+            var resultSymbol = inlinedSymbol || outerSymbol;
+            if (resultSymbol) {
+                ProcessCache.setSymbolName(hexAddr, resultSymbol);
+                return resultSymbol;
+            }
         } catch (e) {
-            if (debug) Logger.info("  [Debug] ln failed: " + e.message);
+            if (debug) Logger.info("  [Debug] ln /i failed: " + e.message);
         }
         return null;
     }
@@ -3709,44 +3735,151 @@ class Exec {
         // If we have a forced context pinned, try to use it
         if (this._forcedContext) {
             Logger.info("    [Auto-This] Attempting resolution from pinned context: " + this._forcedContext);
-            // We can't easily resolve from a raw address without a type normally, 
-            // but for common classes we can try to cast the forced context itself.
             var detected = BlinkUnwrap.detectType(this._forcedContext);
             if (detected) {
                 var detectedName = detected.replace(/[()*]/g, "").trim();
+                // Exact match
                 if (detectedName === className) {
                     Logger.info("    [Auto-This] Pinned context matches " + className + ": " + this._forcedContext);
+                    return this._forcedContext;
+                }
+                // Check if pinned context could be cast to requested class (base class match)
+                // e.g., if pinned is Document and we want Node, Document IS-A Node
+                if (this._isSubclassOf(detectedName, className)) {
+                    Logger.info("    [Auto-This] Pinned context " + detectedName + " is subclass of " + className);
                     return this._forcedContext;
                 }
             }
         }
 
-        // Lookup table: className -> resolver function (takes localFrame, returns instance)
+        // Expanded lookup table: className -> resolver function (takes localFrame, returns instance)
+        // Each resolver returns an address string (hex) or null
         var resolvers = {
+            // Core frame hierarchy
             "blink::LocalFrame": function (lf) { return lf; },
+            "blink::Frame": function (lf) { return lf; }, // LocalFrame IS-A Frame
             "blink::LocalDOMWindow": function (lf) { return BlinkUnwrap.getDomWindow(lf); },
-            "blink::ExecutionContext": function (lf) { return BlinkUnwrap.getDomWindow(lf); }, // LocalDOMWindow is-a ExecutionContext
+            "blink::DOMWindow": function (lf) { return BlinkUnwrap.getDomWindow(lf); }, // LocalDOMWindow IS-A DOMWindow
+            "blink::ExecutionContext": function (lf) { return BlinkUnwrap.getDomWindow(lf); },
+
+            // Document and related
             "blink::Document": function (lf) {
                 var win = BlinkUnwrap.getDomWindow(lf);
                 return win ? BlinkUnwrap.getDocument(win) : null;
+            },
+            "blink::ContainerNode": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                return win ? BlinkUnwrap.getDocument(win) : null; // Document IS-A ContainerNode
+            },
+            "blink::Node": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                return win ? BlinkUnwrap.getDocument(win) : null; // Document IS-A Node
+            },
+            "blink::TreeScope": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                return win ? BlinkUnwrap.getDocument(win) : null; // Document IS-A TreeScope
+            },
+
+            // Security-related (from Document)
+            "blink::SecurityOrigin": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                if (!win) return null;
+                var doc = BlinkUnwrap.getDocument(win);
+                if (!doc) return null;
+                // Try to get SecurityOrigin via ExecutionContext
+                try {
+                    var ctl = SymbolUtils.getControl();
+                    var cmd = "dx ((blink::Document*)0x" + doc + ")->GetExecutionContext()->GetSecurityOrigin()";
+                    var output = ctl.ExecuteCommand(cmd);
+                    for (var line of output) {
+                        var m = line.toString().match(/0x([0-9a-fA-F`]+)/);
+                        if (m) return m[1].replace(/`/g, "");
+                    }
+                } catch (e) { }
+                return null;
+            },
+
+            // URL (from Document)  
+            "blink::KURL": function (lf) {
+                var win = BlinkUnwrap.getDomWindow(lf);
+                if (!win) return null;
+                var doc = BlinkUnwrap.getDocument(win);
+                if (!doc) return null;
+                // Use offset 0x138 for url_ (cached from previous runs)
+                var docBig = MemoryUtils.parseBigInt(doc);
+                var urlAddr = docBig + BigInt(0x138);
+                return "0x" + urlAddr.toString(16); // Must have 0x prefix for thisPtr processing
             }
         };
 
+        // Try exact match first
         var resolver = resolvers[className];
-        if (!resolver) return null;
+
+        // Base class fallback: try known parent classes
+        if (!resolver) {
+            var classHierarchy = {
+                // Map subclasses to their resolvable parent
+                "blink::HTMLDocument": "blink::Document",
+                "blink::XMLDocument": "blink::Document",
+                "blink::HTMLBodyElement": "blink::Document",  // Can't get element directly, fall back to document
+                "blink::HTMLElement": "blink::Document",
+                "blink::Element": "blink::Document",
+                "blink::CharacterData": "blink::Document",
+                "blink::Text": "blink::Document",
+                "blink::DocumentLoader": "blink::LocalFrame",
+                "blink::FrameLoader": "blink::LocalFrame",
+                "blink::ScriptState": "blink::LocalDOMWindow",
+                "blink::LocalWindowProxy": "blink::LocalDOMWindow"
+            };
+
+            var fallbackClass = classHierarchy[className];
+            if (fallbackClass && resolvers[fallbackClass]) {
+                Logger.info("    [Auto-This] Using " + fallbackClass + " as fallback for " + className);
+                resolver = resolvers[fallbackClass];
+            }
+        }
+
+        if (!resolver) {
+            Logger.debug("    [Auto-This] No resolver for class: " + className);
+            return null;
+        }
 
         // Get LocalFrame for requested frame index
         var frame = _getFrameByIndex(frameIndex);
-        if (!frame) return null;
+        if (!frame) {
+            Logger.debug("    [Auto-This] No frame at index " + frameIndex);
+            return null;
+        }
 
         var localFrame = BlinkUnwrap.getLocalFrame(frame.webFrame);
-        if (!localFrame) return null;
+        if (!localFrame) {
+            Logger.debug("    [Auto-This] Could not get LocalFrame from WebLocalFrameImpl");
+            return null;
+        }
 
         var result = resolver(localFrame);
         if (result) {
-            Logger.info("    [Auto-This] Using " + className + " from Frame " + frameIndex + ": 0x" + result);
+            // Normalize result to have 0x prefix for logging (some resolvers return with, some without)
+            var logResult = result.toString().startsWith("0x") ? result : "0x" + result;
+            Logger.info("    [Auto-This] Using " + className + " from Frame " + frameIndex + ": " + logResult);
         }
         return result;
+    }
+
+    /// Helper: Check if subClass inherits from parentClass (simplified Blink hierarchy)
+    static _isSubclassOf(subClass, parentClass) {
+        // Simplified inheritance map for common Blink classes
+        var inheritance = {
+            "blink::Document": ["blink::ContainerNode", "blink::Node", "blink::TreeScope", "blink::ExecutionContext"],
+            "blink::HTMLDocument": ["blink::Document", "blink::ContainerNode", "blink::Node"],
+            "blink::LocalDOMWindow": ["blink::DOMWindow", "blink::ExecutionContext", "blink::EventTarget"],
+            "blink::LocalFrame": ["blink::Frame"],
+            "blink::HTMLElement": ["blink::Element", "blink::ContainerNode", "blink::Node"],
+            "blink::Element": ["blink::ContainerNode", "blink::Node"]
+        };
+
+        var parents = inheritance[subClass];
+        return parents && parents.indexOf(parentClass) !== -1;
     }
 
     /// Execute a single call expression, optionally with a 'this' pointer override
@@ -3826,6 +3959,10 @@ class Exec {
             }
 
             if (className) {
+                // Strip module prefix (e.g., "chrome!blink::Document" -> "blink::Document")
+                if (className.includes("!")) {
+                    className = className.split("!")[1];
+                }
                 // Try to resolve a default instance for this class
                 var autoThis = this._resolveAutoThis(className);
                 if (autoThis) {
@@ -4211,7 +4348,7 @@ class Exec {
     }
 
     /// Helper: Adjust 'this' pointer for multiple inheritance
-    /// Casts the pointer to the target class type to let the compiler/debugger handle offset adjustment
+    /// Uses dx to cast pointer - dx understands C++ semantics and adjusts for base class offsets
     static _adjustThisPointer(thisPtr, targetSymbol) {
         try {
             // 1. Detect Original Type
@@ -4231,24 +4368,37 @@ class Exec {
             // 3. Compare (if same, no adjustment needed)
             if (originalClass === targetClass) return thisPtr;
 
-            // 4. Perform Cast via dx
-            // &((chrome!TargetClass*)((chrome!OriginalClass*)0xPtr))
-            var castExpr = "&((" + "chrome!" + targetClass + "*)(" + "chrome!" + originalClass + "*)" + thisPtr + ")";
+            // 4. Perform Cast via dx (NOT '?' which doesn't handle C++ inheritance)
+            // dx understands C++ semantics and will adjust pointer for multiple inheritance
+            // Format: (TargetClass*)(OriginalClass*)ptr - dx returns adjusted address
+            var ctl = SymbolUtils.getControl();
+            var castExpr = "dx (chrome!" + targetClass + "*)((chrome!" + originalClass + "*)" + thisPtr + ")";
 
-            // Use evaluate which uses '?' command
-            var adjustedPtr = SymbolUtils.evaluate(castExpr);
+            try {
+                var output = ctl.ExecuteCommand(castExpr);
+                for (var line of output) {
+                    // dx output: (chrome!blink::ExecutionContext *) : 0x1234...
+                    var m = line.toString().match(/:\s*(0x[0-9a-fA-F`]+)/);
+                    if (m) {
+                        var adjustedPtr = m[1].replace(/`/g, "");
 
-            if (adjustedPtr && adjustedPtr !== thisPtr) {
-                // Formatting for log
-                var diff = BigInt("0x" + adjustedPtr) - BigInt(thisPtr.startsWith("0x") ? thisPtr : "0x" + thisPtr);
-                var sign = diff >= 0n ? "+" : "";
+                        if (adjustedPtr !== thisPtr && adjustedPtr !== "0x0") {
+                            var thisBig = MemoryUtils.parseBigInt(thisPtr);
+                            var adjBig = MemoryUtils.parseBigInt(adjustedPtr);
+                            var diff = adjBig - thisBig;
+                            var sign = diff >= 0n ? "+" : "";
 
-                Logger.info("    [Multi-Inheritance] Adjusted 'this': " + thisPtr + " -> " + adjustedPtr +
-                    " (Offset: " + sign + diff.toString(16) + ")");
-                return adjustedPtr;
+                            Logger.info("    [Multi-Inheritance] Adjusted 'this': " + thisPtr + " -> " + adjustedPtr +
+                                " (Offset: " + sign + diff.toString(16) + ")");
+                            return adjustedPtr;
+                        }
+                    }
+                }
+            } catch (e) {
+                Logger.debug("    [Multi-Inheritance] dx cast failed: " + e.message);
             }
         } catch (e) {
-            // Fail silently and return original, simpler is safer on error
+            // Fail silently and return original
         }
         return thisPtr;
     }
@@ -4304,6 +4454,26 @@ class Exec {
 
                 if (symbols) {
                     for (var sym of symbols) {
+                        // Skip template instantiations when using broad wildcard (pattern 3)
+                        // These often match wrong methods like sync_pb::EstimateMemoryUsage<sync_pb::Url
+                        if (pattern === "chrome!*::" + methodName && sym.name.indexOf("<") !== -1) {
+                            Logger.debug("    [PDB] Skipping template: " + sym.name);
+                            continue;
+                        }
+
+                        // Skip unrelated namespaces when using broad wildcard (pattern 3)
+                        // Only accept blink::, content::, WTF::, base::, or the exact className namespace
+                        if (pattern === "chrome!*::" + methodName) {
+                            var symClean = sym.name.replace(/^chrome!/, "");
+                            var targetNs = className.split("::")[0]; // e.g., "blink" from "blink::Document"
+                            var allowedNs = ["blink", "content", "WTF", "base", targetNs];
+                            var symNs = symClean.split("::")[0];
+                            if (allowedNs.indexOf(symNs) === -1) {
+                                Logger.debug("    [PDB] Skipping unrelated namespace: " + symNs);
+                                continue;
+                            }
+                        }
+
                         // Look for non-inlined function (prv func) - only for exact matches
                         if (isExactMatch && sym.type === "func") {
                             exactFuncAddr = sym.address;
@@ -4321,7 +4491,6 @@ class Exec {
                                 inlineCandidates.push({
                                     addr: sym.address,
                                     size: sym.size,
-                                    foundClass: foundClass,
                                     foundClass: foundClass,
                                     foundMethod: methodName,
                                     returnType: sym.returnType // Capture return type from symbol
@@ -5907,8 +6076,12 @@ class Exec {
         // movsd [rbx + 8], xmm0  (F2 0F 11 43 08)
         code.push(0xF2, 0x0F, 0x11, 0x43, 0x08);
 
-        // mov [rbx], rax
+        // mov [rbx], rax - save primary result
         code.push(0x48, 0x89, 0x03);
+
+        // mov [rbx + 16], rdx - save RDX for small struct returns (RAX:RDX pairs like StringView)
+        // Encoding: 48 89 53 10 = mov [rbx+0x10], rdx
+        code.push(0x48, 0x89, 0x53, 0x10);
 
         // Clean Stack (epilogue)
         if (totalStack < 128) {
@@ -5976,7 +6149,86 @@ class Exec {
             var structAddrHex = "0x" + structReturnAddr.toString(16);
             Logger.info("  [Struct Return] Reading result from buffer: " + structAddrHex);
 
-            // For String types, use BlinkUnwrap.readString (reuses existing robust logic)
+            // For StringView: can be returned in RAX:RDX or written to hidden buffer
+            if (returnType.includes("StringView")) {
+                Logger.info("  [StringView] Detected StringView return type");
+                try {
+                    // Read saved RAX from baseAddr (offset 0)
+                    var savedVals = host.memory.readMemoryValues(host.parseInt64(baseAddrHex, 16), 1, 8);
+                    var raxVal = BigInt(savedVals[0]);
+
+                    var dataPtr, length, is8Bit;
+
+                    // Check if function used hidden pointer convention (RAX = buffer address)
+                    if (raxVal === structReturnAddr) {
+                        // Hidden pointer return: struct is written to buffer
+                        // StringView layout (from Chromium source):
+                        //   offset 0:  StringImpl* impl_  (8 bytes) - used for is_8bit flag
+                        //   offset 8:  void* bytes_       (8 bytes) - actual data pointer
+                        //   offset 16: unsigned length_   (4 bytes) - string length
+                        Logger.info("  [StringView] Using hidden pointer buffer");
+
+                        // Read all values from struct buffer
+                        var structData = host.memory.readMemoryValues(host.parseInt64(structAddrHex, 16), 3, 8);
+                        var implPtr = BigInt(structData[0]);    // offset 0: impl_
+                        dataPtr = BigInt(structData[1]);        // offset 8: bytes_
+
+                        // Read length at offset 16 (4 bytes)
+                        var lengthData = host.memory.readMemoryValues(host.parseInt64((structReturnAddr + 16n).toString(16), 16), 1, 4);
+                        length = lengthData[0];
+
+                        // Check is_8bit from impl_ if it's valid (impl_->Is8Bit())
+                        // For simplicity, try reading a byte near impl_ or assume 8-bit for ASCII hostnames
+                        is8Bit = true; // Default assumption for URL components
+                        if (implPtr > 0x10000n) {
+                            // StringImpl has method Is8Bit() - it stores a flag
+                            // The is_8bit flag is typically at a fixed offset in StringImpl
+                            // For now, we'll assume 8-bit for URL host (ASCII)
+                            try {
+                                // Try to infer from impl_ - but this is complex, default to 8-bit
+                                Logger.debug("  [StringView] impl_=0x" + implPtr.toString(16));
+                            } catch (e) { }
+                        }
+                    } else {
+                        // RAX:RDX register return: RAX = data ptr, RDX = length+flags
+                        dataPtr = raxVal;
+                        var rdxVals = host.memory.readMemoryValues(host.parseInt64((baseAddrHex.replace("0x", "") + 16).toString(16), 16), 1, 8);
+                        var rdxVal = BigInt(rdxVals[0]);
+                        length = Number(rdxVal & 0xFFFFFFFFn);
+                        var flags = Number((rdxVal >> 32n) & 0xFFFFFFFFn);
+                        is8Bit = (flags & 1) !== 0;
+                    }
+
+                    Logger.info("  [StringView] data=0x" + dataPtr.toString(16) + " len=" + length + " is8bit=" + is8Bit);
+
+                    if (dataPtr > 0x10000n && length > 0 && length < 10000) {
+                        var strResult = "";
+                        if (is8Bit) {
+                            var chars = host.memory.readMemoryValues(host.parseInt64(dataPtr.toString(16), 16), length, 1);
+                            for (var i = 0; i < chars.length; i++) {
+                                strResult += String.fromCharCode(chars[i]);
+                            }
+                        } else {
+                            var chars = host.memory.readMemoryValues(host.parseInt64(dataPtr.toString(16), 16), length, 2);
+                            for (var i = 0; i < chars.length; i++) {
+                                strResult += String.fromCharCode(chars[i]);
+                            }
+                        }
+                        Logger.info("  [StringView] Result: " + strResult);
+                        if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
+                        return strResult;
+                    } else if (length === 0) {
+                        Logger.info("  [StringView] Empty string");
+                        if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
+                        return "";
+                    }
+                    Logger.warn("  [StringView] Invalid data or length");
+                } catch (e) {
+                    Logger.warn("  [StringView] Read failed: " + e.message);
+                }
+            }
+
+            // For String/KURL types, try BlinkUnwrap.readString
             if (returnType.includes("String") || returnType.includes("KURL") || returnType.includes("AtomicString")) {
                 try {
                     var strResult = BlinkUnwrap.readString(structAddrHex);
@@ -5985,20 +6237,10 @@ class Exec {
                         if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
                         return strResult;
                     }
-                    Logger.warn("  [Struct Return] readString returned empty/null, dumping buffer...");
+                    Logger.warn("  [Struct Return] readString returned empty/null");
                 } catch (e) {
                     Logger.warn("  [Struct Return] String read failed: " + e.message);
                 }
-
-                // Debug: Dump struct buffer contents for diagnosis
-                try {
-                    var bufferVals = host.memory.readMemoryValues(host.parseInt64(structAddrHex, 16), 4, 8);
-                    Logger.info("  [Struct Return] Buffer[0-3]: " +
-                        "0x" + BigInt(bufferVals[0]).toString(16) + ", " +
-                        "0x" + BigInt(bufferVals[1]).toString(16) + ", " +
-                        "0x" + BigInt(bufferVals[2]).toString(16) + ", " +
-                        "0x" + BigInt(bufferVals[3]).toString(16));
-                } catch (e) { }
             }
 
             // Fallback: return buffer address for other struct types
