@@ -1464,14 +1464,14 @@ function _validateStringImplHeader(dataAddr, searchStr, logFailures) {
 
 
 
-                    // 3. Reject Atomic Strings (avoid corrupting AtomicStringTable)
+                    // 1. Reject Atomic Strings (avoid corrupting AtomicStringTable)
                     if ((flags & kIsAtomic) === kIsAtomic) {
                         if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Atomic String.");
                         continue;
                     }
                 }
 
-                // 3. Check RefCount at -12 (Data - 12)
+                // 2. Check RefCount at -12 (Data - 12)
                 if (i - 4 >= 0) {
                     var refCount = bytes[i - 4] | (bytes[i - 3] << 8) | (bytes[i - 2] << 16) | (bytes[i - 1] << 24);
                     if (refCount === 0) {
