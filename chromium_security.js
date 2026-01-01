@@ -568,22 +568,6 @@ class SymbolUtils {
 
             // Prefer inlined symbol over outer symbol when available
             var resultSymbol = inlinedSymbol || outerSymbol;
-
-            // Fallback: if we didn't match the specific patterns, try a looser match on the last line
-            if (!resultSymbol && output.length > 0) {
-                for (var line of output) {
-                    var lineStr = line.toString();
-                    // Just look for something that looks like a symbol name (contains !)
-                    // e.g. "  (00007ffc`fd386480)   chrome!blink::LocalFrame::`vftable'  |  (00007ffc`fd386620) ..."
-                    var simpleMatch = lineStr.match(/\s+([a-zA-Z0-9_]+![a-zA-Z0-9_:<>\?@$]+)/);
-                    if (simpleMatch) {
-                        resultSymbol = simpleMatch[1];
-                        if (debug) Logger.info("  [Debug] Loose match symbol: " + resultSymbol);
-                        break;
-                    }
-                }
-            }
-
             if (resultSymbol) {
                 ProcessCache.setSymbolName(hexAddr, resultSymbol);
                 return resultSymbol;
@@ -783,38 +767,7 @@ class MemoryUtils {
             return (base | offset).toString(16);
         }
 
-    }
-
-    static compressCppgcPtr(fullPtr, contextAddr) {
-        if (!fullPtr) return 0;
-        var ptrBig = this.parseBigInt(fullPtr);
-        if (ptrBig === 0n) return 0;
-
-        const kPointerCompressionShift = 3n;
-        const kCageBaseMask = BigInt("0xFFFFFFFC00000000");
-
-        var base = 0n;
-        if (contextAddr) {
-            try {
-                var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
-                base = context & kCageBaseMask;
-            } catch (e) { }
-        }
-
-        if (base === 0n) {
-            var cage = this.getCppgcCageBase();
-            if (cage) base = BigInt("0x" + cage);
-        }
-
-        if (base === 0n) return 0; // Cannot compress without base
-
-        // offset = ptr - base
-        // compressed = offset >> shift
-        var offset = ptrBig - base;
-        if (offset < 0n) return 0; // Invalid, outside cage?
-
-        var compressed = offset >> kPointerCompressionShift;
-        return Number(compressed & 0xFFFFFFFFn); // return as number (32-bit)
+        return null;
     }
 
     /// Write bytes to memory
@@ -1856,20 +1809,8 @@ class BlinkUnwrap {
                 return true;
             }
             else if (memberType.indexOf("uint64_t") !== -1 || memberType.indexOf("size_t") !== -1 ||
-                memberType.indexOf("uintptr_t") !== -1 || memberType.indexOf("*") !== -1 ||
-                memberType.indexOf("Member") !== -1 || memberType.indexOf("BasicMember") !== -1) {
-
-                // Check for compressed pointer types
-                if (memberType.indexOf("Member") !== -1 || memberType.indexOf("BasicMember") !== -1) {
-                    var ptrValue = value;
-                    // If value is a string "0x...", parse it
-                    // If value is 0, write 0
-                    var compressed = MemoryUtils.compressCppgcPtr(ptrValue, objHex);
-                    MemoryUtils.writeU32(memberAddr, compressed);
-                    return true;
-                }
-
-                // Normal 64-bit value or pointer
+                memberType.indexOf("uintptr_t") !== -1 || memberType.indexOf("*") !== -1) {
+                // 64-bit value or pointer
                 var numericValue = BigInt(parseIntAuto(value));
                 var writeCmd = "eq " + memberAddr + " " + numericValue.toString(16);
                 ctl.ExecuteCommand(writeCmd);
@@ -2004,8 +1945,7 @@ class BlinkUnwrap {
         // If we have a non-zero value and it's not obviously a string content pointer 
         // (unless it's a Member<String>, but Member<T> is usually handled by dx)
         if (addrBig > 0x10000n && !result.stringValue) {
-            var val64 = 0n;
-
+            var val64 = addrBig;
             var high32 = Number(val64 >> 32n);
             var low32 = Number(val64 & 0xFFFFFFFFn);
 
@@ -2054,30 +1994,7 @@ class BlinkUnwrap {
                     return cached;
                 }
 
-                var symName = null;
-
-                // Try dqs (Dump Quad Symbols) first - usually most reliable for vtables
-                try {
-                    var dqs = SymbolUtils.execute("dqs " + objHex + " L1");
-                    for (var line of dqs) {
-                        // 00000000`00000000  00007ffc`12345678 chrome!blink::LocalFrame::vftable
-                        var dqsMatch = line.toString().match(/\s+[0-9a-fA-F`]+\s+(.+)/);
-                        if (dqsMatch) {
-                            var s = dqsMatch[1].trim();
-                            if (s.indexOf("!") !== -1) {
-                                symName = s;
-                                if (debug) Logger.info("  [Debug] dqs symbol: " + symName);
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) { }
-
-                // Fallback to ln if dqs failed
-                if (!symName) {
-                    symName = SymbolUtils.getSymbolName(vtableHex, debug);
-                }
-
+                var symName = SymbolUtils.getSymbolName(vtableHex, debug);
                 if (symName) {
                     var resultType = null;
 
@@ -2121,32 +2038,6 @@ class BlinkUnwrap {
                         return resultType;
                     }
                 }
-            }
-
-            // Pattern 4: Generic "vftable" suffix check (very robust)
-            // If the symbol ends with "vftable" (with or without backticks), it's likely a vtable.
-            // Extract the part before "::`vftable'" or "::vftable" or "::`vftable"
-            if (!resultType && (symName.indexOf("vftable") !== -1)) {
-                // Remove "chrome!" prefix if present
-                var cleanName = symName.replace(/^[a-zA-Z0-9_]+!/, "");
-
-                // Split by :: and look for vftable part
-                var parts = cleanName.split("::");
-                if (parts.length > 1) {
-                    // Filter out the vftable part
-                    var classParts = parts.filter(p => p.indexOf("vftable") === -1);
-                    if (classParts.length > 0) {
-                        var className = classParts.join("::");
-                        if (debug) Logger.info("  [Debug] Detected Type (Suffix): " + className);
-                        resultType = "(" + className + "*)";
-                    }
-                }
-            }
-
-            // Cache and return result
-            if (resultType) {
-                ProcessCache.setVTableType(vtableHex, resultType);
-                return resultType;
             }
         } catch (e) {
             if (debug) Logger.info("  [Debug] detectType direct check failed: " + e.message);
@@ -3394,18 +3285,8 @@ function frame_attrs(objectAddr, debug, typeHint) {
                     var memberTypeHint = extractPointeeType(m.type);
                     if (memberTypeHint) {
                         try {
-                            var ptrValBig = 0n;
-                            // Check for compressed types (Member, WeakMember, BasicMember)
-                            if (m.type.indexOf("Member") !== -1 || m.type.indexOf("BasicMember") !== -1) {
-                                var compressedVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 4)[0];
-                                var decompressed = MemoryUtils.decompressCppgcPtr(compressedVal, objHex);
-                                if (decompressed) {
-                                    ptrValBig = BigInt("0x" + decompressed);
-                                }
-                            } else {
-                                var ptrVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 8)[0];
-                                ptrValBig = MemoryUtils.parseBigInt(ptrVal);
-                            }
+                            var ptrVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 8)[0];
+                            var ptrValBig = MemoryUtils.parseBigInt(ptrVal);
                             if (ptrValBig !== 0n && isValidUserModePointer(ptrValBig)) {
                                 var targetAddr = "0x" + ptrValBig.toString(16);
                                 Logger.info("  " + m.name + " -> " + targetAddr + "  !frame_attrs(" + targetAddr + ", false, \"" + memberTypeHint + "\")");
@@ -3446,41 +3327,17 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
         if (addrBig === 0n) {
             Logger.info("  [NULL pointer]");
-        } else {
-            // If string was found but no type detected, warning might be needed
-            if (!activeType && inspection.stringValue) {
-                try {
-                    var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
-                    if (vtablePtr.compareTo(0) !== 0) {
-                        var sym = SymbolUtils.getSymbolName(vtablePtr.toString(16));
-                        if (sym) {
-                            Logger.empty();
-                            Logger.warn("  [Auto-Detection Failed] VTable symbol: " + sym);
-                            Logger.warn("  Object looks like a string but has vtable. Try: !frame_attrs(" + objHex + ", false, \"(blink::LocalFrame*)\")");
-                            Logger.empty();
-                        } else {
-                            Logger.empty();
-                            Logger.warn("  [Auto-Detection Failed] VTable ptr: 0x" + vtablePtr.toString(16));
-                            Logger.warn("  Symbol resolution failed. Object looks like a string (false positive?).");
-                            Logger.warn("  Try manual cast: !frame_attrs(" + objHex + ", false, \"(blink::LocalFrame*)\")");
-                            Logger.empty();
-                        }
-                    }
-                } catch (e) { }
-            }
-
-            if (!inspection.stringValue || activeType) {
-                if (activeType) {
-                    var members = BlinkUnwrap.getCppMembers(objHex, activeType);
-                    if (members.length > 0) {
-                        displayMembers(members, activeType);
-                    } else {
-                        Logger.info("  (Type hint " + activeType + " did not yield members)");
-                    }
+        } else if (!inspection.stringValue) {
+            if (activeType) {
+                var members = BlinkUnwrap.getCppMembers(objHex, activeType);
+                if (members.length > 0) {
+                    displayMembers(members, activeType);
                 } else {
-                    Logger.info("  (Type unknown - no vtable, no type hint)");
-                    Logger.info("  Provide type: !frame_attrs(" + objHex + ", false, \"(blink::TypeName*)\")");
+                    Logger.info("  (Type hint " + activeType + " did not yield members)");
                 }
+            } else {
+                Logger.info("  (Type unknown - no vtable, no type hint)");
+                Logger.info("  Provide type: !frame_attrs(" + objHex + ", false, \"(blink::TypeName*)\")");
             }
         }
     } else {
