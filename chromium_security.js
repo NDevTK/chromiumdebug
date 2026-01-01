@@ -2005,11 +2005,6 @@ class BlinkUnwrap {
         // (unless it's a Member<String>, but Member<T> is usually handled by dx)
         if (addrBig > 0x10000n && !result.stringValue) {
             var val64 = 0n;
-            try {
-                // Read the pointer VALUE at the address
-                var vals = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8);
-                val64 = MemoryUtils.parseBigInt(vals[0]);
-            } catch (e) { }
 
             var high32 = Number(val64 >> 32n);
             var low32 = Number(val64 & 0xFFFFFFFFn);
@@ -2021,7 +2016,7 @@ class BlinkUnwrap {
                     result.vtable = objHex;
                 } else {
                     result.isPointer = true;
-                    result.pointerTarget = "0x" + val64.toString(16);
+                    result.pointerTarget = objHex;
                     result.pointerType = "Raw 64-bit pointer";
                 }
             } else if (high32 === 0 && low32 !== 0) {
