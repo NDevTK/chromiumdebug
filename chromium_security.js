@@ -403,13 +403,13 @@ class SymbolUtils {
                 else if (lineStr.indexOf("prv func") !== -1) type = "func";
 
                 if (type) {
-                    // Match: ADDR SIZE ... chrome!NAME
-                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+(\d+)\s+.*chrome!(.+)/);
+                    // Match: ADDR SIZE(hex) ... chrome!NAME
+                    var match = lineStr.match(/([0-9a-fA-F`]+)\s+([0-9a-fA-F]+)\s+.*chrome!(.+)/);
                     if (match) {
                         results.push({
                             type: type,
                             address: "0x" + match[1].replace(/`/g, ""),
-                            size: parseInt(match[2], 10),
+                            size: parseInt(match[2], 16),  // Parse as hex
                             name: "chrome!" + match[3].trim(),
                             line: lineStr
                         });
@@ -4063,7 +4063,7 @@ class Exec {
         Logger.info("    Target: " + targetSymbol + " @ " + targetAddr);
         Logger.info("    Args: " + JSON.stringify(args, (k, v) => (typeof v === 'bigint' ? v.toString() : v)));
 
-        return this._runX64(targetAddr, args);
+        return this._runX64(targetAddr, args, this.currentReturnTypeHint);
     }
 
     /// Fallback for inlined functions: synthesize shellcode to read member
@@ -4247,10 +4247,12 @@ class Exec {
         //   1. Targeted wildcard for exact class (primary)
         //   2. Exact match fallback
         //   3. Method-only wildcard to find on base classes (fallback for inheritance)
+        // Ensure we don't double-prefix if className already has "chrome!" etc.
+        var modulePrefix = className.includes("!") ? "" : "chrome!";
         var patterns = [
-            "chrome!*" + className + "::" + methodName + "*",  // Wildcard for inlines (primary)
-            "chrome!" + className + "::" + methodName,         // Exact match
-            "chrome!*::" + methodName                          // Method-only search (finds base class methods)
+            modulePrefix + "*" + className + "::" + methodName + "*",  // Wildcard for inlines (primary)
+            modulePrefix + className + "::" + methodName,              // Exact match
+            "chrome!*::" + methodName                                  // Method-only search (finds base class methods)
         ];
 
         var inlineAddr = null;
@@ -4295,7 +4297,7 @@ class Exec {
 
                 // If we found candidates in this pattern, break (prefer earlier patterns)
                 if (inlineCandidates.length > 0) break;
-            } catch (e) { }
+            } catch (e) { Logger.debug("    [PDB] Pattern lookup failed: " + e.message); }
         }
 
         // Select best RELOCATABLE inline candidate based on class hierarchy heuristics
@@ -4360,7 +4362,7 @@ class Exec {
                 var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
                 if (inlinedReturnType) {
                     // Normalize to pointer hint for chaining
-                    this.currentReturnTypeHint = normalizeTypeHint(inlinedReturnType);
+                    this.currentReturnTypeHint = this._normalizeTypeHint(inlinedReturnType);
                     Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
                 }
 
@@ -4383,8 +4385,8 @@ class Exec {
                 return this._execViaInline_Part2(exactFuncAddr, thisPtr);
             }
 
-            Logger.error("    [PDB] No relocatable inline found and no non-inlined function available");
-            return null;
+            Logger.warn("    [PDB] No relocatable inline found and no non-inlined function available (falling back to member lookup)");
+            // return null; // Removed to allow fallthrough to member fallback
         }
 
         // No inline candidates found - try member variable fallback
@@ -4392,11 +4394,161 @@ class Exec {
         var memberName = this._methodToMember(methodName);
         if (memberName && thisPtr) {
             Logger.info("    [Fallback] Trying member variable: " + memberName);
-            return this._readMemberDirect(thisPtr, className, memberName);
+            var result = this._readMemberDirect(thisPtr, className, memberName);
+            if (result) return result;
+
+            // Retry without "get_" prefix if present
+            if (memberName.startsWith("get_")) {
+                var altMember = memberName.substring(4); // remove "get_"
+                Logger.info("    [Fallback] Trying alternative member: " + altMember);
+                result = this._readMemberDirect(thisPtr, className, altMember);
+                if (result) return result;
+            }
+        }
+
+        // Final fallback: Try vtable dispatch for virtual methods
+        if (thisPtr && className && methodName) {
+            var vtableResult = this._execViaVtable(thisPtr, className, methodName);
+            if (vtableResult) return vtableResult;
         }
 
         Logger.error("    [PDB] No PDB entry found for " + className + "::" + methodName);
         return null;
+    }
+
+    /// Execute a virtual method via vtable dispatch
+    /// @param thisPtr - Object pointer
+    /// @param className - Class name (may include module prefix)
+    /// @param methodName - Method name to call
+    static _execViaVtable(thisPtr, className, methodName) {
+        Logger.info("    [Vtable] Attempting vtable dispatch for " + methodName);
+
+        var ctl = SymbolUtils.getControl();
+        var thisBig = MemoryUtils.parseBigInt(thisPtr);
+
+        try {
+            // 1. Read vtable pointer from [this + 0]
+            var vtablePtrRaw = host.memory.readMemoryValues(host.parseInt64(thisBig.toString(16), 16), 1, 8)[0];
+            // Convert via hex string to avoid 64-bit precision loss
+            var vtablePtr = BigInt("0x" + vtablePtrRaw.toString(16));
+
+            if (vtablePtr < 0x10000n) {
+                Logger.warn("    [Vtable] Invalid vtable pointer: 0x" + vtablePtr.toString(16));
+                return null;
+            }
+
+            // Validate vtable pointer is in valid address range (user-mode, not obviously garbage)
+            if (vtablePtr > 0x7FFFFFFFFFFFn) {
+                Logger.warn("    [Vtable] Vtable pointer out of user-mode range: 0x" + vtablePtr.toString(16));
+                return null;
+            }
+
+            Logger.info("    [Vtable] Vtable at: 0x" + vtablePtr.toString(16));
+
+            // 2. Verify this is actually a vtable using ln command
+            var vtableName = null;
+            var isValidVtable = false;
+            try {
+                var lnOut = ctl.ExecuteCommand("ln 0x" + vtablePtr.toString(16));
+                for (var line of lnOut) {
+                    var lineStr = line.toString();
+                    // Look for pattern like "chrome!blink::SecurityOrigin::`vftable'"
+                    var vtMatch = lineStr.match(/(\w+![^`]+)::`vftable'/);
+                    if (vtMatch) {
+                        vtableName = vtMatch[1];
+                        isValidVtable = true;
+                        Logger.info("    [Vtable] Type: " + vtableName);
+                        break;
+                    }
+                }
+            } catch (e) { Logger.debug("    [Vtable] Slot resolution failed: " + e.message); }
+
+            if (!isValidVtable) {
+                Logger.warn("    [Vtable] Address 0x" + vtablePtr.toString(16) + " is not a valid vtable (class may not be polymorphic)");
+                return null;
+            }
+
+            // 3. Find the method slot offset in the vtable
+            // Use dx to enumerate the vtable and find matching method
+            var slotOffset = null;
+            var funcAddr = null;
+
+            // Try direct dx on vtable as function pointer array
+            // Pattern: dx -r1 (void**)0x<vtable>
+            try {
+                var dxCmd = "dx -r1 ((void**)0x" + vtablePtr.toString(16) + ")";
+                var dxOut = ctl.ExecuteCommand(dxCmd);
+                var slotIdx = 0;
+
+                for (var line of dxOut) {
+                    var lineStr = line.toString();
+
+                    // Look for method name in demangled form
+                    // Pattern: [0] : 0x... : chrome!ClassName::MethodName
+                    if (lineStr.indexOf("::" + methodName) !== -1) {
+                        // Extract address
+                        var addrMatch = lineStr.match(/0x([0-9a-fA-F]+)/);
+                        if (addrMatch) {
+                            funcAddr = BigInt("0x" + addrMatch[1]);
+                            slotOffset = slotIdx * 8;
+                            Logger.info("    [Vtable] Found " + methodName + " at slot " + slotIdx + " -> 0x" + funcAddr.toString(16));
+                            break;
+                        }
+                    }
+
+                    // Track slot index
+                    var slotMatch = lineStr.match(/\[(\d+)\]/);
+                    if (slotMatch) {
+                        slotIdx = parseInt(slotMatch[1]) + 1;
+                    }
+                }
+            } catch (e) {
+                Logger.warn("    [Vtable] dx enumeration failed: " + e.message);
+            }
+
+            // Alternative: Try "dqs" to dump vtable with symbols
+            if (!funcAddr) {
+                try {
+                    var dqsOut = ctl.ExecuteCommand("dqs 0x" + vtablePtr.toString(16) + " L20");
+                    var slotIdx = 0;
+
+                    for (var line of dqsOut) {
+                        var lineStr = line.toString();
+
+                        // Pattern: addr  funcAddr  chrome!Class::Method
+                        if (lineStr.indexOf("::" + methodName) !== -1) {
+                            var parts = lineStr.trim().split(/\s+/);
+                            if (parts.length >= 2) {
+                                var addrStr = parts[1].replace(/`/g, "");
+                                if (/^[0-9a-fA-F]+$/.test(addrStr)) {
+                                    funcAddr = BigInt("0x" + addrStr);
+                                    Logger.info("    [Vtable] Found " + methodName + " via dqs -> 0x" + funcAddr.toString(16));
+                                    break;
+                                }
+                            }
+                        }
+                        slotIdx++;
+                    }
+                } catch (e) {
+                    Logger.warn("    [Vtable] dqs failed: " + e.message);
+                }
+            }
+
+            if (!funcAddr) {
+                Logger.warn("    [Vtable] Method " + methodName + " not found in vtable");
+                return null;
+            }
+
+            // 4. Call the virtual function
+            Logger.info("    [Vtable] Calling virtual method at 0x" + funcAddr.toString(16));
+
+            var args = [{ type: 'int', realValue: thisBig }];
+            return this._runX64("0x" + funcAddr.toString(16), args, this.currentReturnTypeHint);
+
+        } catch (e) {
+            Logger.error("    [Vtable] Dispatch failed: " + e.message);
+            return null;
+        }
     }
 
     /// Helper: Convert CamelCase method name to snake_case member name
@@ -4455,7 +4607,7 @@ class Exec {
                     return offset;
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("    [Offset] dt command failed: " + e.message); }
         return null;
     }
 
@@ -4548,7 +4700,7 @@ class Exec {
                     }
                 }
             }
-        } catch (e) { }
+        } catch (e) { Logger.debug("    [MemberAtOffset] dt lookup failed: " + e.message); }
         return null;
     }
 
@@ -4630,8 +4782,52 @@ class Exec {
                 } catch (e) { }
             };
 
+            var isFirstLine = true;
             for (var line of output) {
                 var lineStr = line.toString();
+
+                // First pass: Check if the result itself is a struct/object (first line)
+                // e.g. ((blink::HTMLDocument*)0x...)->cookie_url_                 [Type: blink::KURL]
+                if (isFirstLine) {
+                    isFirstLine = false;
+
+                    // Check if it has a Type field that implies complex object
+                    var typeMatch = lineStr.match(/\[Type:\s*([^\]]+)\]/);
+                    if (typeMatch) {
+                        var typeName = typeMatch[1].trim();
+                        // If it's NOT a primitive (bool, int, etc) and NOT a pointer (pointers are handled by standard dx value read usually, but here we want address of member)
+                        // Actually, pointers usually show as `member : 0x... [Type: T*]`.
+                        // Structs show as `member [Type: T]`.
+                        // So if it DOESN'T look like `key : value` we assume it's the struct itself.
+
+                        // Robust check: If Type is NOT bool and line does NOT contain " : " (value assignment)
+                        // This handles "cookie_url_ [Type: blink::KURL]" vs "is_valid_ : true [Type: bool]"
+                        if (typeName !== "bool" && lineStr.indexOf(" : ") === -1 && !lineStr.match(/:\s*(true|false|\d+|0x)/)) {
+                            Logger.info("    [Fallback] Detected complex object: " + typeName);
+
+                            // Set return type hint for next chain execution
+                            this.currentReturnTypeHint = typeName;
+                            Logger.info("    [Type Hint] Set hint for next call: " + typeName);
+
+                            // We need the offset to return the address (this + offset)
+                            var offsetCmd = "dx &((" + className + "*)0)->" + memberName;
+                            var offsetOut = ctl.ExecuteCommand(offsetCmd);
+                            for (var offLine of offsetOut) {
+                                var m = offLine.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
+                                if (m) {
+                                    var offset = BigInt(m[1]);
+                                    ProcessCache.setOffset(className + "->" + memberName, { offset: offset, path: "cached" });
+                                    Logger.info("    [Cache] Stored offset 0x" + m[1] + " for " + memberName);
+                                    // Return address: thisPtr + offset
+                                    var addr = MemoryUtils.parseBigInt(thisPtr) + offset;
+                                    var addrStr = "0x" + addr.toString(16);
+                                    Logger.info("    [Fallback] Result (Object Address): " + addrStr);
+                                    return addrStr;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Check for errors
                 if (lineStr.indexOf("Error") !== -1 || lineStr.indexOf("Unable") !== -1) {
@@ -4640,6 +4836,7 @@ class Exec {
                 }
 
                 // Parse boolean result: "... : true [Type: bool]" or "... : false [Type: bool]"
+                // STRICTER: Only if name matches memberName or it's the main result line (no name)
                 var boolMatch = lineStr.match(/:\s*(true|false)\s*\[Type:\s*bool\]/i);
                 if (boolMatch) {
                     result = boolMatch[1].toLowerCase() === "true" ? "0x1" : "0x0";
@@ -4842,19 +5039,21 @@ class Exec {
             outputReg = "rax";
         }
 
-        // Allocate buffer for code + RET
+        // Declare all allocation variables outside try so finally can access them
         var bufSize = inlineSize + 16;  // Extra space for RET and alignment
-        var buf = MemoryUtils.alloc(bufSize);
-        if (!buf) {
-            Logger.error("Failed to allocate execution buffer");
-            return null;
-        }
-
-        // Preparation: Allocate scratch memory for string arguments if any (reusing _runX64 logic)
+        var buf = null;
         var scratchBase = null;
         var currentScratchOffset = 0n;
 
         try {
+            // Allocate buffer for code + RET
+            buf = MemoryUtils.alloc(bufSize);
+            if (!buf) {
+                Logger.error("Failed to allocate execution buffer");
+                return null;
+            }
+
+            // Preparation: Allocate scratch memory for string arguments if any
             for (var i = 0; i < args.length; i++) {
                 if (args[i].type === 'string') {
                     if (!scratchBase) {
@@ -4888,12 +5087,12 @@ class Exec {
             Logger.info("    Input: " + inputReg + " = 0x" + thisPtr.toString(16));
             Logger.info("    Output: " + outputReg);
 
-            // 1. Copy real inlined bytes from target
+            // 1. Copy real inlined bytes from target (bulk read for performance)
             var srcAddr = MemoryUtils.parseBigInt(inlineAddr);
             var codeBytes = [];
-            for (var i = 0; i < inlineSize; i++) {
-                var byte = host.memory.readMemoryValues(host.parseInt64((srcAddr + BigInt(i)).toString(16), 16), 1, 1)[0];
-                codeBytes.push(Number(byte));
+            var values = host.memory.readMemoryValues(host.parseInt64(srcAddr.toString(16), 16), inlineSize, 1);
+            for (var v of values) {
+                codeBytes.push(Number(v));
             }
 
             // 2. Append INT3 as fallback (in case no RET found in copied code)
@@ -5121,7 +5320,7 @@ class Exec {
     /// Used for value-returning getters (MOV pattern)
     static _readMember(thisPtr, offset) {
         var thisAddr = MemoryUtils.parseBigInt(thisPtr);
-        var memberAddr = thisAddr + offset;
+        var memberAddr = BigInt(thisAddr) + BigInt(offset);
 
         Logger.info("    Reading [0x" + thisAddr.toString(16) + " + 0x" + offset.toString(16) + "]");
         Logger.info("    Member address: 0x" + memberAddr.toString(16));
@@ -5190,6 +5389,27 @@ class Exec {
             var boolVal = resultVal !== 0n;
             Logger.info("    Result (bool hint): " + boolVal + " (0x" + resultVal.toString(16) + ")");
             return resultVal !== 0n ? 1n : 0n;
+        }
+
+        // Check for String return type - blink::String is only 8 bytes (pointer to StringImpl)
+        // When returned by value, RAX contains the impl_ pointer directly
+        var isStringHint = this.currentReturnTypeHint && (
+            this.currentReturnTypeHint.includes("String") ||
+            this.currentReturnTypeHint.includes("AtomicString")
+        );
+        if (isStringHint && resultVal > 0x10000n) {
+            try {
+                // RAX is the StringImpl pointer - read it directly
+                var implAddr = "0x" + resultVal.toString(16);
+                var strResult = BlinkUnwrap.readString(implAddr);
+                if (strResult !== null && strResult.length > 0) {
+                    Logger.info("    String Result: \"" + strResult + "\"");
+                    // Store string for potential use, but return the pointer for chaining
+                    this.lastStringResult = strResult;
+                }
+            } catch (e) {
+                Logger.debug("    [String Read] Failed: " + e.message);
+            }
         }
 
         // Fallback boolean heuristic for cases without hints
@@ -5345,9 +5565,32 @@ class Exec {
         return { type: 'int', value: arg };
     }
 
-    static _runX64(targetAddr, args) {
+    static _runX64(targetAddr, args, returnType = null) {
+        // Detect if return type is a complex struct that needs hidden return pointer
+        // 
+        // Chrome/Blink uses a NON-STANDARD calling convention for String returns:
+        //   - Standard MSVC: RCX = return buffer, RDX = this
+        //   - Chrome/Clang:  RCX = this,          RDX = return buffer
+        //
+        // This was confirmed by disassembling SecurityOrigin::ToString() which accesses
+        // [rcx+38h] and [rcx+8] for member fields, proving RCX is 'this'.
+        //
+        var isStructReturn = returnType && (
+            returnType.includes("String") ||
+            returnType.includes("KURL") ||
+            returnType.includes("AtomicString")
+        );
+        // Exclude actual pointer returns (e.g., "String*" or "String **")
+        // The normalized hint adds one "*", so "String" becomes "(String*)" 
+        // But "String*" return would become "(String**)"
+        if (isStructReturn && (returnType.includes("**") || returnType.includes("* *"))) {
+            isStructReturn = false;
+        }
+
+        Logger.debug("    [_runX64] returnType=" + returnType + ", isStructReturn=" + isStructReturn);
+
         // 1. Allocate scratch Memory
-        // Need space for: Shellcode + String Data + Result
+        // Need space for: Shellcode + String Data + Result + Struct Return Buffer
         var allocSize = 0x1000;
         var baseAddrHex = MemoryUtils.alloc(allocSize);
         if (!baseAddrHex) {
@@ -5358,12 +5601,15 @@ class Exec {
         var baseAddr = BigInt("0x" + baseAddrHex);
 
         // Layout:
-        // +0x000: Result (8 bytes)
+        // +0x000: Result (8 bytes for RAX)
+        // +0x008: XMM0 result (8 bytes for float)
         // +0x010: String Data Start...
+        // +0x700: Struct Return Buffer (256 bytes, should be enough for blink::String etc.)
         // +0x800: Code Start (Arbitrary safe offset)
 
         var resultOffset = 0x0n;
         var dataOffset = 0x10n;
+        var structReturnOffset = 0x700n;
         var codeOffset = 0x800n;
 
         var currentDataOffset = dataOffset;
@@ -5410,8 +5656,9 @@ class Exec {
 
         // Standard: Shadow space (32 bytes) is required.
         // + stack args.
-
-        var stackArgsCount = (args.length > 4) ? (args.length - 4) : 0;
+        // For struct returns, one register is consumed by hidden return pointer
+        var effectiveArgCount = isStructReturn ? args.length + 1 : args.length;
+        var stackArgsCount = (effectiveArgCount > 4) ? (effectiveArgCount - 4) : 0;
         var stackSpace = stackArgsCount * 8;
         // Always allocate 0x20 shadow space.
         // Total alloc = 0x20 + stackSpace.
@@ -5436,6 +5683,8 @@ class Exec {
         }
 
         // Load Register Args (RCX, RDX, R8, R9)
+        // For Chrome/Clang struct returns: RCX = this, RDX = return buffer
+        // (This is DIFFERENT from standard MSVC which uses RCX = buffer, RDX = this)
         var registers = [
             [0x48, 0xB9], // mov rcx, imm64
             [0x48, 0xBA], // mov rdx, imm64
@@ -5443,24 +5692,47 @@ class Exec {
             [0x49, 0xB9]  // mov r9, imm64
         ];
 
-        for (var i = 0; i < Math.min(args.length, 4); i++) {
-            code = code.concat(registers[i]);
-            code = code.concat(this._to64BitLE(args[i].realValue));
+        var structReturnAddr = baseAddr + structReturnOffset;
+
+        if (isStructReturn && args.length > 0) {
+            // Chrome/Clang convention: RCX = this, RDX = return buffer
+            Logger.debug("    [Struct Return] Using Chrome/Clang convention: RCX=this, RDX=buffer");
+            Logger.debug("    [Struct Return] Return buffer at: 0x" + structReturnAddr.toString(16));
+
+            // RCX = this (first arg)
+            code = code.concat(registers[0]); // mov rcx, this
+            code = code.concat(this._to64BitLE(args[0].realValue));
+
+            // RDX = return buffer
+            code = code.concat(registers[1]); // mov rdx, structReturnAddr
+            code = code.concat(this._to64BitLE(structReturnAddr));
+
+            // Remaining args go to R8, R9, stack
+            for (var i = 1; i < args.length && i < 3; i++) {
+                code = code.concat(registers[i + 1]); // R8, R9
+                code = code.concat(this._to64BitLE(args[i].realValue));
+            }
+        } else {
+            // Standard calling: RCX, RDX, R8, R9
+            for (var i = 0; i < args.length && i < 4; i++) {
+                code = code.concat(registers[i]);
+                code = code.concat(this._to64BitLE(args[i].realValue));
+            }
         }
 
         // Push Stack Args
-        // Args 5+ go to [rsp + 0x20], [rsp + 0x28]...
+        // Args that didn't fit in registers go to stack [rsp + 0x20], [rsp + 0x28]...
         // Warning: The space is already allocated (sub rsp). We should MOV them.
-        // Because if we PUSH, we mess up offsets relative to shadow space.
-        // Correct: mov [rsp + 0x28], arg5
+        // For struct returns, regIndex started at 1, so fewer args fit in registers
+        var stackStartIdx = isStructReturn ? 3 : 4;  // 4 regs - 1 hidden = 3 for struct return
 
-        for (var i = 4; i < args.length; i++) {
+        for (var i = stackStartIdx; i < args.length; i++) {
             // mov rax, argVal
             code.push(0x48, 0xB8);
             code = code.concat(this._to64BitLE(args[i].realValue));
 
             // mov [rsp + offset], rax
-            var offset = 0x20 + (i - 4) * 8;
+            var offset = 0x20 + (i - stackStartIdx) * 8;
             if (offset < 0x80) {
                 // Short encoding: mov [rsp + disp8], rax
                 code.push(0x48, 0x89, 0x44, 0x24, offset & 0xFF);
@@ -5537,10 +5809,7 @@ class Exec {
         var result = BigInt(resultVals[0]);
         var resultXmm = BigInt(resultVals[1]);
 
-        // Analyze Result
-        result = this._analyzeResult(result, resultXmm);
-
-        // Restore Registers
+        // Restore Registers first (before any analysis that might fail)
         ctl.ExecuteCommand("r @rip = @$t0");
         ctl.ExecuteCommand("r @rsp = @$t1");
         ctl.ExecuteCommand("r @rcx = @$t2");
@@ -5553,7 +5822,47 @@ class Exec {
         Logger.info("  State restored.");
         Logger.info("  [Trace] Returning result...");
 
-        // Return result for chaining
+        // Handle struct return - read from buffer instead of RAX
+        // Skip _analyzeResult since result is in buffer, not RAX
+        if (isStructReturn) {
+            var structAddrHex = "0x" + structReturnAddr.toString(16);
+            Logger.info("  [Struct Return] Reading result from buffer: " + structAddrHex);
+
+            // For String types, use BlinkUnwrap.readString (reuses existing robust logic)
+            if (returnType.includes("String") || returnType.includes("KURL") || returnType.includes("AtomicString")) {
+                try {
+                    var strResult = BlinkUnwrap.readString(structAddrHex);
+                    if (strResult !== null && strResult.length > 0) {
+                        Logger.info("  [Struct Return] String result: " + strResult);
+                        if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
+                        return strResult;
+                    }
+                    Logger.warn("  [Struct Return] readString returned empty/null, dumping buffer...");
+                } catch (e) {
+                    Logger.warn("  [Struct Return] String read failed: " + e.message);
+                }
+
+                // Debug: Dump struct buffer contents for diagnosis
+                try {
+                    var bufferVals = host.memory.readMemoryValues(host.parseInt64(structAddrHex, 16), 4, 8);
+                    Logger.info("  [Struct Return] Buffer[0-3]: " +
+                        "0x" + BigInt(bufferVals[0]).toString(16) + ", " +
+                        "0x" + BigInt(bufferVals[1]).toString(16) + ", " +
+                        "0x" + BigInt(bufferVals[2]).toString(16) + ", " +
+                        "0x" + BigInt(bufferVals[3]).toString(16));
+                } catch (e) { }
+            }
+
+            // Fallback: return buffer address for other struct types
+            if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
+            return structAddrHex;
+        }
+
+
+        // For non-struct returns, analyze RAX result
+        result = this._analyzeResult(result, resultXmm);
+
+        // Return result for chaining (standard RAX return)
         // Return as HEX STRING to avoid BigInt marshalling crashes
         try {
             var bi = BigInt(result);
@@ -7985,8 +8294,6 @@ function bp_gc() {
     return _bpFromConfig("gc");
 }
 
-
-
 function bp_wasm() {
     return _bpFromConfig("wasm");
 }
@@ -7994,5 +8301,3 @@ function bp_wasm() {
 function bp_jit() {
     return _bpFromConfig("jit");
 }
-
-// _isWritable moved to helpers section (after isValidPointer) for better code organization
