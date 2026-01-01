@@ -104,7 +104,7 @@ Then in WinDbg: `!chelp`
 | `!script_renderer("path")` | Load script in all renderers |
 | `!on_attach("cmd")` | Auto-run command when renderers attach |
 
-### C++ Execution / REPL
+### C++ Execution / REPL (Very very experimental)
 | Command | Description |
 |---------|-------------|
 | `!exec("expr")` | Execute C++ function chains with shellcode injection |
@@ -117,8 +117,6 @@ Then in WinDbg: `!chelp`
 
 #### Examples
 ```text
-!exec "blink::Document::Url()"
-!exec "blink::Document::Url()->GetString()"
 !exec "blink::LocalFrame::DomWindow()->document()"
 !exec "blink::Document::Url()->ProtocolIs(\"https\")"
 ```
