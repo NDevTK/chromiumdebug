@@ -396,7 +396,20 @@ class SymbolUtils {
         try {
             var output = this.getControl().ExecuteCommand("x /v " + pattern);
             for (var line of output) {
-                var lineStr = line.toString();
+                var lineStr = line.toString().trim(); // Trim for easier matching
+
+                // Check for Type line (continuation of previous symbol)
+                // Format: "Type: bool" or "Type: blink::Document *"
+                if (lineStr.startsWith("Type:") && results.length > 0) {
+                    var lastResult = results[results.length - 1];
+                    var typeMatch = lineStr.match(/^Type:\s*(.+)/);
+                    if (typeMatch) {
+                        lastResult.returnType = typeMatch[1].trim();
+                        // Clean up type string (remove (void) args if present)
+                        lastResult.returnType = lastResult.returnType.split("(")[0].trim();
+                    }
+                    continue;
+                }
 
                 var type = null;
                 if (lineStr.indexOf("prv inline") !== -1) type = "inline";
@@ -411,7 +424,8 @@ class SymbolUtils {
                             address: "0x" + match[1].replace(/`/g, ""),
                             size: parseInt(match[2], 16),  // Parse as hex
                             name: "chrome!" + match[3].trim(),
-                            line: lineStr
+                            line: lineStr,
+                            returnType: null // Will be filled by next line if available
                         });
                     }
                 }
@@ -3175,6 +3189,8 @@ function frame_attrs(objectAddr, debug, typeHint) {
     var objHex = normalizeAddress(objectAddr);
     var enableDebug = debug === true || debug === "true";
     var typeHintStr = typeHint || null;
+    var addrBig = 0n;
+    try { addrBig = BigInt(objHex); } catch (e) { }
 
     Logger.section("Object Attributes & Members: " + objHex);
 
@@ -3273,6 +3289,11 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
     if (result.members.length === 0) {
         if (inspection.isPointer && inspection.pointerTarget && addrBig > 0) {
+            // Check for recursion/loops
+            if (normalizeAddress(inspection.pointerTarget) === objHex) {
+                Logger.warn("  [Recursion] Pointer target is same as current object.");
+                return "";
+            }
             Logger.info("  [" + inspection.pointerType + " -> " + inspection.pointerTarget + "]");
             Logger.empty();
             return frame_attrs(inspection.pointerTarget, debug, typeHintStr);
@@ -3569,6 +3590,10 @@ class Exec {
             return;
         }
 
+        // Clear stale forced context from previous commands to prevent side effects
+        this._forcedContext = null;
+        this.currentThis = null;
+
         // Check for chained calls: Func()->Method() or Func()->Method()->Method2()
         var chain = this._parseChain(cmdString.trim());
         if (chain.length > 1) {
@@ -3659,8 +3684,17 @@ class Exec {
 
             // Use result as 'this' for next call
             currentThis = result;
-            this._forcedContext = currentThis; // Memory: Pin this address as the forced context
-            this.currentThis = currentThis; // Store statically for _analyzeResult context
+
+            // Only pin context if it looks like a pointer (starts with 0x)
+            // This prevents string results (e.g. "https://...") from being pinned
+            if (currentThis && typeof currentThis === 'string' && currentThis.startsWith("0x")) {
+                this._forcedContext = currentThis;
+                this.currentThis = currentThis;
+            } else {
+                // If intermediate result is not a pointer (e.g. string), we can't chain off it
+                // But we still persist currentThis for the loop (though next call will likely fail)
+                this._forcedContext = null;
+            }
         }
         // Return final result for chaining (already a hex string, safe to return)
         return result;
@@ -4288,7 +4322,9 @@ class Exec {
                                     addr: sym.address,
                                     size: sym.size,
                                     foundClass: foundClass,
-                                    foundMethod: methodName
+                                    foundClass: foundClass,
+                                    foundMethod: methodName,
+                                    returnType: sym.returnType // Capture return type from symbol
                                 });
                             }
                         }
@@ -4359,7 +4395,7 @@ class Exec {
 
                 // Inferred return type for chaining: Use the resolved symbol
                 var inlinedSymbol = cand.foundClass + "::" + cand.foundMethod;
-                var inlinedReturnType = SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
+                var inlinedReturnType = cand.returnType || SymbolUtils.getReturnType("chrome!" + inlinedSymbol);
                 if (inlinedReturnType) {
                     // Normalize to pointer hint for chaining
                     this.currentReturnTypeHint = this._normalizeTypeHint(inlinedReturnType);
@@ -5018,12 +5054,24 @@ class Exec {
     static _executeInlinedCode(inlineAddr, inlineSize, args, inputReg, outputReg) {
         var ctl = SymbolUtils.getControl();
 
-        // Valid x64 registers (GPR + XMM)
+        // Valid x64 registers (GPR 64/32/16/8-bit + XMM)
         var validRegs = [
+            // 64-bit
             "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+            // 32-bit
             "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"
+            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+            // 16-bit
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+            // 8-bit (low)
+            "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+            "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+            // 8-bit (high, legacy)
+            "ah", "bh", "ch", "dh",
+            // XMM
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"
         ];
 
         inputReg = (inputReg || "rcx").toLowerCase();
@@ -5467,7 +5515,9 @@ class Exec {
             }
 
             // Standard compressed pointer check (up to 1TB raw value)
-            if (resultVal <= 0xFFFFFFFFFFn && this.currentThis) {
+            // Exclude small negative 32-bit integers (0xFFFF0000 - 0xFFFFFFFF) which are likely error codes
+            var looksLikeNegativeInt = (resultVal >= 0xFFFF0000n && resultVal <= 0xFFFFFFFFn);
+            if (resultVal <= 0xFFFFFFFFFFn && this.currentThis && !looksLikeNegativeInt) {
                 try {
                     var decompressed = MemoryUtils.decompressCppgcPtr(resultVal, this.currentThis);
                     if (decompressed && decompressed !== resultVal.toString(16)) {
