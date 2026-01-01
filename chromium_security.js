@@ -783,7 +783,38 @@ class MemoryUtils {
             return (base | offset).toString(16);
         }
 
-        return null;
+    }
+
+    static compressCppgcPtr(fullPtr, contextAddr) {
+        if (!fullPtr) return 0;
+        var ptrBig = this.parseBigInt(fullPtr);
+        if (ptrBig === 0n) return 0;
+
+        const kPointerCompressionShift = 3n;
+        const kCageBaseMask = BigInt("0xFFFFFFFC00000000");
+
+        var base = 0n;
+        if (contextAddr) {
+            try {
+                var context = BigInt(contextAddr.toString().startsWith("0x") ? contextAddr : "0x" + contextAddr);
+                base = context & kCageBaseMask;
+            } catch (e) { }
+        }
+
+        if (base === 0n) {
+            var cage = this.getCppgcCageBase();
+            if (cage) base = BigInt("0x" + cage);
+        }
+
+        if (base === 0n) return 0; // Cannot compress without base
+
+        // offset = ptr - base
+        // compressed = offset >> shift
+        var offset = ptrBig - base;
+        if (offset < 0n) return 0; // Invalid, outside cage?
+
+        var compressed = offset >> kPointerCompressionShift;
+        return Number(compressed & 0xFFFFFFFFn); // return as number (32-bit)
     }
 
     /// Write bytes to memory
@@ -1825,8 +1856,20 @@ class BlinkUnwrap {
                 return true;
             }
             else if (memberType.indexOf("uint64_t") !== -1 || memberType.indexOf("size_t") !== -1 ||
-                memberType.indexOf("uintptr_t") !== -1 || memberType.indexOf("*") !== -1) {
-                // 64-bit value or pointer
+                memberType.indexOf("uintptr_t") !== -1 || memberType.indexOf("*") !== -1 ||
+                memberType.indexOf("Member") !== -1 || memberType.indexOf("BasicMember") !== -1) {
+
+                // Check for compressed pointer types
+                if (memberType.indexOf("Member") !== -1 || memberType.indexOf("BasicMember") !== -1) {
+                    var ptrValue = value;
+                    // If value is a string "0x...", parse it
+                    // If value is 0, write 0
+                    var compressed = MemoryUtils.compressCppgcPtr(ptrValue, objHex);
+                    MemoryUtils.writeU32(memberAddr, compressed);
+                    return true;
+                }
+
+                // Normal 64-bit value or pointer
                 var numericValue = BigInt(parseIntAuto(value));
                 var writeCmd = "eq " + memberAddr + " " + numericValue.toString(16);
                 ctl.ExecuteCommand(writeCmd);
@@ -3356,8 +3399,18 @@ function frame_attrs(objectAddr, debug, typeHint) {
                     var memberTypeHint = extractPointeeType(m.type);
                     if (memberTypeHint) {
                         try {
-                            var ptrVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 8)[0];
-                            var ptrValBig = MemoryUtils.parseBigInt(ptrVal);
+                            var ptrValBig = 0n;
+                            // Check for compressed types (Member, WeakMember, BasicMember)
+                            if (m.type.indexOf("Member") !== -1 || m.type.indexOf("BasicMember") !== -1) {
+                                var compressedVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 4)[0];
+                                var decompressed = MemoryUtils.decompressCppgcPtr(compressedVal, objHex);
+                                if (decompressed) {
+                                    ptrValBig = BigInt("0x" + decompressed);
+                                }
+                            } else {
+                                var ptrVal = host.memory.readMemoryValues(host.parseInt64(memberAddr, 16), 1, 8)[0];
+                                ptrValBig = MemoryUtils.parseBigInt(ptrVal);
+                            }
                             if (ptrValBig !== 0n && isValidUserModePointer(ptrValBig)) {
                                 var targetAddr = "0x" + ptrValBig.toString(16);
                                 Logger.info("  " + m.name + " -> " + targetAddr + "  !frame_attrs(" + targetAddr + ", false, \"" + memberTypeHint + "\")");
