@@ -568,6 +568,22 @@ class SymbolUtils {
 
             // Prefer inlined symbol over outer symbol when available
             var resultSymbol = inlinedSymbol || outerSymbol;
+
+            // Fallback: if we didn't match the specific patterns, try a looser match on the last line
+            if (!resultSymbol && output.length > 0) {
+                for (var line of output) {
+                    var lineStr = line.toString();
+                    // Just look for something that looks like a symbol name (contains !)
+                    // e.g. "  (00007ffc`fd386480)   chrome!blink::LocalFrame::`vftable'  |  (00007ffc`fd386620) ..."
+                    var simpleMatch = lineStr.match(/\s+([a-zA-Z0-9_]+![a-zA-Z0-9_:<>\?@$]+)/);
+                    if (simpleMatch) {
+                        resultSymbol = simpleMatch[1];
+                        if (debug) Logger.info("  [Debug] Loose match symbol: " + resultSymbol);
+                        break;
+                    }
+                }
+            }
+
             if (resultSymbol) {
                 ProcessCache.setSymbolName(hexAddr, resultSymbol);
                 return resultSymbol;
@@ -1945,7 +1961,13 @@ class BlinkUnwrap {
         // If we have a non-zero value and it's not obviously a string content pointer 
         // (unless it's a Member<String>, but Member<T> is usually handled by dx)
         if (addrBig > 0x10000n && !result.stringValue) {
-            var val64 = addrBig;
+            var val64 = 0n;
+            try {
+                // Read the pointer VALUE at the address
+                var vals = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8);
+                val64 = MemoryUtils.parseBigInt(vals[0]);
+            } catch (e) { }
+
             var high32 = Number(val64 >> 32n);
             var low32 = Number(val64 & 0xFFFFFFFFn);
 
@@ -1956,7 +1978,7 @@ class BlinkUnwrap {
                     result.vtable = objHex;
                 } else {
                     result.isPointer = true;
-                    result.pointerTarget = objHex;
+                    result.pointerTarget = "0x" + val64.toString(16);
                     result.pointerType = "Raw 64-bit pointer";
                 }
             } else if (high32 === 0 && low32 !== 0) {
@@ -1994,7 +2016,30 @@ class BlinkUnwrap {
                     return cached;
                 }
 
-                var symName = SymbolUtils.getSymbolName(vtableHex, debug);
+                var symName = null;
+
+                // Try dqs (Dump Quad Symbols) first - usually most reliable for vtables
+                try {
+                    var dqs = SymbolUtils.execute("dqs " + objHex + " L1");
+                    for (var line of dqs) {
+                        // 00000000`00000000  00007ffc`12345678 chrome!blink::LocalFrame::vftable
+                        var dqsMatch = line.toString().match(/\s+[0-9a-fA-F`]+\s+(.+)/);
+                        if (dqsMatch) {
+                            var s = dqsMatch[1].trim();
+                            if (s.indexOf("!") !== -1) {
+                                symName = s;
+                                if (debug) Logger.info("  [Debug] dqs symbol: " + symName);
+                                break;
+                            }
+                        }
+                    }
+                } catch (e) { }
+
+                // Fallback to ln if dqs failed
+                if (!symName) {
+                    symName = SymbolUtils.getSymbolName(vtableHex, debug);
+                }
+
                 if (symName) {
                     var resultType = null;
 
@@ -2038,6 +2083,32 @@ class BlinkUnwrap {
                         return resultType;
                     }
                 }
+            }
+
+            // Pattern 4: Generic "vftable" suffix check (very robust)
+            // If the symbol ends with "vftable" (with or without backticks), it's likely a vtable.
+            // Extract the part before "::`vftable'" or "::vftable" or "::`vftable"
+            if (!resultType && (symName.indexOf("vftable") !== -1)) {
+                // Remove "chrome!" prefix if present
+                var cleanName = symName.replace(/^[a-zA-Z0-9_]+!/, "");
+
+                // Split by :: and look for vftable part
+                var parts = cleanName.split("::");
+                if (parts.length > 1) {
+                    // Filter out the vftable part
+                    var classParts = parts.filter(p => p.indexOf("vftable") === -1);
+                    if (classParts.length > 0) {
+                        var className = classParts.join("::");
+                        if (debug) Logger.info("  [Debug] Detected Type (Suffix): " + className);
+                        resultType = "(" + className + "*)";
+                    }
+                }
+            }
+
+            // Cache and return result
+            if (resultType) {
+                ProcessCache.setVTableType(vtableHex, resultType);
+                return resultType;
             }
         } catch (e) {
             if (debug) Logger.info("  [Debug] detectType direct check failed: " + e.message);
@@ -3327,17 +3398,41 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
         if (addrBig === 0n) {
             Logger.info("  [NULL pointer]");
-        } else if (!inspection.stringValue) {
-            if (activeType) {
-                var members = BlinkUnwrap.getCppMembers(objHex, activeType);
-                if (members.length > 0) {
-                    displayMembers(members, activeType);
+        } else {
+            // If string was found but no type detected, warning might be needed
+            if (!activeType && inspection.stringValue) {
+                try {
+                    var vtablePtr = host.memory.readMemoryValues(host.parseInt64(objHex, 16), 1, 8)[0];
+                    if (vtablePtr.compareTo(0) !== 0) {
+                        var sym = SymbolUtils.getSymbolName(vtablePtr.toString(16));
+                        if (sym) {
+                            Logger.empty();
+                            Logger.warn("  [Auto-Detection Failed] VTable symbol: " + sym);
+                            Logger.warn("  Object looks like a string but has vtable. Try: !frame_attrs(" + objHex + ", false, \"(blink::LocalFrame*)\")");
+                            Logger.empty();
+                        } else {
+                            Logger.empty();
+                            Logger.warn("  [Auto-Detection Failed] VTable ptr: 0x" + vtablePtr.toString(16));
+                            Logger.warn("  Symbol resolution failed. Object looks like a string (false positive?).");
+                            Logger.warn("  Try manual cast: !frame_attrs(" + objHex + ", false, \"(blink::LocalFrame*)\")");
+                            Logger.empty();
+                        }
+                    }
+                } catch (e) { }
+            }
+
+            if (!inspection.stringValue || activeType) {
+                if (activeType) {
+                    var members = BlinkUnwrap.getCppMembers(objHex, activeType);
+                    if (members.length > 0) {
+                        displayMembers(members, activeType);
+                    } else {
+                        Logger.info("  (Type hint " + activeType + " did not yield members)");
+                    }
                 } else {
-                    Logger.info("  (Type hint " + activeType + " did not yield members)");
+                    Logger.info("  (Type unknown - no vtable, no type hint)");
+                    Logger.info("  Provide type: !frame_attrs(" + objHex + ", false, \"(blink::TypeName*)\")");
                 }
-            } else {
-                Logger.info("  (Type unknown - no vtable, no type hint)");
-                Logger.info("  Provide type: !frame_attrs(" + objHex + ", false, \"(blink::TypeName*)\")");
             }
         }
     } else {
