@@ -5045,6 +5045,117 @@ class Exec {
         return null;
     }
 
+    /// Helper: Prepare a StringView argument in scratch memory
+    /// @param str - The string value
+    /// @param scratchBase - Base address of scratch memory (BigInt)
+    /// @param currentOffset - Current offset in scratch memory (BigInt)
+    /// @returns Object { realValue: BigInt (pointer to StringView), sizeUsed: BigInt }
+    static _prepareStringArg(str, scratchBase, currentOffset) {
+        // 1. Resolve Blink's static empty StringImpl pointers (used for literals)
+        var empty8 = MemoryUtils.readGlobalPointer("chrome!blink::StringImpl::empty_");
+        var empty16 = MemoryUtils.readGlobalPointer("chrome!blink::StringImpl::empty16_bit_");
+        if (!empty8 || !empty16) Logger.warn("    [StringView] Could not resolve static markers");
+
+        // 2. Determine encoding
+        var is8Bit = true;
+        for (var j = 0; j < str.length; j++) {
+            if (str.charCodeAt(j) > 0xFF) { is8Bit = false; break; }
+        }
+
+        // 3. Write raw character data
+        var strDataAddr = scratchBase + currentOffset;
+        var charBytes = [];
+        if (is8Bit) {
+            for (var j = 0; j < str.length; j++) charBytes.push(str.charCodeAt(j));
+        } else {
+            for (var j = 0; j < str.length; j++) {
+                var code = str.charCodeAt(j);
+                charBytes.push(code & 0xFF); charBytes.push((code >> 8) & 0xFF);
+            }
+        }
+        MemoryUtils.writeMemory(strDataAddr.toString(16), charBytes);
+        Logger.debug("    [StringView] Data (" + (is8Bit ? "8-bit" : "16-bit") + ") at: 0x" + strDataAddr.toString(16));
+
+        // 4. Create StringView Struct (24 bytes)
+        var dataSize = BigInt(charBytes.length);
+        if (dataSize % 8n !== 0n) dataSize += (8n - (dataSize % 8n));
+        var viewAddr = scratchBase + currentOffset + dataSize;
+
+        // +0x00: impl_
+        var implPtrVal = is8Bit ? (empty8 ? BigInt("0x" + empty8) : 0n) : (empty16 ? BigInt("0x" + empty16) : 0n);
+        var implBytes = []; var tempImpl = implPtrVal;
+        for (var m = 0; m < 8; m++) { implBytes.push(Number(tempImpl & 0xFFn)); tempImpl >>= 8n; }
+        MemoryUtils.writeMemory(viewAddr.toString(16), implBytes);
+
+        // +0x08: bytes_
+        var ptrBytes = []; var tempPtr = strDataAddr;
+        for (var k = 0; k < 8; k++) { ptrBytes.push(Number(tempPtr & 0xFFn)); tempPtr >>= 8n; }
+        MemoryUtils.writeMemory((viewAddr + 8n).toString(16), ptrBytes);
+
+        // +0x10: length_
+        var lenVal = str.length;
+        var lenBytes = [lenVal & 0xFF, (lenVal >> 8) & 0xFF, (lenVal >> 16) & 0xFF, (lenVal >> 24) & 0xFF];
+        MemoryUtils.writeMemory((viewAddr + 16n).toString(16), lenBytes);
+
+        Logger.debug("    [StringView] Struct at: 0x" + viewAddr.toString(16) + " (impl=0x" + implPtrVal.toString(16) + ")");
+        return { realValue: viewAddr, sizeUsed: dataSize + 24n };
+    }
+
+    /// Helper: Prepare an Array argument in scratch memory
+    /// Allocates contiguous block of 64-bit integers and returns pointer to start
+    static _prepareArrayArg(arr, scratchBase, currentOffset) {
+        var arrayAddr = scratchBase + currentOffset;
+        var bytes = [];
+
+        for (var i = 0; i < arr.length; i++) {
+            var val = BigInt(arr[i]); // Support both int and hex strings via BigInt constructor if simple
+            // But arr[i] from JSON.parse is number or string. 
+            // If it's a string hex "0x...", BigInt handles it. 
+            // If it's a number, BigInt handles it.
+            // We need to pack it as 64-bit LE
+            for (var b = 0; b < 8; b++) {
+                bytes.push(Number(val & 0xFFn));
+                val >>= 8n;
+            }
+        }
+
+        MemoryUtils.writeMemory(arrayAddr.toString(16), bytes);
+        Logger.debug("    [Array] Data (" + arr.length + " elements) at: 0x" + arrayAddr.toString(16));
+
+        var sizeUsed = BigInt(bytes.length);
+        return { realValue: arrayAddr, sizeUsed: sizeUsed };
+    }
+
+    /// Helper: Iterate and prepare all arguments (String, Array, Integer)
+    /// @param args - The arguments array
+    /// @param scratchBase - Base address for data allocation (BigInt) or null
+    /// @param currentOffset - Starting offset in scratch memory (BigInt)
+    /// @returns BigInt - The new current offset after allocations
+    static _prepareAllArgs(args, scratchBase, currentOffset) {
+        for (var i = 0; i < args.length; i++) {
+            if (args[i].type === 'string') {
+                if (!scratchBase) throw new Error("Scratch memory required for string argument");
+                var result = this._prepareStringArg(args[i].value, scratchBase, currentOffset);
+                args[i].realValue = result.realValue;
+                currentOffset += result.sizeUsed;
+                if (currentOffset % 8n !== 0n) currentOffset += (8n - (currentOffset % 8n));
+
+            } else if (args[i].type === 'array') {
+                if (!scratchBase) throw new Error("Scratch memory required for array argument");
+                var result = this._prepareArrayArg(args[i].value, scratchBase, currentOffset);
+                args[i].realValue = result.realValue;
+                currentOffset += result.sizeUsed;
+                if (currentOffset % 8n !== 0n) currentOffset += (8n - (currentOffset % 8n));
+
+            } else if (args[i].realValue === undefined) {
+                // Parse simple integer/pointer if not already parsed
+                args[i].realValue = MemoryUtils.parseBigInt(args[i].value);
+            }
+        }
+        return currentOffset;
+    }
+
+
     /// Execute real inlined code by copying it to a buffer and running it
     /// @param inlineAddr - Address where inlined code starts
     /// @param inlineSize - Size of inlined code in bytes
@@ -5101,32 +5212,33 @@ class Exec {
                 return null;
             }
 
-            // Preparation: Allocate scratch memory for string arguments if any
+            // Preparation: Check if we need scratch memory
+            var needsScratch = false;
             for (var i = 0; i < args.length; i++) {
-                if (args[i].type === 'string') {
-                    if (!scratchBase) {
-                        var scratchHex = MemoryUtils.alloc(0x1000);
-                        if (!scratchHex) {
-                            Logger.error("Failed to allocate scratch memory for string arguments");
-                            return null;
-                        }
-                        scratchBase = BigInt("0x" + scratchHex);
-                    }
-
-                    var str = args[i].value;
-                    var bytes = [];
-                    for (var j = 0; j < str.length; j++) bytes.push(str.charCodeAt(j));
-                    bytes.push(0); // Null term
-
-                    var strAddr = scratchBase + currentScratchOffset;
-                    MemoryUtils.writeMemory(strAddr.toString(16), bytes);
-                    args[i].realValue = strAddr;
-
-                    currentScratchOffset += BigInt(bytes.length);
-                    if (currentScratchOffset % 8n !== 0n) currentScratchOffset += (8n - (currentScratchOffset % 8n));
-                } else if (args[i].realValue === undefined) {
-                    args[i].realValue = MemoryUtils.parseBigInt(args[i].value);
+                if (args[i].type === 'string' || args[i].type === 'array') {
+                    needsScratch = true;
+                    break;
                 }
+            }
+
+            if (needsScratch) {
+                var scratchHex = MemoryUtils.alloc(0x1000);
+                if (!scratchHex) {
+                    Logger.error("Failed to allocate scratch memory");
+                    return null;
+                }
+                scratchBase = BigInt("0x" + scratchHex);
+
+                // Prepare all arguments using the shared helper
+                try {
+                    currentScratchOffset = this._prepareAllArgs(args, scratchBase, currentScratchOffset);
+                } catch (e) {
+                    Logger.error("Argument preparation failed: " + e.message);
+                    return null;
+                }
+            } else {
+                // Even if no scratch needed, ensure integers are parsed
+                this._prepareAllArgs(args, null, 0n);
             }
 
             var thisPtr = args[0] ? args[0].realValue : 0n;
@@ -5610,6 +5722,15 @@ class Exec {
             if (addr) return { type: 'int', value: addr };
         }
 
+        if (arg.trim().startsWith('[') && arg.trim().endsWith(']')) {
+            try {
+                var arr = JSON.parse(arg);
+                if (Array.isArray(arr)) return { type: 'array', value: arr };
+            } catch (e) {
+                Logger.warn("    [Args] Failed to parse array: " + e.message);
+            }
+        }
+
         // Fallback: treat as raw value (may cause issues if not valid)
         Logger.warn("    [Args] Unrecognized argument format: '" + arg + "' - treating as literal");
         return { type: 'int', value: arg };
@@ -5664,35 +5785,12 @@ class Exec {
 
         var currentDataOffset = dataOffset;
 
-        // Write String Args
-        for (var i = 0; i < args.length; i++) {
-            if (args[i].type === 'string') {
-                // Convert string to bytes
-                var str = args[i].value;
-                var bytes = [];
-                for (var j = 0; j < str.length; j++) bytes.push(str.charCodeAt(j));
-                bytes.push(0); // Null term
-
-                // Write to memory
-                var strAddr = baseAddr + currentDataOffset;
-
-                // Safety Check: Do not overflow into Code region
-                if (currentDataOffset + BigInt(bytes.length) >= codeOffset) {
-                    Logger.error("String argument too long, exceeds buffer capacity.");
-                    return "0x0";
-                }
-
-                MemoryUtils.writeMemory(strAddr.toString(16), bytes);
-
-                // Update arg value to be the pointer
-                args[i].realValue = strAddr;
-                currentDataOffset += BigInt(bytes.length);
-                // 8-byte align
-                if (currentDataOffset % 8n !== 0n) currentDataOffset += (8n - (currentDataOffset % 8n));
-            } else {
-                // Integer/Pointer
-                args[i].realValue = MemoryUtils.parseBigInt(args[i].value);
-            }
+        // Prepare All Arguments (Strings, Arrays, Ints)
+        try {
+            currentDataOffset = this._prepareAllArgs(args, baseAddr, currentDataOffset);
+        } catch (e) {
+            Logger.error("Argument preparation failed in _runX64: " + e.message);
+            return null;
         }
 
         // Generate Shellcode

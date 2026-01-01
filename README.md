@@ -120,6 +120,7 @@ Then in WinDbg: `!chelp`
 !exec "blink::Document::Url()"
 !exec "blink::Document::Url()->GetString()"
 !exec "blink::LocalFrame::DomWindow()->document()"
+!exec "blink::Document::Url()->ProtocolIs(\"https\")"
 ```
 
 ## Files
