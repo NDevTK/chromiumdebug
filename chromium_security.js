@@ -574,6 +574,11 @@ class SymbolUtils {
             }
         } catch (e) {
             if (debug) Logger.info("  [Debug] ln /i failed: " + e.message);
+            // Fallback: try without /i if that was the cause
+            if (includeInline) {
+                if (debug) Logger.info("  [Debug] Retrying without /i...");
+                return this.getSymbolName(subsysAddr, debug, false);
+            }
         }
         return null;
     }
@@ -3327,7 +3332,7 @@ function frame_attrs(objectAddr, debug, typeHint) {
 
         if (addrBig === 0n) {
             Logger.info("  [NULL pointer]");
-        } else if (!inspection.stringValue) {
+        } else {
             if (activeType) {
                 var members = BlinkUnwrap.getCppMembers(objHex, activeType);
                 if (members.length > 0) {
@@ -6192,7 +6197,7 @@ class Exec {
                     } else {
                         // RAX:RDX register return: RAX = data ptr, RDX = length+flags
                         dataPtr = raxVal;
-                        var rdxVals = host.memory.readMemoryValues(host.parseInt64((baseAddrHex.replace("0x", "") + 16).toString(16), 16), 1, 8);
+                        var rdxVals = host.memory.readMemoryValues(host.parseInt64((baseAddr + 16n).toString(16), 16), 1, 8);
                         var rdxVal = BigInt(rdxVals[0]);
                         length = Number(rdxVal & 0xFFFFFFFFn);
                         var flags = Number((rdxVal >> 32n) & 0xFFFFFFFFn);
