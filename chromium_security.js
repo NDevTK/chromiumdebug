@@ -4186,12 +4186,6 @@ class Exec {
 
                 var regs = this._getInlinedRegs(cand.address);
 
-                // Offset Validation: Ensure the inlined code accesses the expected member
-                if (!this._validateInlinedOffset(cand.foundClass, cand.foundMethod, regs.offset)) {
-                    Logger.warn("    [Chain] Skipping (offset mismatch): " + cand.address);
-                    continue;
-                }
-
                 // Heuristic: We want a simple getter, usually offset is small positive.
                 // If offset is 0x10, it's likely "mov rax, [rcx+10h]".
                 // If offset is huge (e.g. 0xB0), it might be "mov rax, [rcx+B0h]" where rcx is NOT 'this'.
@@ -4247,76 +4241,16 @@ class Exec {
             // Get register info (includes offset for ADD pattern getters)
             var regs = this._getInlinedRegs(symInfo.address);
 
-            // Extract class and method names for offset validation
-            var inlineClassName = null;
-            var inlineMethodName = null;
-            var cleanSymbol = targetSymbol.replace(/^chrome!/, "");
-            var lastCC = cleanSymbol.lastIndexOf("::");
-            if (lastCC !== -1) {
-                inlineClassName = cleanSymbol.substring(0, lastCC);
-                inlineMethodName = cleanSymbol.substring(lastCC + 2);
-            }
-
-            // Offset Validation: Ensure the inlined code accesses the expected member
-            if (inlineClassName && inlineMethodName) {
-                if (!this._validateInlinedOffset(inlineClassName, inlineMethodName, regs.offset)) {
-                    Logger.warn("    [Inline] First candidate offset mismatch (0x" + regs.offset.toString(16) + "), searching for others...");
-
-                    // Try to find other inline candidates with correct offset (limit search)
-                    var allResults = SymbolUtils.getVerboseSymbols(targetSymbol);
-                    var foundValid = false;
-                    var MAX_INLINE_CANDIDATES = 10; // Limit search to avoid long delays
-
-                    for (var i = 1; i < allResults.length && i <= MAX_INLINE_CANDIDATES && !foundValid; i++) {
-                        var candidate = allResults[i];
-                        if (candidate.type !== "inline") continue;
-
-                        // Check relocatability
-                        if (!this._checkRelocatable(candidate.address, candidate.size)) continue;
-
-                        // Check offset
-                        var candRegs = this._getInlinedRegs(candidate.address);
-                        if (this._validateInlinedOffset(inlineClassName, inlineMethodName, candRegs.offset)) {
-                            Logger.info("    [Inline] Found valid candidate at " + candidate.address + " (offset 0x" + candRegs.offset.toString(16) + ")");
-                            symInfo = candidate;
-                            regs = candRegs;
-                            foundValid = true;
-                        }
-                    }
-
-                    if (!foundValid && allResults.length > MAX_INLINE_CANDIDATES) {
-                        Logger.info("    [Inline] Checked " + MAX_INLINE_CANDIDATES + " candidates, none valid (skipping remaining " + (allResults.length - MAX_INLINE_CANDIDATES) + ")");
-                    }
-
-                    if (!foundValid) {
-                        // Try non-inlined function as fallback
-                        var funcSym = SymbolUtils.getNonInlinedFunc(targetSymbol);
-                        if (funcSym) {
-                            Logger.info("    [Inline] Using non-inlined function @ " + funcSym.address);
-                            symInfo = { type: "func", address: funcSym.address };
-                        } else {
-                            // No non-inlined function available - method is fully inlined
-                            // and all inline candidates have wrong offsets
-                            Logger.error("    [Inline] No valid inline or function found");
-                            symInfo = null;
-                        }
-                    }
+            // Infer return type from member offset via DRY helper
+            if (regs.offset > 0) {
+                var detectedType = this._detectTypeFromOffset(targetSymbol, regs.offset);
+                if (detectedType) {
+                    this.currentReturnTypeHint = detectedType;
+                    Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
                 }
             }
 
-            // If validation passed and we have inlined code, execute it
-            if (symInfo && symInfo.type === "inline") {
-                // Infer return type from member offset via DRY helper
-                if (regs.offset > 0) {
-                    var detectedType = this._detectTypeFromOffset(targetSymbol, regs.offset);
-                    if (detectedType) {
-                        this.currentReturnTypeHint = detectedType;
-                        Logger.info("    [Type Detection] Inlined return type: " + this.currentReturnTypeHint);
-                    }
-                }
-
-                return this._executeInlinedCode(symInfo.address, symInfo.size, args, regs.inputReg, regs.outputReg);
-            }
+            return this._executeInlinedCode(symInfo.address, symInfo.size, args, regs.inputReg, regs.outputReg);
         }
 
         var targetAddr = symInfo ? symInfo.address : null;
@@ -4646,25 +4580,20 @@ class Exec {
                 if (cand.priority) continue;  // Already added
                 var shortClassName = className.split("::").pop();
                 var shortFoundClass = cand.foundClass.split("::").pop();
-                if (shortClassName.indexOf(shortFoundClass) !== -1) {
+                if (shortClassName.endsWith(shortFoundClass)) {
                     cand.priority = 2;
                     orderedCandidates.push(cand);
                 }
             }
 
-            // Priority 3: Add all remaining candidates
-            // Offset validation will catch any wrong method bodies
-            for (var cand of inlineCandidates) {
-                if (!cand.priority) {
-                    cand.priority = 3;
-                    orderedCandidates.push(cand);
-                }
-            }
+            // Priority 3: Skip remaining candidates from unrelated classes
+            // Even if offset validation passes, code designed for a different object type
+            // (e.g., FrameFetchContext::Url vs Document::Url) will produce incorrect results
+            // because the inlined code may rely on other class-specific state/layout
 
             // Try each candidate in order, checking relocatability
             for (var cand of orderedCandidates) {
-                var priorityName = cand.priority === 1 ? "Exact class" :
-                    cand.priority === 2 ? "Base class" : "Other";
+                var priorityName = cand.priority === 1 ? "Exact class" : "Base class";
                 Logger.info("    [PDB] Trying " + priorityName + " match: " + cand.foundClass + "::" + cand.foundMethod);
 
                 // Check relocatability BEFORE selecting
@@ -4673,15 +4602,10 @@ class Exec {
                     continue;
                 }
 
-                // Check offset validation - ensure inlined code accesses the expected member
-                // Pass 'className' (the target class) as the original target for validation
+                // Get register info for execution
                 var regs = this._getInlinedRegs(cand.addr);
-                if (!this._validateInlinedOffset(cand.foundClass, cand.foundMethod, regs.offset, className)) {
-                    Logger.warn("    [PDB] Skipping (offset mismatch): " + cand.addr);
-                    continue;
-                }
 
-                // This candidate is relocatable and validated - use it!
+                // This candidate is relocatable - use it!
                 Logger.info("    [PDB] Selected inlined at: " + cand.addr + " (size=" + cand.size + ")");
 
                 // Inferred return type for chaining: Use the resolved symbol
@@ -4936,77 +4860,6 @@ class Exec {
             }
         } catch (e) { Logger.debug("    [Offset] dt command failed: " + e.message); }
         return null;
-    }
-
-    /// Helper: Validate that an inlined function's detected offset matches the expected member
-    /// @param className - Class name of the inline candidate
-    /// @param methodName - Method name (e.g., "GetDocument", "document")
-    /// @param detectedOffset - Offset detected from disassembly
-    /// @param originalTargetClass - (Optional) The original target class we were looking for
-    /// @returns true if offset is valid or can't be validated, false if definitely wrong
-    static _validateInlinedOffset(className, methodName, detectedOffset, originalTargetClass) {
-        if (detectedOffset === null) {
-            // If we are checking an unrelated class (Priority 3/Other), be strict:
-            // We MUST be able to validate the offset to trust it.
-            if (originalTargetClass && originalTargetClass !== className) {
-                Logger.debug("    [Offset Validation] Could not detect offset in candidate " + className + " - Strict mode rejecting.");
-                return false;
-            }
-            return true; // For exact/base class, allow complex code we can't parse
-        }
-
-        // Convert method to expected member: GetDocument -> document_, DomWindow -> dom_window_
-        var expectedMember = this._methodToMember(methodName);
-        if (!expectedMember) return true; // Can't validate, allow it
-
-        // 1. Look up actual offset on the CANDIDATE class
-        var actualOffset = this._getMemberOffset(className, expectedMember);
-
-        // 2. If not found, and we have an ORIGINAL TARGET class, try that
-        if (actualOffset === null && originalTargetClass && originalTargetClass !== className) {
-            Logger.debug("    [Offset Validation] Member '" + expectedMember + "' not found on candidate " + className + ", checking target " + originalTargetClass);
-            actualOffset = this._getMemberOffset(originalTargetClass, expectedMember);
-            if (actualOffset !== null) {
-                Logger.debug("    [Offset Validation] Found member on target " + originalTargetClass + " at 0x" + actualOffset.toString(16));
-            }
-        }
-
-        if (actualOffset === null) {
-            // Try without "Get" prefix: GetDocument -> Document -> document_
-            if (methodName.startsWith("Get") && methodName.length > 3) {
-                var altMember = this._methodToMember(methodName.substring(3));
-                if (altMember) {
-                    actualOffset = this._getMemberOffset(className, altMember);
-
-                    // Retry on target class if needed
-                    if (actualOffset === null && originalTargetClass && originalTargetClass !== className) {
-                        actualOffset = this._getMemberOffset(originalTargetClass, altMember);
-                        if (actualOffset !== null) expectedMember = altMember;
-                    } else if (actualOffset !== null) {
-                        expectedMember = altMember;
-                    }
-                }
-            }
-        }
-
-        if (actualOffset === null) {
-            // Member not found on this class - can't validate
-            // Method might be a wrapper or access inherited/indirect member
-            // Allow the inlined code to execute
-            Logger.debug("    [Offset Validation] Member '" + expectedMember + "' not found on " + className + " (or target), allowing inline");
-            return true;
-        }
-
-        // Check if detected offset matches expected (tolerance for sub-member access)
-        var tolerance = 16; // Allow some slack for nested member access
-        var isValid = Math.abs(detectedOffset - actualOffset) <= tolerance;
-
-        if (!isValid) {
-            Logger.info("    [Offset Validation] Expected " + expectedMember + " at 0x" +
-                actualOffset.toString(16) + ", but detected 0x" + detectedOffset.toString(16));
-        }
-
-        return isValid;
     }
 
     /// Helper: Get member name at a specific offset in a class
