@@ -46,6 +46,18 @@ function parseIntAuto(str) {
     return s.startsWith("0x") || s.startsWith("0X") ? parseInt(s, 16) : parseInt(s, 10);
 }
 
+/// Helper: Clean up a type name from messy characters (references, extra stars, etc.)
+function cleanType(typeStr) {
+    if (!typeStr) return null;
+    return typeStr
+        .replace(/&/g, "")           // Remove references
+        .replace(/\s+/g, " ")        // Normalize whitespace
+        .replace(/\*\s*\*/g, "*")    // Convert ** to * (often we just want the base pointer)
+        .replace(/\s*\*$/g, "*")     // Normalize trailing pointer
+        .replace(/^(class|struct)\s+/, "") // Strip class/struct prefix
+        .trim();
+}
+
 /// Helper: Check if a BigInt value is a valid user-mode pointer
 /// On x64 Chromium, CppGC/Oilpan heap addresses are always above 4GB (0x100000000)
 /// Compressed pointers like 0x80080ede are 32-bit values and should NOT pass this check
@@ -64,20 +76,24 @@ function isValidUserModePointer(val) {
 /// @returns Normalized type hint (e.g., "(blink::Document*)")
 function normalizeTypeHint(typeName) {
     if (!typeName) return null;
+
+    var clean = cleanType(typeName);
+    if (!clean) return null;
+
     // Already in pointer cast format
-    if (typeName.startsWith("(") && typeName.endsWith(")")) {
-        return typeName;
+    if (clean.startsWith("(") && clean.endsWith(")")) {
+        return clean;
     }
     // Already has pointer suffix, just wrap in parens
-    if (typeName.endsWith("*")) {
-        return "(" + typeName + ")";
+    if (clean.endsWith("*")) {
+        return "(" + clean + ")";
     }
     // Check if it looks like a class/namespace (contains ::) or starts with uppercase
-    if (typeName.includes("::") || /^[A-Z]/.test(typeName)) {
-        return "(" + typeName + "*)";
+    if (clean.includes("::") || /^[A-Z]/.test(clean)) {
+        return "(" + clean + "*)";
     }
     // Primitive or unknown type, return as-is (no pointer)
-    return typeName;
+    return clean;
 }
 
 /// Helper: Register sxe cpr handler for renderer attach
@@ -615,7 +631,7 @@ class SymbolUtils {
                     var retMatch = sig.match(/^([^(]+)\s*\(/);
                     var type = retMatch ? retMatch[1].trim() : sig;
                     Logger.info("    [Type Detection] PDB Signature: " + type);
-                    type = type.replace(/^(class|struct)\s+/, "");
+                    type = cleanType(type);
                     ProcessCache.setReturnType(symbolName, type);
                     return type;
                 }
@@ -1277,29 +1293,27 @@ function extractPointeeType(typeStr) {
     // Pattern 1: scoped_refptr<T>, unique_ptr<T>, Member<T>, DataRef<T>, RefPtr<T>, etc.
     var match = typeStr.match(/(?:scoped_refptr|unique_ptr|Member|WeakMember|Persistent|CrossThreadPersistent|DataRef|RefPtr|base::RefCountedData)\s*<\s*([^<>,]+)/);
     if (match) {
-        return "(" + match[1].trim() + "*)";
+        return "(" + cleanType(match[1]) + "*)";
     }
 
     // Pattern 2: cppgc::internal::BasicMember<T, ...>
     match = typeStr.match(/BasicMember\s*<\s*([^,<>]+)/);
     if (match) {
-        return "(" + match[1].trim() + "*)";
+        return "(" + cleanType(match[1]) + "*)";
     }
 
     // Pattern 3: Already a pointer type "T *" or "T*"
-    match = typeStr.match(/^([a-zA-Z_][a-zA-Z0-9_:]*(?:\s+const)?)\s*\*\s*$/);
+    match = typeStr.match(/^([a-zA-Z_][a-zA-Z0-9_:]*(?:\s+const)?)\s*\*?\s*&?\s*\*?\s*$/);
     if (match) {
-        return "(" + match[1].trim() + "*)";
+        var base = cleanType(match[1]);
+        return "(" + base + "*)";
     }
 
     // Pattern 4: Any template with single type arg - extract inner type as best guess
     // e.g., "SomeWrapper<blink::StyleFoo>" -> "(blink::StyleFoo*)"
     match = typeStr.match(/^[a-zA-Z_][a-zA-Z0-9_:]*\s*<\s*([a-zA-Z_][a-zA-Z0-9_:]+)\s*>$/);
     if (match) {
-        var res = "(" + match[1].trim() + "*)";
-        // Cache this result if we can allow it (helper function doesn't have access to cache easily without passing it)
-        // But extractPointeeType is a helper, not a class method with state.
-        return res;
+        return "(" + cleanType(match[1]) + "*)";
     }
 
     return null;
