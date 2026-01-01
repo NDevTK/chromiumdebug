@@ -1406,8 +1406,14 @@ function readUrlStringFromDx(addr, typeCast) {
 /// @param minLen - Minimum length to match
 /// @param logFailures - If true, log detailed reasons for validation failures
 /// @returns Object {valid: bool, lengthAddr: host.Int64|null, refCountAddr: host.Int64|null} or null
-function _validateStringImplHeader(dataAddr, minLen, logFailures) {
+/// Helper: Validate if an address looks like a StringImpl header
+/// @param dataAddr - Address where string data starts
+/// @param searchStr - The string content to validate flags against
+/// @param logFailures - If true, log detailed reasons for validation failures
+/// @returns Object {valid: bool, lengthAddr: host.Int64|null, refCountAddr: host.Int64|null} or null
+function _validateStringImplHeader(dataAddr, searchStr, logFailures) {
     var addrVal = host.parseInt64(dataAddr, 16);
+    var minLen = searchStr.length;
 
     // Scan window: -32 to +32 bytes
     var startScan = addrVal.subtract(32);
@@ -1425,75 +1431,89 @@ function _validateStringImplHeader(dataAddr, minLen, logFailures) {
             bytes.push((val >> 24) & 0xFF);
         }
 
-        // Offset of dataAddr in 'bytes' array is 32.
+        // Calculate expected flags based on searchStr
+        var isAscii = /^[\x00-\x7F]*$/.test(searchStr);
+        var isLower = isAscii && /^[a-z0-9\W]*$/.test(searchStr); // Lowercase or non-alpha
+
+        // Define flags
+        // kIs8Bit = 1 << 0
+        // kStatic = 1 << 1
+        // kAtomic = 1 << 2
+        // kAsciiPropertyCheckDone = 1 << 3
+        // kContainsOnlyAscii = 1 << 4
+        // kIsLowerAscii = 1 << 5
+
+        var kIs8Bit = 1;
+        var kIsStatic = 2; // 1 << 1
+        var kIsAtomic = 4; // 1 << 2
+        var kContainsOnlyAscii = 16;
+        var kIsLowerAscii = 32;
 
         for (var i = 0; i < bytes.length; i++) {
             var offsetFromData = i - 32;
-            var byteVal = bytes[i];
 
-            // Check 4-byte Length (Raw/SMI)
-            if (i + 4 <= bytes.length) {
+            // Restrict 32-bit header search to EXACTLY -8 (Length offset)
+            if (offsetFromData === -8 && i + 4 <= bytes.length) {
                 var val32 = bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
                 val32 = val32 >>> 0;
 
-                // Restrict 32-bit header search to EXACTLY -8 (WTF::StringImpl Length offset x64)
-                // Matching -12 (RefCount) or -4 (Hash) causes corruption.
-                if (offsetFromData === -8) {
+                // Check Flags at -4 from Data (Offset +4 from length)
+                // Flags = hash_and_flags_ & 0xFF
+                if (i + 4 < bytes.length) {
+                    var flags = bytes[i + 4];
 
-                    // STRICT VALIDATION for WTF::StringImpl
-                    // Layout: [Ref:4][Len:4][Flags:4][Data...]
-                    // Length is at -8. RefCount at -12. Flags at -4.
+                    // 1. Must be 8-bit
+                    if ((flags & kIs8Bit) !== kIs8Bit) {
+                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Flags not 8-bit.");
+                        continue;
+                    }
 
-                    if (offsetFromData === -8) {
-                        // 1. Check Flags (Is8Bit) at -4
-                        if (i + 4 < bytes.length) {
-                            var flags = bytes[i + 4];
-                            if ((flags & 1) !== 1) {
-                                if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Flags not 8-bit.");
-                                continue;
-                            }
+                    // 2. Reject Static Strings (avoid modifying constants/RO memory)
+                    if ((flags & kIsStatic) === kIsStatic) {
+                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Static String.");
+                        continue;
+                    }
+
+                    // 3. Reject Atomic Strings (avoid corrupting AtomicStringTable)
+                    if ((flags & kIsAtomic) === kIsAtomic) {
+                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Atomic String.");
+                        continue;
+                    }
+
+                    // 2. Validate ASCII flags if applicable
+                    if (isAscii) {
+                        if ((flags & kContainsOnlyAscii) !== kContainsOnlyAscii) {
+                            if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Missing kContainsOnlyAscii flag.");
+                            continue;
                         }
-
-                        // 2. Check RefCount at -12 (Must be > 0 for live object)
-                        if (i - 4 >= 0) {
-                            var refCount = bytes[i - 4] | (bytes[i - 3] << 8) | (bytes[i - 2] << 16) | (bytes[i - 1] << 24);
-                            if (refCount === 0) {
-                                if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: RefCount is 0 (Dead Object).");
-                                continue;
-                            }
+                        if (isLower && (flags & kIsLowerAscii) !== kIsLowerAscii) {
+                            if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: Missing kIsLowerAscii flag.");
+                            continue;
                         }
                     }
+                }
 
-                    // Raw 32
-                    if (val32 >= minLen && val32 < minLen + 1000) {
-                        var matchAddr = startScan.add(i);
-                        if (logFailures) Logger.info("  [DEBUG] Found Raw 32-bit Length " + val32 + " at " + offsetFromData);
-                        return { valid: true, lengthAddr: matchAddr, encoding: 'raw', actualLen: val32 };
+                // 3. Check RefCount at -12 (Data - 12)
+                if (i - 4 >= 0) {
+                    var refCount = bytes[i - 4] | (bytes[i - 3] << 8) | (bytes[i - 2] << 16) | (bytes[i - 1] << 24);
+                    if (refCount === 0) {
+                        if (logFailures) Logger.info("  [DEBUG] Rejected Length at -8: RefCount is 0 (Dead Object).");
+                        continue;
                     }
-                    // SMI 32
-                    var valSmi = val32 >> 1;
-                    if ((val32 & 1) === 0 && valSmi >= minLen && valSmi < minLen + 1000) {
-                        var matchAddr = startScan.add(i);
-                        if (logFailures) Logger.info("  [DEBUG] Found SMI 32-bit Length " + valSmi + " at " + offsetFromData);
-                        return { valid: true, lengthAddr: matchAddr, encoding: 'smi', actualLen: valSmi };
-                    }
+                }
+
+                // Check Length (Raw or SMI)
+                if (val32 >= minLen && val32 < minLen + 1000) {
+                    return { valid: true, lengthAddr: startScan.add(i), encoding: 'raw', actualLen: val32 };
+                }
+                var valSmi = val32 >> 1;
+                if ((val32 & 1) === 0 && valSmi >= minLen && valSmi < minLen + 1000) {
+                    return { valid: true, lengthAddr: startScan.add(i), encoding: 'smi', actualLen: valSmi };
                 }
             }
         }
     } catch (e) {
         if (logFailures) Logger.info("  [DEBUG] Scan failed: " + e.message);
-    }
-
-    if (logFailures) {
-        Logger.info("  [DEBUG] No valid header found in preceding 32 bytes.");
-        // Dump the hex values to see what's actually there
-        var hexDump = [];
-        if (ints) {
-            for (var val of ints) {
-                hexDump.push("0x" + val.toString(16));
-            }
-        }
-        Logger.info("  [DEBUG] Memory dump [-32..0]: " + hexDump.join(", "));
     }
     return { valid: false, lengthAddr: null };
 }
@@ -1532,10 +1552,33 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
         var skipped = 0;
         var hasLoggedFailure = false;
 
+        // Get RSP to filter out stack addresses
+        var rsp = null;
+        try {
+            var rspOutput = ctl.ExecuteCommand('.printf "%I64x", @rsp');
+            for (var line of rspOutput) {
+                var s = line.toString().trim();
+                if (/^[0-9a-fA-F]+$/.test(s)) {
+                    rsp = BigInt("0x" + s);
+                    break;
+                }
+            }
+        } catch (e) { }
+
         for (var addr of addresses) {
             try {
                 if (typeof addr === 'string') {
                     addr = host.parseInt64(addr, 16);
+                }
+
+                // Skip stack addresses (within 1MB of RSP) - these are temporary
+                if (rsp) {
+                    var addrBig = BigInt("0x" + addr.toString(16));
+                    var stackDistance = addrBig > rsp ? addrBig - rsp : rsp - addrBig;
+                    if (stackDistance < 0x100000n) {
+                        skipped++;
+                        continue;
+                    }
                 }
 
                 if (!_isWritable(addr)) {
@@ -1548,7 +1591,7 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
                 // If lengths differ, we try to find and update the length field
                 if (needsLengthUpdate) {
                     var doLog = (skipped < 3);
-                    headerInfo = _validateStringImplHeader(addr, searchStr.length, doLog);
+                    headerInfo = _validateStringImplHeader(addr, searchStr, doLog);
 
                     if (headerInfo && headerInfo.valid) {
                         var finalNewLen = replaceStr.length;
@@ -1610,6 +1653,14 @@ function _patchStringInMemory(ctl, searchStr, replaceStr, label, isUnicode) {
                             }
                         }
                     } else {
+                        skipped++;
+                        continue;
+                    }
+                } else {
+                    // Same-length replacement: still validate this is a StringImpl
+                    var doLog = (skipped < 3);
+                    headerInfo = _validateStringImplHeader(addr, searchStr, doLog);
+                    if (!headerInfo || !headerInfo.valid) {
                         skipped++;
                         continue;
                     }
