@@ -3734,24 +3734,28 @@ class Exec {
         var className = cleanSym.substring(0, lastCC);
         var offsetHex = offset.toString(16).toLowerCase();
 
-        try {
-            var ctl = SymbolUtils.getControl();
-            var dtOutput = ctl.ExecuteCommand("dt chrome!" + className);
-            var offsetPattern = new RegExp("\\+0x" + offsetHex + "\\s+(\\S+)\\s+:\\s+(.+)", "i");
+        // 1. Find member name at this offset
+        var memberName = this._getMemberAtOffset(className, offset);
 
-            for (var line of dtOutput) {
-                var lineStr = line.toString();
-                var m = lineStr.match(offsetPattern);
-                if (m) {
-                    var memberName = m[1];
-                    var memberType = m[2].trim();
-                    Logger.info("    [Type Detection] dt offset 0x" + offsetHex.toUpperCase() + " -> " + memberName + " : " + memberType);
-                    // Clean up type (remove template noise if simple type)
-                    var simpleType = memberType.split("<")[0].trim();
-                    return this._normalizeTypeHint(simpleType);
-                }
+        if (memberName) {
+            // 2. Get full semantic type info using unified helper
+            var typeInfo = this._getMemberTypeInfo(className, memberName);
+
+            if (typeInfo) {
+                Logger.info("    [Type Detection] dt offset 0x" + offsetHex.toUpperCase() + " -> " + memberName + " : " + typeInfo.typeName);
+
+                // 3. Cache the result! 
+                // This ensures future accesses (inline or direct) use the correct complex object logic
+                ProcessCache.setOffset(className + "->" + memberName, {
+                    offset: typeInfo.offset,
+                    path: memberName,
+                    isComplexObject: typeInfo.isComplexObject,
+                    typeName: typeInfo.typeName
+                });
+
+                return this._normalizeTypeHint(typeInfo.typeName);
             }
-        } catch (e) { }
+        }
 
         return null;
     }
@@ -4355,10 +4359,10 @@ class Exec {
         var foundPath = null;
 
         // Check cache first (using ProcessCache)
-        if (ProcessCache.getOffset(className + "->" + memberName)) {
-            var cached = ProcessCache.getOffset(className + "->" + memberName);
+        var cached = ProcessCache.getOffset(className + "->" + memberName);
+        if (cached) {
             Logger.info("    [Cache Hit] " + className + "->" + memberName + " offset=0x" + cached.offset.toString(16));
-            return this._readMember(thisPtr, cached.offset);
+            return this._readCachedMember(cached, thisPtr);
         }
 
         // Automatic hierarchy search ("Deep Member Lookup")
@@ -4506,7 +4510,7 @@ class Exec {
         var cached = ProcessCache.getOffset(className + "->" + methodName);
         if (cached && cached.offset !== undefined && cached.offset !== null) {
             Logger.info("    [Cache Hit] Offset = 0x" + cached.offset.toString(16));
-            return this._readMember(thisPtr, cached.offset);
+            return this._readCachedMember(cached, thisPtr);
         }
 
         // Use x /v to find function info from PDB
@@ -4913,6 +4917,76 @@ class Exec {
         return null;
     }
 
+    /// Get complete type information for a class member using dt command
+    /// This is the canonical way to determine if a member is a complex object (embedded struct)
+    /// vs a pointer, primitive, or other simple type.
+    /// @param className - Class name (e.g., "blink::Document")
+    /// @param memberName - Member name (e.g., "url_")
+    /// @returns {offset: number, typeName: string, isComplexObject: boolean} or null if not found
+    static _getMemberTypeInfo(className, memberName) {
+        var ctl = SymbolUtils.getControl();
+        try {
+            var qualifiedClass = className.indexOf("!") === -1 ? "chrome!" + className : className;
+            var output = ctl.ExecuteCommand("dt " + qualifiedClass + " " + memberName);
+
+            for (var line of output) {
+                var lineStr = line.toString();
+
+                // dt output format: +0x138 url_ : blink::KURL
+                // or: +0x028 element_ : blink::Element *
+                // or: +0x010 flags_ : unsigned int
+                var m = lineStr.match(/\+0x([0-9a-fA-F]+)\s+(\w+)\s+:\s+(.+)/);
+                if (m) {
+                    var offset = parseInt(m[1], 16);
+                    var foundMember = m[2];
+                    var typeName = m[3].trim();
+
+                    // Determine if this is a complex embedded object:
+                    // - NOT a pointer (doesn't end with *)
+                    // - NOT a primitive (int, bool, float, double, char, etc.)
+                    // Complex objects are embedded structs/classes that should return address
+
+                    var isPointer = typeName.endsWith("*");
+                    var isReference = typeName.endsWith("&");
+
+                    // Primitive types (including sized variants)
+                    var primitiveTypes = [
+                        "bool", "int", "unsigned int", "signed int",
+                        "short", "unsigned short", "long", "unsigned long",
+                        "long long", "unsigned long long", "__int64", "unsigned __int64",
+                        "char", "unsigned char", "signed char", "wchar_t",
+                        "float", "double", "void",
+                        "size_t", "ptrdiff_t", "intptr_t", "uintptr_t",
+                        "int8_t", "int16_t", "int32_t", "int64_t",
+                        "uint8_t", "uint16_t", "uint32_t", "uint64_t"
+                    ];
+
+                    var isPrimitive = primitiveTypes.indexOf(typeName) !== -1;
+
+                    // Also check for Bitfield pseudo-types: Pos 0, 1 Bit or similar
+                    var isBitfield = /^Pos\s+\d+/.test(typeName);
+
+                    // Complex object = not pointer, not reference, not primitive, not bitfield
+                    // Examples: blink::KURL, blink::String, content::FrameTree
+                    var isComplexObject = !isPointer && !isReference && !isPrimitive && !isBitfield;
+
+                    Logger.debug("    [TypeInfo] " + foundMember + " @ 0x" + offset.toString(16) +
+                        " : " + typeName + " (complex=" + isComplexObject + ")");
+
+                    return {
+                        offset: offset,
+                        typeName: typeName,
+                        isComplexObject: isComplexObject,
+                        isPointer: isPointer
+                    };
+                }
+            }
+        } catch (e) {
+            Logger.debug("    [TypeInfo] dt lookup failed: " + e.message);
+        }
+        return null;
+    }
+
     /// Helper: Infer return type from method name
     /// e.g., "GetSecurityOrigin" -> "blink::SecurityOrigin*"
     ///       "GetDocument" -> "blink::Document*"
@@ -4961,12 +5035,40 @@ class Exec {
         var cached = ProcessCache.getOffset(className + "->" + memberName);
         if (cached) {
             Logger.info("    [Cache] Reading member at offset 0x" + cached.offset.toString(16));
-            return this._readMember(thisPtr, cached.offset);
+            return this._readCachedMember(cached, thisPtr);
         }
 
         var ctl = SymbolUtils.getControl();
         var result = null;
 
+        // 2. Try semantic type detection using dt command (PDB-based, reliable)
+        var typeInfo = this._getMemberTypeInfo(className, memberName);
+        if (typeInfo) {
+            Logger.info("    [TypeInfo] Using PDB type: " + typeInfo.typeName + " (complex=" + typeInfo.isComplexObject + ")");
+
+            // Cache the result with full type info
+            ProcessCache.setOffset(className + "->" + memberName, {
+                offset: typeInfo.offset,
+                path: memberName,
+                isComplexObject: typeInfo.isComplexObject,
+                typeName: typeInfo.typeName
+            });
+
+            if (typeInfo.isComplexObject) {
+                // Complex embedded object: return address (this + offset)
+                this.currentReturnTypeHint = typeInfo.typeName;
+                Logger.info("    [Type Hint] Set hint for next call: " + typeInfo.typeName);
+                var addr = MemoryUtils.parseBigInt(thisPtr) + BigInt(typeInfo.offset);
+                var addrStr = "0x" + addr.toString(16);
+                Logger.info("    [TypeInfo] Result (Object Address): " + addrStr);
+                return addrStr;
+            } else {
+                // Pointer or primitive: read the value
+                return this._readMember(thisPtr, typeInfo.offset);
+            }
+        }
+
+        // 3. Fallback to dx command (when dt fails or member not found)
         try {
             // Build dx expression: ((<type>*)<addr>)->member_
             var expr = "((" + className + "*)0x" +
@@ -5025,8 +5127,8 @@ class Exec {
                                 var m = offLine.toString().match(/:\s*(0x[0-9a-fA-F]+)/);
                                 if (m) {
                                     var offset = BigInt(m[1]);
-                                    ProcessCache.setOffset(className + "->" + memberName, { offset: offset, path: "cached" });
-                                    Logger.info("    [Cache] Stored offset 0x" + m[1] + " for " + memberName);
+                                    ProcessCache.setOffset(className + "->" + memberName, { offset: offset, path: "cached", isComplexObject: true, typeName: typeName });
+                                    Logger.info("    [Cache] Stored offset 0x" + m[1] + " for " + memberName + " (complex object: " + typeName + ")");
                                     // Return address: thisPtr + offset
                                     var addr = MemoryUtils.parseBigInt(thisPtr) + offset;
                                     var addrStr = "0x" + addr.toString(16);
@@ -5819,6 +5921,28 @@ class Exec {
             Logger.error("Failed to read memory at 0x" + memberAddr.toString(16) + ": " + e.message);
             return null;
         }
+    }
+
+    /// Read a cached member, handling both complex objects and simple values
+    /// For complex objects: returns address (this + offset) and sets type hint
+    /// For simple values: reads 8 bytes from memory at offset
+    /// @param cached - Cache entry with {offset, isComplexObject?, typeName?}
+    /// @param thisPtr - The object pointer
+    /// @returns Address string or memory value
+    static _readCachedMember(cached, thisPtr) {
+        if (cached.isComplexObject) {
+            // Complex object: return address, set type hint for chaining
+            if (cached.typeName) {
+                this.currentReturnTypeHint = cached.typeName;
+                Logger.info("    [Cache] Type hint restored: " + cached.typeName);
+            }
+            var addr = MemoryUtils.parseBigInt(thisPtr) + BigInt(cached.offset);
+            var addrStr = "0x" + addr.toString(16);
+            Logger.info("    [Cache] Result (Object Address): " + addrStr);
+            return addrStr;
+        }
+        // Simple value: read memory
+        return this._readMember(thisPtr, cached.offset);
     }
 
     static _analyzeResult(resultVal, floatValBitcast) {
