@@ -1,2 +1,0 @@
-.scriptload "C:\Users\lewis\Desktop\chromiumdebug\chromium_security.js"
-g

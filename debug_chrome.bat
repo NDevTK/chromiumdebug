@@ -69,20 +69,21 @@ SET CHROME_FLAGS=^
     --wait-for-debugger-children
 
 :: WinDbg initialization commands
-:: -o : Debug child processes
-:: -G : Ignore initial breakpoint (go on attach)
-:: -c : Execute commands on startup
-:: Init script for WinDbg (loads our JavaScript)
+:: -o : Debug child processes  
+:: -g : Ignore initial breakpoint for the FIRST process (Chrome browser)
+:: -G : Ignore final breakpoint when process terminates
+:: The init script just loads our JS - the -g flag handles continuing automatically
+
 SET "INIT_SCRIPT=%SCRIPT_DIR%init.txt"
 echo .scriptload "%WINDBG_SCRIPT%"> "%INIT_SCRIPT%"
-echo g>> "%INIT_SCRIPT%"
 
 echo.
 echo  Launching WinDbg...
 echo.
 
 :: Launch WinDbg with Chrome as target
-:: Use $$< to execute commands from file
+:: -g handles the initial breakpoint automatically (no manual break needed)
+:: The script is loaded via $$< which runs after -g takes effect
 start "" "%WINDBG_EXE%" -o -g -G -c "$$<%INIT_SCRIPT%" "%CHROME_PATH%" %CHROME_FLAGS%
 
 echo.
