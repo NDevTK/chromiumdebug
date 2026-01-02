@@ -5225,9 +5225,19 @@ class Exec {
     /// @returns Object { realValue: BigInt (pointer to StringView), sizeUsed: BigInt }
     static _prepareStringArg(str, scratchBase, currentOffset) {
         // 1. Resolve Blink's static empty StringImpl pointers (used for literals)
+        // StringImpl::empty_ is used as a marker for 8-bit strings
+        // StringImpl::empty16_bit_ is used as a marker for 16-bit strings
+        // These MUST be valid - if null, Is8Bit() will crash when dereferencing impl_
         var empty8 = MemoryUtils.readGlobalPointer("chrome!blink::StringImpl::empty_");
         var empty16 = MemoryUtils.readGlobalPointer("chrome!blink::StringImpl::empty16_bit_");
-        if (!empty8 || !empty16) Logger.warn("    [StringView] Could not resolve static markers");
+
+        // Also try WTF:: namespace if blink:: fails
+        if (!empty8) {
+            empty8 = MemoryUtils.readGlobalPointer("chrome!WTF::StringImpl::empty_");
+        }
+        if (!empty16) {
+            empty16 = MemoryUtils.readGlobalPointer("chrome!WTF::StringImpl::empty16_bit_");
+        }
 
         // 2. Determine encoding
         var is8Bit = true;
@@ -5235,42 +5245,62 @@ class Exec {
             if (str.charCodeAt(j) > 0xFF) { is8Bit = false; break; }
         }
 
-        // 3. Write raw character data
+        // Validate we have the required marker pointer
+        var implPtrVal = 0n;
+        if (is8Bit) {
+            if (!empty8) {
+                Logger.error("    [StringView] Cannot resolve StringImpl::empty_ - string argument preparation will fail!");
+                Logger.error("    [StringView] This is required for passing string arguments to Blink functions.");
+                Logger.info("    [StringView] Try running: dx chrome!blink::StringImpl::empty_");
+                throw new Error("StringImpl::empty_ not found - cannot construct 8-bit StringView");
+            }
+            implPtrVal = BigInt("0x" + empty8);
+        } else {
+            if (!empty16) {
+                Logger.error("    [StringView] Cannot resolve StringImpl::empty16_bit_ - string argument preparation will fail!");
+                throw new Error("StringImpl::empty16_bit_ not found - cannot construct 16-bit StringView");
+            }
+            implPtrVal = BigInt("0x" + empty16);
+        }
+
+        // 3. Write raw character data (with null terminator for safety)
         var strDataAddr = scratchBase + currentOffset;
         var charBytes = [];
         if (is8Bit) {
             for (var j = 0; j < str.length; j++) charBytes.push(str.charCodeAt(j));
+            charBytes.push(0); // Null terminator (safety for some API expectations)
         } else {
             for (var j = 0; j < str.length; j++) {
                 var code = str.charCodeAt(j);
                 charBytes.push(code & 0xFF); charBytes.push((code >> 8) & 0xFF);
             }
+            charBytes.push(0, 0); // Null terminator (2 bytes for UChar)
         }
         MemoryUtils.writeMemory(strDataAddr.toString(16), charBytes);
-        Logger.debug("    [StringView] Data (" + (is8Bit ? "8-bit" : "16-bit") + ") at: 0x" + strDataAddr.toString(16));
+        Logger.info("    [StringView] Data (\"" + str + "\", " + (is8Bit ? "8-bit" : "16-bit") + ") at: 0x" + strDataAddr.toString(16));
 
-        // 4. Create StringView Struct (24 bytes)
+        // 4. Create StringView Struct (24 bytes total, aligned)
+        // Layout: impl_ (8 bytes) | bytes_ (8 bytes) | length_ (4 bytes) | padding (4 bytes)
         var dataSize = BigInt(charBytes.length);
-        if (dataSize % 8n !== 0n) dataSize += (8n - (dataSize % 8n));
+        if (dataSize % 8n !== 0n) dataSize += (8n - (dataSize % 8n)); // Align data section
         var viewAddr = scratchBase + currentOffset + dataSize;
 
-        // +0x00: impl_
-        var implPtrVal = is8Bit ? (empty8 ? BigInt("0x" + empty8) : 0n) : (empty16 ? BigInt("0x" + empty16) : 0n);
+        // +0x00: impl_ (StringImpl* - marker for Is8Bit())
         var implBytes = []; var tempImpl = implPtrVal;
         for (var m = 0; m < 8; m++) { implBytes.push(Number(tempImpl & 0xFFn)); tempImpl >>= 8n; }
         MemoryUtils.writeMemory(viewAddr.toString(16), implBytes);
 
-        // +0x08: bytes_
+        // +0x08: bytes_ (pointer to character data)
         var ptrBytes = []; var tempPtr = strDataAddr;
         for (var k = 0; k < 8; k++) { ptrBytes.push(Number(tempPtr & 0xFFn)); tempPtr >>= 8n; }
         MemoryUtils.writeMemory((viewAddr + 8n).toString(16), ptrBytes);
 
-        // +0x10: length_
+        // +0x10: length_ (4 bytes unsigned)
         var lenVal = str.length;
         var lenBytes = [lenVal & 0xFF, (lenVal >> 8) & 0xFF, (lenVal >> 16) & 0xFF, (lenVal >> 24) & 0xFF];
         MemoryUtils.writeMemory((viewAddr + 16n).toString(16), lenBytes);
 
-        Logger.debug("    [StringView] Struct at: 0x" + viewAddr.toString(16) + " (impl=0x" + implPtrVal.toString(16) + ")");
+        Logger.info("    [StringView] Struct at: 0x" + viewAddr.toString(16) + " (impl=0x" + implPtrVal.toString(16) + ", len=" + str.length + ")");
         return { realValue: viewAddr, sizeUsed: dataSize + 24n };
     }
 
@@ -5422,10 +5452,84 @@ class Exec {
 
             // 1. Copy real inlined bytes from target (bulk read for performance)
             var srcAddr = MemoryUtils.parseBigInt(inlineAddr);
+
+            // Sanity check: Verify source address looks reasonable (should be in module range)
+            if (srcAddr < 0x10000n || srcAddr > BigInt("0x7FFFFFFFFFFF")) {
+                Logger.error("    [Sanity Check] Source address 0x" + srcAddr.toString(16) + " is outside valid range!");
+                Logger.info("    This may indicate stale cache. Try: ProcessCache.clearCurrent()");
+                return null;
+            }
+
             var codeBytes = [];
-            var values = host.memory.readMemoryValues(host.parseInt64(srcAddr.toString(16), 16), inlineSize, 1);
-            for (var v of values) {
-                codeBytes.push(Number(v));
+            try {
+                var values = host.memory.readMemoryValues(host.parseInt64("0x" + srcAddr.toString(16)), inlineSize, 1);
+                for (var v of values) {
+                    codeBytes.push(Number(v));
+                }
+            } catch (readErr) {
+                Logger.error("    [Code Copy] Failed to read from 0x" + srcAddr.toString(16) + ": " + readErr.message);
+                Logger.info("    Auto-clearing symbol cache for this process...");
+                // Auto-invalidate cache to force fresh lookup next time
+                ProcessCache.clearCurrent();
+                return null;
+            }
+
+            // Sanity check: First bytes should look like valid x86 code (not all zeros or 0xCC)
+            var codeInvalid = false;
+            if (codeBytes.length > 0) {
+                var allZeros = codeBytes.slice(0, Math.min(4, codeBytes.length)).every(b => b === 0);
+                var allInt3 = codeBytes.slice(0, Math.min(4, codeBytes.length)).every(b => b === 0xCC);
+                if (allZeros || allInt3) {
+                    Logger.warn("    [Sanity Check] Copied code looks invalid (all zeros or INT3)");
+                    Logger.info("    First bytes: " + codeBytes.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join(' '));
+                    Logger.info("    Auto-clearing symbol cache...");
+                    ProcessCache.clearCurrent();
+                    codeInvalid = true;
+                }
+            }
+
+            // Pattern verification: Verify first instruction matches expected type
+            // This catches cases where the wrong inline candidate was selected
+            if (!codeInvalid && codeBytes.length >= 4) {
+                var firstByte = codeBytes[0];
+                var secondByte = codeBytes.length > 1 ? codeBytes[1] : 0;
+                var thirdByte = codeBytes.length > 2 ? codeBytes[2] : 0;
+
+                // Expected patterns based on outputReg detection:
+                // ADD: 48 81 C1 xx (add rcx, imm32) or 48 83 C1 xx (add rcx, imm8)
+                // LEA: 48 8D xx (lea rxx, [...])
+                // MOV: 48 8B xx (mov rxx, [...]) or 48 89 xx (mov [...], rxx)
+                // MOVSXD: 48 63 xx (movsxd rxx, [...])
+                // MOVSS/SD: F3 0F 10 (movss) or F2 0F 10 (movsd)
+
+                var looksLikeValidCode = false;
+
+                // REX.W prefix (0x48, 0x49, 0x4C, 0x4D) followed by opcode
+                if ((firstByte >= 0x48 && firstByte <= 0x4F)) {
+                    // ADD, LEA, MOV, MOVSXD all start with REX prefix
+                    if (secondByte === 0x81 || secondByte === 0x83 || // ADD
+                        secondByte === 0x8D || // LEA
+                        secondByte === 0x8B || secondByte === 0x89 || // MOV
+                        secondByte === 0x63) { // MOVSXD
+                        looksLikeValidCode = true;
+                    }
+                }
+                // SSE prefix (F2/F3) for float operations
+                if (firstByte === 0xF2 || firstByte === 0xF3) {
+                    if (secondByte === 0x0F) {
+                        looksLikeValidCode = true;
+                    }
+                }
+                // Non-REX instructions (less common but valid)
+                if (firstByte === 0x8B || firstByte === 0x8D || firstByte === 0x89) {
+                    looksLikeValidCode = true;
+                }
+
+                if (!looksLikeValidCode) {
+                    Logger.warn("    [Pattern Check] First instruction doesn't match expected getter pattern");
+                    Logger.info("    First bytes: " + codeBytes.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join(' '));
+                    // Don't fail, but log for debugging - some valid patterns might not be recognized
+                }
             }
 
             // 2. Append INT3 as fallback (in case no RET found in copied code)
@@ -5433,6 +5537,21 @@ class Exec {
 
             // 3. Write to our buffer
             MemoryUtils.writeMemory(buf, codeBytes);
+
+            // Debug: Show what code we copied (only in DEBUG_MODE)
+            if (DEBUG_MODE) {
+                Logger.info("    [Debug] Copied " + inlineSize + " bytes from 0x" + srcAddr.toString(16));
+                try {
+                    var debugDisasm = ctl.ExecuteCommand("u 0x" + buf + " L10");
+                    Logger.info("    [Debug] Disassembly of copied code:");
+                    var lineCount = 0;
+                    for (var dLine of debugDisasm) {
+                        if (lineCount++ < 5) {  // Show first 5 instructions
+                            Logger.info("      " + dLine.toString().trim());
+                        }
+                    }
+                } catch (e) { }
+            }
 
             // 4. Find the first RET in the copied code and replace it with INT3
             // This ensures we break at the right place regardless of PDB inlineSize accuracy
@@ -5542,6 +5661,33 @@ class Exec {
             Logger.info("    Executing real inlined code (with args)...");
             // Use gH (go with exception handled) to clear any pending exception state
             ctl.ExecuteCommand("gH");
+
+            // Debug: Show where we stopped and register state (only in DEBUG_MODE)
+            if (DEBUG_MODE) {
+                try {
+                    var ripOut = ctl.ExecuteCommand('.printf "%I64x", @rip');
+                    var ripVal = "";
+                    for (var line of ripOut) {
+                        var s = line.toString().trim();
+                        if (/^[0-9a-fA-F]+$/.test(s)) { ripVal = s; break; }
+                    }
+                    var bufBigInt = BigInt("0x" + buf);
+                    var ripBigInt = BigInt("0x" + ripVal);
+                    var offsetInBuf = ripBigInt - bufBigInt;
+                    Logger.info("    [Debug] Stopped at RIP: 0x" + ripVal + " (offset 0x" + offsetInBuf.toString(16) + " in buffer)");
+
+                    // Show the output register value
+                    var regOut = ctl.ExecuteCommand('.printf "%I64x", @' + outputReg);
+                    for (var line of regOut) {
+                        var s = line.toString().trim();
+                        if (/^[0-9a-fA-F]+$/.test(s)) {
+                            Logger.info("    [Debug] " + outputReg.toUpperCase() + " after execution: 0x" + s);
+                            break;
+                        }
+                    }
+                } catch (e) { }
+            }
+
 
 
             // 7. Read output register and xmm0 (for float support)
@@ -6130,9 +6276,102 @@ class Exec {
         }
 
         // Read Result (and XMM0)
-        var resultVals = host.memory.readMemoryValues(host.parseInt64(baseAddr.toString(16), 16), 2, 8);
-        var result = BigInt(resultVals[0]);
-        var resultXmm = BigInt(resultVals[1]);
+        // Wrap in try-catch to handle cases where execution crashed and corrupted memory
+        var result = 0n;
+        var resultXmm = 0n;
+        try {
+            // Use explicit 0x prefix for reliable parsing
+            var addrStr = "0x" + baseAddr.toString(16);
+            var resultVals = host.memory.readMemoryValues(host.parseInt64(addrStr), 2, 8);
+            result = BigInt(resultVals[0]);
+            resultXmm = BigInt(resultVals[1]);
+        } catch (memReadErr) {
+            Logger.error("Failed to read result from execution buffer: " + memReadErr.message);
+            Logger.error("This usually means the shellcode execution crashed or caused an exception.");
+
+            // Diagnostic: Check current RIP to see where we crashed
+            try {
+                var ripOut = ctl.ExecuteCommand('.printf "%I64x", @rip');
+                for (var line of ripOut) {
+                    var s = line.toString().trim();
+                    if (/^[0-9a-fA-F]+$/.test(s)) {
+                        var currentRip = "0x" + s;
+                        Logger.info("  [Diagnostic] Current RIP: " + currentRip);
+                        // Check if RIP is in our shellcode buffer
+                        var ripBig = BigInt(currentRip);
+                        if (ripBig >= baseAddr && ripBig < baseAddr + BigInt(allocSize)) {
+                            var offset = ripBig - baseAddr;
+                            Logger.info("  [Diagnostic] Crash in shellcode buffer at offset 0x" + offset.toString(16));
+                        } else {
+                            // Try to resolve symbol at RIP
+                            var symName = SymbolUtils.getSymbolName(currentRip);
+                            if (symName) {
+                                Logger.info("  [Diagnostic] Crash at symbol: " + symName);
+                            }
+                        }
+                        break;
+                    }
+                }
+            } catch (diagErr) { }
+
+            // Diagnostic: Check exception record
+            try {
+                var exrOut = ctl.ExecuteCommand(".exr -1");
+                for (var line of exrOut) {
+                    var lineStr = line.toString();
+                    if (lineStr.indexOf("ExceptionCode:") !== -1 || lineStr.indexOf("ExceptionAddress:") !== -1) {
+                        Logger.info("  [Diagnostic] " + lineStr.trim());
+                    }
+                }
+            } catch (exrErr) { }
+
+            Logger.info("  Attempting to restore registers and check state...");
+
+            // Auto-clear cache to help recover from potential transient issues
+            Logger.info("  Auto-clearing symbol cache in case of stale data...");
+            ProcessCache.clearCurrent();
+
+            // Try to restore registers even on failure
+            try {
+                ctl.ExecuteCommand("r @rip = @$t0");
+                ctl.ExecuteCommand("r @rsp = @$t1");
+                ctl.ExecuteCommand("r @rcx = @$t2");
+                ctl.ExecuteCommand("r @rdx = @$t3");
+                ctl.ExecuteCommand("r @r8 = @$t4");
+                ctl.ExecuteCommand("r @r9 = @$t5");
+                ctl.ExecuteCommand("r @rax = @$t6");
+                ctl.ExecuteCommand("r @rbx = @$t7");
+                Logger.info("  Registers restored.");
+            } catch (restoreErr) {
+                Logger.error("  Failed to restore registers: " + restoreErr.message);
+            }
+
+            // Try to free allocation
+            try {
+                if (baseAddrHex) MemoryUtils.free(baseAddrHex, allocSize);
+            } catch (freeErr) { }
+
+            // Try to read RAX directly as a fallback (the function may have returned)
+            try {
+                var raxOut = ctl.ExecuteCommand('.printf "%I64x", @rax');
+                for (var line of raxOut) {
+                    var s = line.toString().trim();
+                    if (/^[0-9a-fA-F]+$/.test(s)) {
+                        result = BigInt("0x" + s);
+                        Logger.info("  Fallback: Read RAX directly = 0x" + result.toString(16));
+                        break;
+                    }
+                }
+            } catch (raxErr) { }
+
+            // If we got a result from RAX, continue with analysis
+            if (result !== 0n) {
+                result = this._analyzeResult(result, 0n);
+                return "0x" + result.toString(16);
+            }
+
+            return null;
+        }
 
         // Restore Registers first (before any analysis that might fail)
         ctl.ExecuteCommand("r @rip = @$t0");
