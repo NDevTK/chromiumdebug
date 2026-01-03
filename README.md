@@ -5,7 +5,7 @@ Inspired by [spoof.js](https://github.com/shhnjk/spoof.js)
 
 > [!WARNING]
 > Avoid untrusted websites and networks while using this script!  
-> Enables MojoJS and Chrome DevTools Protocol both make the browser less secure.
+> Enables MojoJS and Chrome DevTools Protocol both make the browser less secure but help with security research.
 
 ## Quick Start
 - Install [Chrome Canary](https://www.google.com/chrome/canary/)
