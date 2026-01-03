@@ -3,6 +3,10 @@
 An experimental WinDbg debugging toolkit for Chromium security researchers  
 Inspired by [spoof.js](https://github.com/shhnjk/spoof.js)
 
+> [!WARNING]
+> Avoid untrusted websites while using this script!  
+> Enables MojoJS and Chrome DevTools Protocol both make the browser less secure.
+
 ## Quick Start
 - Install [Chrome Canary](https://www.google.com/chrome/canary/)
 - Install [WinDbg from MS Store](https://apps.microsoft.com/detail/9pgjgd53tn86)
