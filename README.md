@@ -4,7 +4,7 @@ An experimental WinDbg debugging toolkit for Chromium security researchers
 Inspired by [spoof.js](https://github.com/shhnjk/spoof.js)
 
 > [!WARNING]
-> Avoid untrusted websites while using this script!  
+> Avoid untrusted websites and networks while using this script!  
 > Enables MojoJS and Chrome DevTools Protocol both make the browser less secure.
 
 ## Quick Start
