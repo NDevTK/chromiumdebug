@@ -66,7 +66,9 @@ SET CHROME_FLAGS=^
     --metrics-recording-only ^
     --safebrowsing-disable-auto-update ^
     --site-per-process ^
-    --wait-for-debugger-children
+    --wait-for-debugger-children ^
+    --remote-debugging-port=9222 ^
+    --enable-blink-features=MojoJS
 
 :: WinDbg initialization commands
 :: -o : Debug child processes  
