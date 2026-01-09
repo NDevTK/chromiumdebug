@@ -68,7 +68,8 @@ SET CHROME_FLAGS=^
     --site-per-process ^
     --wait-for-debugger-children ^
     --remote-debugging-port=9222 ^
-    --enable-blink-features=MojoJS
+    --enable-blink-features=MojoJS ^
+    https://ndevtk.github.io/MojoGUI/
 
 :: WinDbg initialization commands
 :: -o : Debug child processes  
