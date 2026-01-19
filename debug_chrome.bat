@@ -70,7 +70,6 @@ SET CHROME_FLAGS=^
     --wait-for-debugger-children ^
     --remote-debugging-port=9222 ^
     --enable-blink-features=MojoJS,MojoJSTest ^
-    --disable-kill-after-bad-ipc ^
     https://ndevtk.github.io/MojoGUI/
 
 :: WinDbg initialization commands
