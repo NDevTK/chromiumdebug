@@ -13,6 +13,7 @@ SET "CHROME_PATH=C:\Users\%USERNAME%\AppData\Local\Google\Chrome SxS\Application
 SET "WINDBG_EXE=WinDbgX.exe"
 SET "SCRIPT_DIR=%~dp0"
 SET "WINDBG_SCRIPT=%SCRIPT_DIR%chromium_security.js"
+SET _NT_SYMBOL_TIMEOUT=1200
 
 :: Validate Chrome Canary installation
 if not exist "%CHROME_PATH%" (
@@ -69,6 +70,7 @@ SET CHROME_FLAGS=^
     --wait-for-debugger-children ^
     --remote-debugging-port=9222 ^
     --enable-blink-features=MojoJS,MojoJSTest ^
+    --disable-kill-after-bad-ipc ^
     https://ndevtk.github.io/MojoGUI/
 
 :: WinDbg initialization commands
