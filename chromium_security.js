@@ -6981,132 +6981,124 @@ function get_site_locks(browserSysId, childIds) {
     // Remember original process to restore after querying
     var originalId = ProcessUtils.getCurrentSysId();
 
-    try {
-        // Step 1: Get the GetInstance symbol address
-        var funcAddr = SymbolUtils.findSymbolAddress("chrome!content::ChildProcessSecurityPolicyImpl::GetInstance");
 
-        if (!funcAddr) {
-            // Early exit - will restore in finally
-            return locks;
-        }
+    // Step 1: Get the GetInstance symbol address
+    var funcAddr = SymbolUtils.findSymbolAddress("chrome!content::ChildProcessSecurityPolicyImpl::GetInstance");
 
-        // Step 2: Find a browser with chrome.dll and accessible singleton
-        var instanceAddr = null;
-        var workingBrowserId = null;
+    if (!funcAddr) {
+        // Early exit - will restore in finally
+        return locks;
+    }
 
-        ProcessUtils.forEachProcess("browser", function (proc) {
-            try {
-                // Check if chrome is loaded in this browser
-                var lmOut = SymbolUtils.execute("lm m chrome");
-                var hasChrome = false;
-                for (var lmLine of lmOut) {
-                    var lmStr = lmLine.toString();
-                    if (lmStr.indexOf("chrome") !== -1 && lmStr.indexOf("start") === -1 && lmStr.indexOf("Browse") === -1) {
-                        hasChrome = true;
-                        break;
-                    }
+    // Step 2: Find a browser with chrome.dll and accessible singleton
+    var instanceAddr = null;
+    var workingBrowserId = null;
+
+    ProcessUtils.forEachProcess("browser", function (proc) {
+        try {
+            // Check if chrome is loaded in this browser
+            var lmOut = SymbolUtils.execute("lm m chrome");
+            var hasChrome = false;
+            for (var lmLine of lmOut) {
+                var lmStr = lmLine.toString();
+                if (lmStr.indexOf("chrome") !== -1 && lmStr.indexOf("start") === -1 && lmStr.indexOf("Browse") === -1) {
+                    hasChrome = true;
+                    break;
                 }
+            }
 
-                if (!hasChrome) return;
+            if (!hasChrome) return;
 
-                // Use poi() to read the singleton pointer from the correct process context
-                var disasm = SymbolUtils.execute("u " + funcAddr + " L15");
-                for (var dLine of disasm) {
-                    var dLineStr = dLine.toString();
-                    var addrMatch = dLineStr.match(/\(([0-9a-fA-F`]+)\)\]/);
-                    if (addrMatch) {
-                        var addrStr = addrMatch[1].replace(/`/g, "");
-                        try {
-                            var poiOut = SymbolUtils.execute("? poi(0x" + addrStr + ")");
-                            for (var poiLine of poiOut) {
-                                var poiMatch = poiLine.toString().match(/= ([0-9a-fA-F`]+)/);
-                                if (poiMatch) {
-                                    var ptrVal = poiMatch[1].replace(/`/g, "");
-                                    if (isValidPointer(ptrVal) && ptrVal.length > MIN_PTR_VALUE_LENGTH) {
-                                        var candidateAddr = "0x" + ptrVal;
+            // Use poi() to read the singleton pointer from the correct process context
+            var disasm = SymbolUtils.execute("u " + funcAddr + " L15");
+            for (var dLine of disasm) {
+                var dLineStr = dLine.toString();
+                var addrMatch = dLineStr.match(/\(([0-9a-fA-F`]+)\)\]/);
+                if (addrMatch) {
+                    var addrStr = addrMatch[1].replace(/`/g, "");
+                    try {
+                        var poiOut = SymbolUtils.execute("? poi(0x" + addrStr + ")");
+                        for (var poiLine of poiOut) {
+                            var poiMatch = poiLine.toString().match(/= ([0-9a-fA-F`]+)/);
+                            if (poiMatch) {
+                                var ptrVal = poiMatch[1].replace(/`/g, "");
+                                if (isValidPointer(ptrVal) && ptrVal.length > MIN_PTR_VALUE_LENGTH) {
+                                    var candidateAddr = "0x" + ptrVal;
 
-                                        // Verify memory is accessible
-                                        var memoryOk = false;
-                                        try {
-                                            var dqsCheck = SymbolUtils.execute("dqs " + candidateAddr + " L1");
-                                            for (var dqsLine of dqsCheck) {
-                                                var dqsStr = dqsLine.toString();
-                                                if (dqsStr.indexOf("????????") === -1 && dqsStr.indexOf(ptrVal.substring(0, 8)) !== -1) {
-                                                    memoryOk = true;
-                                                }
+                                    // Verify memory is accessible
+                                    var memoryOk = false;
+                                    try {
+                                        var dqsCheck = SymbolUtils.execute("dqs " + candidateAddr + " L1");
+                                        for (var dqsLine of dqsCheck) {
+                                            var dqsStr = dqsLine.toString();
+                                            if (dqsStr.indexOf("????????") === -1 && dqsStr.indexOf(ptrVal.substring(0, 8)) !== -1) {
+                                                memoryOk = true;
                                             }
-                                        } catch (e) { }
-
-                                        if (memoryOk) {
-                                            instanceAddr = candidateAddr;
-                                            workingBrowserId = proc.sysId;
-                                            return false; // Break loop
                                         }
+                                    } catch (e) { }
+
+                                    if (memoryOk) {
+                                        instanceAddr = candidateAddr;
+                                        workingBrowserId = proc.sysId;
+                                        return false; // Break loop
                                     }
                                 }
                             }
-                        } catch (e) { }
-                    }
+                        }
+                    } catch (e) { }
                 }
-            } catch (e) { }
-            if (instanceAddr) return false;
-        });
+            }
+        } catch (e) { }
+        if (instanceAddr) return false;
+    });
 
-        if (!instanceAddr) {
-            // Early exit - will restore in finally
-            return locks;
-        }
+    if (!instanceAddr) {
+        return locks;
+    }
 
+    var originalId = host.currentProcess.Id;
+
+    try {
         // Step 3: Switch to browser context for dx command
         try {
-            SymbolUtils.execute("|" + workingBrowserId + "s");
-        } catch (e) { }
-
-        // Step 4: Enumerate all entries in security_state_ map
-        try {
-            var enumCmd = "dx -r6 ((chrome!content::ChildProcessSecurityPolicyImpl*)" + instanceAddr + ")->security_state_";
-
-            var enumOutput = ctl.ExecuteCommand(enumCmd);
-            var currentChildId = null;
-            var currentLockUrl = null;
-
-            for (var line of enumOutput) {
-                var lineStr = line.toString();
-                // Look for child ID in "first : N" pattern at appropriate indent level
-                // Only match lines that look like top-level security_state_ entries
-                if (lineStr.indexOf("first") !== -1 && lineStr.indexOf("[Type:") !== -1) {
-                    var firstMatch = lineStr.match(/first\s*:\s*(\d+)/);
-                    if (firstMatch) {
-                        // Save previous entry if we had a lock URL
-                        if (currentChildId !== null && currentLockUrl !== null) {
-                            locks.set(currentChildId.toString(), currentLockUrl);
-                        }
-                        currentChildId = parseInt(firstMatch[1]);
-                        currentLockUrl = null;
-                    }
-                }
-
-                // Look for site_url_ with URL - only capture the first one per child ID
-                if ((lineStr.indexOf("site_url_") !== -1 || lineStr.indexOf("lock_url_") !== -1) && currentLockUrl === null) {
-                    var extractedUrl = extractUrlFromLine(lineStr);
-                    if (extractedUrl && currentChildId !== null) {
-                        currentLockUrl = extractedUrl;
-                    }
-                }
-
-            }
-
-            // Save last entry
-            if (currentChildId !== null && currentLockUrl !== null) {
-                locks.set(currentChildId.toString(), currentLockUrl);
+            if (workingBrowserId !== null) {
+                SymbolUtils.execute("|" + workingBrowserId + "s");
             }
         } catch (e) { }
 
+        // Step 4: Enumerate all entries in security_states_ map
+        // Use dx with Select to extract only the properties we need (Child ID and URL)
+        var enumCmd = "dx -r2 ((chrome!content::ChildProcessSecurityPolicyImpl*)" + instanceAddr +
+            ")->security_states_.security_state_.Select(e => new { Id = e.first, Url = e.second->process_lock_.site_info_.site_url_.spec_ })";
+
+        var enumOutput = ctl.ExecuteCommand(enumCmd);
+
+        var currentChildId = null;
+
+        for (var line of enumOutput) {
+            var lineStr = line.toString();
+
+            var idMatch = lineStr.match(/Id\s*:\s*(\d+)/);
+            var urlMatch = lineStr.match(/Url\s*:\s*"(.*)"/);
+
+            if (idMatch) {
+                currentChildId = idMatch[1];
+            }
+
+            if (urlMatch && currentChildId !== null) {
+                var url = urlMatch[1];
+                if (url) {
+                    locks.set(currentChildId.toString(), url);
+                    currentChildId = null;
+                }
+            }
+        }
         return locks;
+
     } finally {
         // Always restore original process context
         try {
-            if (originalId !== null && originalId !== 0) {
+            if (originalId !== null) {
                 SymbolUtils.execute("|" + originalId + "s");
             }
         } catch (e) { }
